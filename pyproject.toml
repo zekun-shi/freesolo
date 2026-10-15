@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freesolo"
+version = "0.1.1"
+description = "FreeSolo: sparse attention trained at 4k, tested on retrieval up to 256k"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "triton",
+    "transformers",
+    "datasets",
+    "numpy",
+    "pyyaml",
+    "safetensors",
+    "huggingface_hub",
+    "accelerate",
+    "omegaconf",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "build",
+]
+longbench = ["fuzzywuzzy==0.18.0"]
+
+[project.urls]
+Repository = "https://github.com/zekun-shi/freesolo"
+
+[project.scripts]
+freesolo-eval-ruler = "eval_ruler:main"
+freesolo-eval-downstream = "eval_downstream:main"
+freesolo-eval-longbench = "eval_longbench:main"
+freesolo-eval-multifact = "eval_multifact:main"
+freesolo-generate = "experiments.scaling.hub:generate_main"
+freesolo-benchmark = "experiments.scaling.hub:benchmark_main"
+
+[tool.setuptools]
+py-modules = ["eval_ruler", "eval_downstream", "eval_longbench", "eval_multifact"]
+
+[tool.setuptools.packages.find]
+include = ["src*", "experiments*"]
+
+[tool.setuptools.package-data]
+"experiments.scaling" = ["configs/*.yaml", "configs/attn/*.yaml"]
+"src.fsattn" = ["*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

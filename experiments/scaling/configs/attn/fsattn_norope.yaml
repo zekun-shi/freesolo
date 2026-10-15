@@ -1,0 +1,12 @@
+# FreeSolo without positional encoding: distance-biased 128-token short-range window + long-range cell branch.
+# Equivalent argparse: --attn_type fsattn --long_range_variant cell_topk --cell_select score
+#   --cell_topk 4 --cell_stride 32 --sel_strict_causal 1 --no_rope --window_size 128
+attn:
+  attn_type: fsattn
+  long_range_variant: cell_topk
+  use_rope: false
+  window_size: 128
+  cell_stride: 32
+  cell_topk: 4
+  cell_select: score
+  sel_strict_causal: 1

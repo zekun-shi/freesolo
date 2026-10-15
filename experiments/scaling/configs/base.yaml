@@ -1,0 +1,43 @@
+# Shared defaults for config-mode training (train_dist.py --config configs/attn/<name>.yaml).
+# Mirrors the train_dist.py argparse defaults except the runtime block; the per-variant yaml
+# is merged on top, then CLI dotlist overrides (e.g. training.max_steps=50000).
+
+model:
+  config: 340m
+
+attn:
+  attn_type: fsattn
+  use_rope: true
+  long_range_variant: cell_topk
+  window_size: 128
+  sigma_init: 4.0
+  cell_stride: 64
+  cell_topk: 1
+  cell_select: score
+  sel_strict_causal: null
+  fs_uniform_sr: false
+  fs_nope_longrange: false
+
+training:
+  per_gpu_batch_size: 8
+  grad_accum_steps: 1
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  max_steps: 100000
+  warmup_steps: 2000
+  grad_clip: 1.0
+  eval_every: 1000
+  log_every: 20
+  save_every: 5000
+  seed: 42
+
+data:
+  pretokenized: ./data/fineweb_edu_10bt.bin
+  data_subset: sample-10BT
+  num_workers: 2
+
+runtime:
+  compile: true
+  no_long_range_recompute: true
+  gradient_checkpointing: false

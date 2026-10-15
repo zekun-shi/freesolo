@@ -1,0 +1,14 @@
+# FreeSolo (FS): RoPE uniform 512-token short-range window + NoPE long-range cell branch.
+# Equivalent argparse: --attn_type fsattn --long_range_variant cell_topk --cell_select score
+#   --cell_topk 4 --cell_stride 32 --sel_strict_causal 1 --fs_nope_longrange --fs_uniform_sr --window_size 512
+attn:
+  attn_type: fsattn
+  long_range_variant: cell_topk
+  use_rope: true
+  window_size: 512
+  cell_stride: 32
+  cell_topk: 4
+  cell_select: score
+  sel_strict_causal: 1
+  fs_uniform_sr: true
+  fs_nope_longrange: true

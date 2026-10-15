@@ -1,0 +1,4 @@
+include README.md LICENSE
+recursive-include src *.cu
+recursive-include scripts *.sh *.py
+recursive-include tests *.py
