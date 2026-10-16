@@ -66,6 +66,12 @@ class GraphedDecoder:
         seq = self.prompt.to(self.dev).view(1, -1)
         P = seq.shape[1]
         extend_rope_cache(m, self.Lmax + 8)
+        if os.environ.get("FSL_TRUNK_FUSED", "1") != "0":
+            for blk, a in zip(self.blocks, self.attn):
+                if hasattr(blk.ffn, "_ensure_gu_cache") and blk.ffn.w_gate.bias is None and blk.ffn.w_up.bias is None:
+                    blk.ffn._ensure_gu_cache()
+                if hasattr(a, "_ensure_qkv_cache") and a.W_q.bias is None and a.W_k.bias is None and a.W_v.bias is None:
+                    a._ensure_qkv_cache()
         self._alloc(P)
         self.cache = make_caches(m, linear=False, reserve=max(0, self.Lmax - P))
         kv_dt = self.dt if self.dt != torch.float32 else next(m.parameters()).dtype
@@ -73,7 +79,7 @@ class GraphedDecoder:
             for c in self.cache:
                 c.preallocate(1, P, kv_dt, self.dev)
         with torch.amp.autocast("cuda", dtype=self.dt):
-            hidden = _trunk_cached(m, seq, self.cache)
+            hidden = _trunk_cached(m, seq, self.cache, last_n=1)
             logits = _lm_head_fp32(m, hidden[:, -1:, :], 4096)[:, 0, :]
         self.next_tok = logits.argmax(dim=-1)
         for i in range(self.nL):
@@ -258,6 +264,12 @@ class FSBGraphedDecoder:
         # the graph indexes the RoPE table by position (the eager loop extends it on demand): cover every position now,
         # so no captured graph ever refers to a table that is rebuilt later
         extend_rope_cache(m, P + self.max_new + 8)
+        if os.environ.get("FSL_TRUNK_FUSED", "1") != "0":
+            for blk, a in zip(self.blocks, self.attn):
+                if hasattr(blk.ffn, "_ensure_gu_cache") and blk.ffn.w_gate.bias is None and blk.ffn.w_up.bias is None:
+                    blk.ffn._ensure_gu_cache()
+                if hasattr(a, "_ensure_qkv_cache") and a.W_q.bias is None and a.W_k.bias is None and a.W_v.bias is None:
+                    a._ensure_qkv_cache()
         self.cache = make_caches(m, lean_prefill=self.lean_prefill, reserve=self.max_new + 8, linear=False)
         for c in self.cache:
             c._fsb_graph_m_cap = (P + self.max_new + 8) // c.attn.cell_stride
@@ -266,7 +278,7 @@ class FSBGraphedDecoder:
             for c in self.cache:
                 c.preallocate(1, P, kv_dt, self.dev)
         with _autocast_ctx(self.dev, self.dt):
-            hidden = _trunk_cached(m, seq, self.cache)
+            hidden = _trunk_cached(m, seq, self.cache, last_n=1)
             logits = _lm_head_fp32(m, hidden[:, -1:, :], 4096)[:, 0, :]
         self.next_tok = logits.argmax(dim=-1)
         self.pos = P
@@ -408,7 +420,7 @@ class GraphedPrefiller:
     def _body(self):
         for c in self.cache:
             c.pos = 0
-        h = _trunk_cached(self.m, self.x_static, self.cache)
+        h = _trunk_cached(self.m, self.x_static, self.cache, last_n=self.tail_tokens)
         tail = h[:, -self.tail_tokens:, :].clone()
         logits = _lm_head_fp32(self.m, h[:, -1:, :], 4096)[:, 0, :]
         return logits, tail

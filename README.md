@@ -45,12 +45,12 @@ Both variants retrieve single needles at 262k — 64x the training length — wi
 
 340M scale on one A100-40GB (bf16, batch 1, each model's fastest CUDA-graph serving path, `experiments/scaling/bench_efficiency.py`):
 
-| Model | Prefill, Ktok/s (4k/16k/64k/131k) | Decode, tok/s (4k/16k/64k/131k) |
-| --- | --- | --- |
-| TF++ (full attention) | 159.3 / 119.8 / 48.4 / 26.2 | 264.5 / 199.8 / 95.8 / 55.5 |
-| FS | 136.5 / 171.8 / 154.7 / 132.1 | 338.1 / 322.8 / 272.9 / 227.5 |
-| FS-L | 132.7 / 175.9 / 181.5 / 180.8 | 341.8 / 339.4 / 338.7 / 337.0 |
-| FS-B | 80.7 / 89.6 / 79.1 / 73.0 | 218.8 / 212.3 / 202.6 / 203.7 |
+| Model | Prefill, Ktok/s (4k/16k/64k/131k) | Decode, tok/s (4k/16k/64k/131k) | Peak memory, GiB (prefill / decode at 131k) |
+| --- | --- | --- | --- |
+| TF++ (full attention) | 159.3 / 119.8 / 48.4 / 26.2 | 264.5 / 199.8 / 95.8 / 55.5 | 22.8 / 22.8 |
+| FS | 138.7 / 173.3 / 154.4 / 132.6 | 337.5 / 321.3 / 273.2 / 227.5 | 14.0 / 14.1 |
+| FS-L | 134.3 / 176.7 / 181.1 / 181.5 | 342.7 / 339.9 / 340.5 / 340.6 | 14.0 / 14.1 |
+| FS-B | 81.0 / 89.8 / 78.6 / 72.7 | 220.6 / 214.9 / 205.3 / 206.7 | 16.3 / 21.6 |
 
 ## Models
 
@@ -93,9 +93,9 @@ CUDA_VISIBLE_DEVICES=0 freesolo-benchmark --model zekun-shi/FreeSolo-B-341M \
 The command downloads the checkpoint (and portable thresholds for FS-B), then invokes the
 paper's benchmark with bf16, batch 1, one warm-up, three measured repetitions,
 256 decode steps, and no memory cap. It prints eager and CUDA-graph measurements;
-compare the graph columns with **181.5/180.8 Ktok/s prefill** and
-**338.7/337.0 tok/s decode** for `FreeSolo-L-341M` (or **79.1/73.0 Ktok/s prefill** and
-**202.6/203.7 tok/s decode** for `FreeSolo-B-341M`) at 64k/131k. GPU clocks, host load, and software versions
+compare the graph columns with **181.1/181.5 Ktok/s prefill** and
+**340.5/340.6 tok/s decode** for `FreeSolo-L-341M` (or **78.6/72.7 Ktok/s prefill** and
+**205.3/206.7 tok/s decode** for `FreeSolo-B-341M`) at 64k/131k. GPU clocks, host load, and software versions
 affect timing. The JSON includes graph/eager logit checks and kernel fallback status.
 The reference stack uses PyTorch 2.5.1+cu121 and Triton 3.1.0.
 

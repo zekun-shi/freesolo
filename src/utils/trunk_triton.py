@@ -837,9 +837,10 @@ def silu_mul_ok(g: torch.Tensor, u: torch.Tensor) -> bool:
             and g.is_contiguous() and u.is_contiguous() and g.numel() > 0)
 
 
-def silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+def silu_mul(g: torch.Tensor, u: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """F.silu(g) * u, bit for bit, in one pass."""
-    out = torch.empty_like(g)
+    if out is None:
+        out = torch.empty_like(g)
     n = g.numel()
     BLK = 4096
     _silu_mul_kernel[(triton.cdiv(n, BLK),)](g, u, out, n, BLOCK=BLK, RND=_RND[g.dtype], num_warps=8,

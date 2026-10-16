@@ -236,12 +236,27 @@ def load_model(
 
 
 def extend_rope_cache(model: torch.nn.Module, max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
-    n = 0
+    shared = {}
     for m in model.modules():
         if hasattr(m, "_build_cache") and hasattr(m, "cos_cached"):
             if m.cos_cached.shape[0] < max_seq_len:
                 m._build_cache(max_seq_len)
-                n += 1
+            key = (
+                getattr(m, "dim", None),
+                getattr(m, "base", None),
+                getattr(m, "scale", None),
+                getattr(m, "original_max_seq_len", None),
+                getattr(m, "beta_fast", None),
+                getattr(m, "beta_slow", None),
+                getattr(m, "attn_factor", None),
+                m.cos_cached.device,
+                m.cos_cached.dtype,
+                m.cos_cached.shape,
+            )
+            if key in shared:
+                m.cos_cached, m.sin_cached = shared[key]
+            else:
+                shared[key] = (m.cos_cached, m.sin_cached)
     return model
 
 

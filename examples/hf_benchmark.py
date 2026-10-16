@@ -4,7 +4,7 @@
         --lengths 65536,131072 --output hf-benchmark.json
 
 BF16, batch 1, median of 3, warm-up 1, 256 decode steps, no memory cap.
-Reference: prefill[graph] 79.1/73.0 Ktok/s; decode[graph] 202.6/203.7 tok/s.
+Reference: prefill[graph] 78.6/72.7 Ktok/s; decode[graph] 205.3/206.7 tok/s.
 Weights and calibration are downloaded together; no training corpus is needed.
 """
 

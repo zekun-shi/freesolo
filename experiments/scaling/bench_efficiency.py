@@ -309,7 +309,7 @@ def main():
     if args.fsb_union_tau_file and (args.serve != "fsb" or args.fsb_union_tau_quantile <= 0):
         ap.error("--fsb_union_tau_file requires --serve fsb and a positive --fsb_union_tau_quantile")
 
-    if args.cap40:
+    if args.cap40 and torch.cuda.get_device_properties(0).total_memory > (50 << 30):
         torch.cuda.set_per_process_memory_fraction(0.5, 0)  # 40 of 80 GB
     if args.serve in ("dense", "sparse"):
         os.environ["FS_FUSED_SELECT"] = "1"

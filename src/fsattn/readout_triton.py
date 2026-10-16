@@ -132,7 +132,7 @@ def readout_ok(Q, K, V, sel, sr, *, cell_size, query_block, bias=None, q_pos=0) 
             and Q.stride(-1) == K.stride(-1) == V.stride(-1) == sr.stride(-1) == 1)
 
 
-def readout_combine(Q, K, V, sel, sr, norm_w, lrs, eps, *, scale, cell_size, query_block):
+def readout_combine(Q, K, V, sel, sr, norm_w, lrs, eps, *, scale, cell_size, query_block, inplace: bool = False):
     """y (B, N, H * D) bf16 = bf16(sr + lrs[h] * lr_norm(bf16(cell readout))) for every query, from one kernel."""
     B, H, N, D = Q.shape
     G = min(_G, query_block)
@@ -140,7 +140,11 @@ def readout_combine(Q, K, V, sel, sr, norm_w, lrs, eps, *, scale, cell_size, que
     KS = triton.next_power_of_2(KK)
     n_kv = K.shape[2]
     ng = triton.cdiv(N, G)
-    out = torch.empty(B, N, H * D, device=Q.device, dtype=torch.bfloat16)
+    if (inplace and not torch.is_grad_enabled() and sr.dtype == torch.bfloat16
+            and sr.stride(0) == N * H * D and sr.stride(1) == D and sr.stride(2) == H * D and sr.stride(3) == 1):
+        out = sr.transpose(1, 2).view(B, N, H * D)
+    else:
+        out = torch.empty(B, N, H * D, device=Q.device, dtype=torch.bfloat16)
     scr = torch.empty(B * H * ng * G * KS, device=Q.device, dtype=torch.int32)
     lrs = lrs.reshape(-1)
     norm_w = norm_w.reshape(-1)

@@ -228,7 +228,7 @@ class FSAttn(nn.Module):
             main.wait_event(ev)
             out_short.record_stream(main)
 
-    def _begin_lr(self, out_short, want_cell_stats=False, sr_event=None):
+    def _begin_lr(self, out_short, want_cell_stats=False, sr_event=None, inplace_sr=False):
         # Prefill only. Hand the window output to the cell readout, which may return W_o's input with the combine
         # fused in (readout_triton; FSL_READOUT_FUSED=0 keeps the eager combine), and ask the long-range branch for
         # its cell statistics when FSKVCache.prefill would recompute exactly them. Not under torch.compile (the
@@ -237,6 +237,7 @@ class FSAttn(nn.Module):
                 and os.environ.get("FSL_READOUT_FUSED", "1") != "0")
         self._lr_combine_sr = out_short if fuse else None
         self._lr_combine_ev = sr_event
+        self._lr_inplace_sr = bool(inplace_sr and fuse and not self.fsb_enabled)
         self._lr_combined = False
         self._cell_stats_out = [] if want_cell_stats else None
 
@@ -252,6 +253,7 @@ class FSAttn(nn.Module):
         fused, stats = getattr(self, "_lr_combined", False), getattr(self, "_cell_stats_out", None)
         self._lr_combine_sr = None
         self._lr_combine_ev = None
+        self._lr_inplace_sr = False
         self._lr_combined = False
         self._cell_stats_out = None
         return fused, (stats[0] if stats else None)
@@ -285,11 +287,14 @@ class FSAttn(nn.Module):
             from .readout_triton import readout_ok, readout_combine
             if readout_ok(Q, K, V, sel_cells, sr, cell_size=s, query_block=Bq, bias=bias, q_pos=q_pos):
                 # the prefill caller handed over the window output (_begin_lr): return W_o's input directly
+                inplace = bool(getattr(self, "_lr_inplace_sr", False))
                 self._lr_combine_sr = None
+                self._lr_inplace_sr = False
                 self._lr_combined = True
                 self._await_window(sr, getattr(self, "_lr_combine_ev", None))
                 return readout_combine(Q, K, V, sel_cells, sr, self.lr_norm.scale, self.long_range_scale,
-                                       self.lr_norm.eps, scale=self.scale, cell_size=s, query_block=Bq)
+                                       self.lr_norm.eps, scale=self.scale, cell_size=s, query_block=Bq,
+                                       inplace=inplace)
         from .cell_select_triton import indexed_cell_attention
         out = indexed_cell_attention(Q, K, V, sel_cells, cell_size=s, query_block=Bq, scale=self.scale,
                                      bias=bias, q_pos=q_pos)
@@ -823,9 +828,39 @@ class FSAttn(nn.Module):
         B, N, _ = x.shape
         self._assert_cacheable(phase="prefill" if (cache.pos == 0 and N > 1) else "decode")
         H, D = self.n_heads, self.head_dim
-        Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
-        K = self.W_k(x).view(B, N, H, D).transpose(1, 2)
-        V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
+        is_std_prefill = (cache.pos == 0 and N > 1 and not getattr(cache, "lean_prefill", False)
+                          and not getattr(cache, "bounded", False))
+        pre = getattr(cache, "_prealloc", None) if (is_std_prefill and not torch.is_grad_enabled()
+                                                    and not self.fsb_enabled and not compiling()) else None
+        cap = N + max(0, int(getattr(cache, "reserve", 0))) if pre is not None else 0
+        if (pre is not None and pre[0] == B and pre[1] == N and tuple(pre[2].shape) == (B, H, cap, D)
+                and pre[2].device == x.device):
+            wk = self.W_k(x).view(B, N, H, D).transpose(1, 2)
+            if wk.dtype == pre[2].dtype:
+                K = pre[2][:, :, :N]
+                K.copy_(wk)
+                del wk
+                wv = self.W_v(x).view(B, N, H, D).transpose(1, 2)
+                V = pre[3][:, :, :N]
+                V.copy_(wv)
+                del wv
+                Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+            else:
+                Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+                K = wk
+                del wk
+                V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
+        elif is_std_prefill and not torch.is_grad_enabled() and not self.fsb_enabled and not compiling() and N > 4096:
+            K = self.W_k(x).view(B, N, H, D).transpose(1, 2).contiguous()
+            V = self.W_v(x).view(B, N, H, D).transpose(1, 2).contiguous()
+            Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+        else:
+            Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+            K = self.W_k(x).view(B, N, H, D).transpose(1, 2)
+            V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
+        if getattr(x, "_can_release", False) and not torch.is_grad_enabled():
+            x.set_(x.new_empty(0))
+        del x
 
         if getattr(cache, "bounded", False):
             if self.fsb_enabled:
@@ -835,6 +870,73 @@ class FSAttn(nn.Module):
 
         _rope = self.use_rope
         _rope_lr = _rope and getattr(self, "rope_long_range", True)
+        if is_std_prefill:
+            sigma = self.sigma
+            used_chunk_rope = False
+            if (_rope and not _rope_lr and self.fs_uniform_sr and self.causal and not self.fsb_enabled
+                    and N > 16384 and Q.is_cuda and not torch.is_grad_enabled() and not compiling()
+                    and os.environ.get("FSL_SLIDING_MODE", "chunked").lower() != "flex"
+                    and os.environ.get("FSL_WINDOW_STREAM", "0") != "1"):
+                end = cache.pos + N
+                if end > self.rope.cos_cached.shape[0]:
+                    self.rope._build_cache(end)
+                cos = self.rope.cos_cached[cache.pos:end]
+                sin = self.rope.sin_cached[cache.pos:end]
+                from ..utils import trunk_triton as tt
+                from ..utils.local_attention import _batched_sliding_window_rope
+                adt = tt.autocast_dtype()
+                dt_sr = adt or Q.dtype
+                T_blk = 64 if D <= 64 else 128
+                if (tt.rope_ok(Q, cos) and tt.rope_ok(K, cos) and sin.stride(-1) == 1 and sin.shape == cos.shape
+                        and D <= 128 and D % 8 == 0 and self.window_size % T_blk == 0 and N >= self.window_size
+                        and dt_sr in (torch.bfloat16, torch.float16) and V.stride(-1) == 1):
+                    out_short = self.dropout(_batched_sliding_window_rope(
+                        Q, K, V, cos, sin, adt, self.window_size, self.scale, T=T_blk
+                    ))
+                    ev = None
+                    Q_lr, K_lr = Q, K
+                    used_chunk_rope = True
+            if not used_chunk_rope:
+                if _rope:
+                    end = cache.pos + N
+                    if end > self.rope.cos_cached.shape[0]:
+                        self.rope._build_cache(end)
+                    Q_sr, K_sr = self._rope_pair(
+                        Q, K, self.rope.cos_cached[cache.pos:end], self.rope.sin_cached[cache.pos:end],
+                        window_only=not _rope_lr,
+                    )
+                else:
+                    Q_sr, K_sr = Q, K
+                Q_lr = Q_sr if _rope_lr else Q
+                K_lr = K_sr if _rope_lr else K
+                out_short, ev = self._short_range_prefill(Q_sr, K_sr, V, sigma)
+                if not _rope_lr and ev is None and not torch.is_grad_enabled():
+                    del Q_sr, K_sr
+            if self._lr_handoff_off():
+                out_long = self._long_range(Q_lr, K_lr, V, sigma, N)
+                fused, cell_stats = False, None
+            else:
+                # FSL_PREFILL_CELL_REUSE=0: FSKVCache.prefill recomputes the cell means / ceilings itself
+                self._begin_lr(out_short, want_cell_stats=(os.environ.get("FSL_PREFILL_CELL_REUSE", "1") != "0"
+                                                           and not torch.is_grad_enabled()),
+                               sr_event=ev, inplace_sr=(ev is None and not torch.is_grad_enabled()))
+                try:
+                    out_long = self._long_range(Q_lr, K_lr, V, sigma, N)
+                finally:
+                    fused, cell_stats = self._end_lr()
+            y = self._combine(out_short, out_long, fused, B, N, sr_event=ev)
+            if not torch.is_grad_enabled():
+                del Q, Q_lr, out_short, out_long
+            if cell_stats is not None:
+                cache._prefill_cell_stats = cell_stats          # read (and cleared) by FSKVCache.prefill
+            cache.prefill(K, V)
+            if not torch.is_grad_enabled():
+                del K, K_lr, V, cell_stats
+                out = self.W_o(y)
+                del y
+                return out
+            return self.W_o(y)
+
         if _rope:
             end = cache.pos + N
             if end > self.rope.cos_cached.shape[0]:
@@ -845,26 +947,6 @@ class FSAttn(nn.Module):
             Q_sr, K_sr = Q, K
         Q_lr = Q_sr if _rope_lr else Q
         K_lr = K_sr if _rope_lr else K
-
-        if cache.pos == 0 and N > 1 and not getattr(cache, "lean_prefill", False):
-            sigma = self.sigma
-            out_short, ev = self._short_range_prefill(Q_sr, K_sr, V, sigma)
-            if self._lr_handoff_off():
-                out_long = self._long_range(Q_lr, K_lr, V, sigma, N)
-                fused, cell_stats = False, None
-            else:
-                # FSL_PREFILL_CELL_REUSE=0: FSKVCache.prefill recomputes the cell means / ceilings itself
-                self._begin_lr(out_short, want_cell_stats=(os.environ.get("FSL_PREFILL_CELL_REUSE", "1") != "0"
-                                                           and not torch.is_grad_enabled()), sr_event=ev)
-                try:
-                    out_long = self._long_range(Q_lr, K_lr, V, sigma, N)
-                finally:
-                    fused, cell_stats = self._end_lr()
-            y = self._combine(out_short, out_long, fused, B, N, sr_event=ev)
-            if cell_stats is not None:
-                cache._prefill_cell_stats = cell_stats          # read (and cleared) by FSKVCache.prefill
-            cache.prefill(K, V)
-            return self.W_o(y)
 
         if cache.pos == 0 and N > 1:
             sigma = self.sigma
@@ -1166,18 +1248,28 @@ class FSAttn(nn.Module):
         out = torch.einsum("bhl,bhld->bhd", w, Vw).unsqueeze(2)
         return out
 
+    def _ensure_qkv_cache(self):
+        wq, wk, wv = self.W_q.weight, self.W_k.weight, self.W_v.weight
+        dm = self.d_model
+        key = (wq.data_ptr(), wq._version, wk.data_ptr(), wk._version, wv.data_ptr(), wv._version, wq.dtype)
+        c = getattr(self, "_w_qkv_cache", None)
+        if c is None or c[0] != key:
+            qkv_w = torch.cat([wq.data, wk.data, wv.data], dim=0)
+            self.W_q.weight.data = qkv_w[:dm]
+            self.W_k.weight.data = qkv_w[dm:2 * dm]
+            self.W_v.weight.data = qkv_w[2 * dm:]
+            wq, wk, wv = self.W_q.weight, self.W_k.weight, self.W_v.weight
+            key = (wq.data_ptr(), wq._version, wk.data_ptr(), wk._version, wv.data_ptr(), wv._version, wq.dtype)
+            c = (key, qkv_w)
+            self._w_qkv_cache = c
+        return c[1], dm
+
     def _qkv_decode(self, x, B, N, H, D):
         if (x.is_cuda and B * N == 1 and not torch.is_grad_enabled()
                 and self.W_q.bias is None and self.W_k.bias is None and self.W_v.bias is None
                 and os.environ.get("FSL_TRUNK_FUSED", "1") != "0"):
-            wq, wk, wv = self.W_q.weight, self.W_k.weight, self.W_v.weight
-            key = (wq.data_ptr(), wq._version, wk.data_ptr(), wk._version, wv.data_ptr(), wv._version, wq.dtype)
-            c = getattr(self, "_w_qkv_cache", None)
-            if c is None or c[0] != key:
-                c = (key, torch.cat([wq, wk, wv], dim=0))
-                self._w_qkv_cache = c
-            qkv = F.linear(x, c[1])
-            dm = self.d_model
+            qkv_w, dm = self._ensure_qkv_cache()
+            qkv = F.linear(x, qkv_w)
             Q = qkv[..., :dm].view(B, N, H, D).transpose(1, 2)
             K = qkv[..., dm:2 * dm].view(B, N, H, D).transpose(1, 2)
             V = qkv[..., 2 * dm:].view(B, N, H, D).transpose(1, 2)

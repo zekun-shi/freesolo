@@ -90,8 +90,10 @@ class FSKVCache:
                 self._k_buf, self._v_buf = pre[2], pre[3]
             else:
                 self._k_buf = K.new_zeros(B, H, cap, D); self._v_buf = V.new_zeros(B, H, cap, D)
-            self._k_buf[:, :, :N] = K
-            self._v_buf[:, :, :N] = V
+            if self._k_buf.data_ptr() != K.data_ptr():
+                self._k_buf[:, :, :N] = K
+            if self._v_buf.data_ptr() != V.data_ptr():
+                self._v_buf[:, :, :N] = V
         else:
             self._k_buf = K.contiguous(); self._v_buf = V.contiguous()
         self._len = N
@@ -273,8 +275,10 @@ def linear_prefill(model, idx, cache, *, chunk_size=2048):
     return hidden[:, -1:].clone()
 
 
-def _trunk_cached(model, idx, cache):
+def _trunk_cached(model, idx, cache, *, last_n: int | None = None):
     x = model.drop(model.tok_emb(idx))
     for i, block in enumerate(model.blocks):
         x = block(x, cache=cache[i])
+    if last_n is not None and x.shape[1] > last_n:
+        x = x[:, -last_n:, :].contiguous()
     return model.ln_final(x)

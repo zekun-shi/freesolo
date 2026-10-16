@@ -87,6 +87,16 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        if not torch.is_grad_enabled() and x.is_cuda and x.dim() == 3 and x.shape[1] > 8192:
+            N = x.shape[1]
+            c0 = self.forward(x[:, :8192])
+            out = torch.empty((x.shape[0], N, x.shape[2]), device=x.device, dtype=c0.dtype)
+            out[:, :8192].copy_(c0)
+            del c0
+            for s in range(8192, N, 8192):
+                e = min(s + 8192, N)
+                out[:, s:e].copy_(self.forward(x[:, s:e]))
+            return out
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 
@@ -98,22 +108,39 @@ class SwiGLU(nn.Module):
         self.w_down = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
+    def _ensure_gu_cache(self):
+        wg, wu = self.w_gate.weight, self.w_up.weight
+        d_ff = wg.shape[0]
+        key = (wg.data_ptr(), wg._version, wu.data_ptr(), wu._version, wg.dtype)
+        c = getattr(self, "_w_gu_cache", None)
+        if c is None or c[0] != key:
+            gu_w = torch.cat([wg.data, wu.data], dim=0)
+            self.w_gate.weight.data = gu_w[:d_ff]
+            self.w_up.weight.data = gu_w[d_ff:]
+            wg, wu = self.w_gate.weight, self.w_up.weight
+            key = (wg.data_ptr(), wg._version, wu.data_ptr(), wu._version, wg.dtype)
+            c = (key, gu_w)
+            self._w_gu_cache = c
+        return c[1], d_ff
+
     def forward(self, x):
         if (getattr(self, "_use_gu_cache", False) and x.is_cuda and _tt._rows(x) == 1
                 and not torch.is_grad_enabled() and self.w_gate.bias is None and self.w_up.bias is None
                 and os.environ.get("FSL_TRUNK_FUSED", "1") != "0"):
-            wg, wu = self.w_gate.weight, self.w_up.weight
-            key = (wg.data_ptr(), wg._version, wu.data_ptr(), wu._version, wg.dtype)
-            c = getattr(self, "_w_gu_cache", None)
-            if c is None or c[0] != key:
-                c = (key, torch.cat([wg, wu], dim=0))
-                self._w_gu_cache = c
-            gu = F.linear(x, c[1])
-            d_ff = wg.shape[0]
+            gu_w, d_ff = self._ensure_gu_cache()
+            gu = F.linear(x, gu_w)
             g, u = gu[..., :d_ff], gu[..., d_ff:]
-        else:
-            g, u = self.w_gate(x), self.w_up(x)
-        # no-grad CUDA inference: silu and the product in one pass, bit for bit (trunk_triton.silu_mul)
+            h = _tt.silu_mul(g, u) if _tt.silu_mul_ok(g, u) else F.silu(g) * u
+            return self.dropout(self.w_down(h))
+        g, u = self.w_gate(x), self.w_up(x)
+        if not torch.is_grad_enabled():
+            del x
+            # no-grad CUDA inference: silu and the product in one pass, bit for bit (trunk_triton.silu_mul)
+            h = _tt.silu_mul(g, u, out=g) if _tt.silu_mul_ok(g, u) else F.silu(g) * u
+            del g, u
+            out = self.w_down(h)
+            del h
+            return self.dropout(out)
         h = _tt.silu_mul(g, u) if _tt.silu_mul_ok(g, u) else F.silu(g) * u
         return self.dropout(self.w_down(h))
 
@@ -187,7 +214,22 @@ class TransformerBlock(nn.Module):
             # W_v, w_gate / w_up), which would each cast it; write it once in the autocast dtype instead, from one
             # fused pass (bit for bit: trunk_triton.rms_norm_cast)
             dt = _tt.autocast_dtype()
-            x = x + self.attn(_tt.rms_norm_cast(x, self.ln1.weight, self.ln1.eps, dt), cache=cache)
+            xn1 = _tt.rms_norm_cast(x, self.ln1.weight, self.ln1.eps, dt)
+            xn1._can_release = True
+            attn_out = self.attn(xn1, cache=cache)
+            del xn1
+            N = x.shape[1] if x.dim() == 3 else 0
+            ffn_env = int(os.environ.get("FSL_FFN_CHUNK", "0"))
+            ffn_chunk = ffn_env if ffn_env > 0 else (max(16384, N // 4) if N > 16384 else 0)
+            if N > ffn_chunk > 0:
+                x.add_(attn_out)
+                del attn_out
+                for s in range(0, N, ffn_chunk):
+                    xc = x[:, s:min(s + ffn_chunk, N)]
+                    xc.add_(self.ffn(_tt.rms_norm_cast(xc, self.ln2.weight, self.ln2.eps, dt)))
+                return x
+            x = x + attn_out
+            del attn_out
             x = x + self.ffn(_tt.rms_norm_cast(x, self.ln2.weight, self.ln2.eps, dt))
             return x
         x = x + self.attn(self.ln1(x), cache=cache)
@@ -245,6 +287,33 @@ class FreeSoloLM(nn.Module):
         self._fsb_route_layers = [m for m in self.modules() if getattr(m, "fsb_route_adapter", "none") != "none"]
 
         self._init_weights()
+        self._dedup_rope_buffers()
+
+    def _dedup_rope_buffers(self):
+        shared = {}
+        for m in self.modules():
+            if hasattr(m, "_build_cache") and hasattr(m, "cos_cached") and m.cos_cached is not None:
+                key = (
+                    getattr(m, "dim", None),
+                    getattr(m, "base", None),
+                    getattr(m, "scale", None),
+                    getattr(m, "original_max_seq_len", None),
+                    getattr(m, "beta_fast", None),
+                    getattr(m, "beta_slow", None),
+                    getattr(m, "attn_factor", None),
+                    m.cos_cached.device,
+                    m.cos_cached.dtype,
+                    m.cos_cached.shape,
+                )
+                if key in shared:
+                    m.cos_cached, m.sin_cached, m.inv_freq = shared[key]
+                else:
+                    shared[key] = (m.cos_cached, m.sin_cached, getattr(m, "inv_freq", None))
+
+    def _apply(self, fn, recurse=True):
+        out = super()._apply(fn, recurse=recurse)
+        self._dedup_rope_buffers()
+        return out
 
     def _init_weights(self):
         for name, p in self.named_parameters():

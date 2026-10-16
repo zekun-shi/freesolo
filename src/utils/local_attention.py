@@ -169,14 +169,68 @@ def _batched_sliding_window(Q, K, V, W, scale, T=64):
         # chunked path on short prompts.
         Qm, Km, Vm = (t if _bh_mergeable(t) else t.contiguous() for t in (Q, K, V))
         sq, sk, sv = Qm.stride(), Km.stride(), Vm.stride()
-        qv = Qm.as_strided((nblk, B * H, T, D), (T * sq[2], sq[1], sq[2], sq[3]), Qm.storage_offset() + W * sq[2])
-        kv = Km.as_strided((nblk, B * H, T + W, D), (T * sk[2], sk[1], sk[2], sk[3]), Km.storage_offset())
-        vv = Vm.as_strided((nblk, B * H, T + W, D), (T * sv[2], sv[1], sv[2], sv[3]), Vm.storage_offset())
         m = _band(T, T + W, -W, W, Q.dtype, Q.device)
-        o = F.scaled_dot_product_attention(qv, kv, vv, attn_mask=m[None, None], scale=scale)
-        out[:, W:nfull * T].view(B, nblk, T, H, D).copy_(o.view(nblk, B, H, T, D).permute(1, 0, 3, 2, 4))
+        bch = 256
+        for b0 in range(0, nblk, bch):
+            b1 = min(b0 + bch, nblk)
+            nb_c = b1 - b0
+            qv = Qm.as_strided((nb_c, B * H, T, D), (T * sq[2], sq[1], sq[2], sq[3]),
+                               Qm.storage_offset() + (W + b0 * T) * sq[2])
+            kv = Km.as_strided((nb_c, B * H, T + W, D), (T * sk[2], sk[1], sk[2], sk[3]),
+                               Km.storage_offset() + (b0 * T) * sk[2])
+            vv = Vm.as_strided((nb_c, B * H, T + W, D), (T * sv[2], sv[1], sv[2], sv[3]),
+                               Vm.storage_offset() + (b0 * T) * sv[2])
+            o = F.scaled_dot_product_attention(qv, kv, vv, attn_mask=m[None, None], scale=scale)
+            out[:, W + b0 * T:W + b1 * T].view(B, nb_c, T, H, D).copy_(o.view(nb_c, B, H, T, D).permute(1, 0, 3, 2, 4))
+            del o
     if nfull * T < N:
         out[:, nfull * T:].copy_(_window_rows(Q, K, V, nfull * T, N, W, scale).transpose(1, 2))
+    return out.transpose(1, 2)
+
+
+def _batched_sliding_window_rope(Q, K, V, cos, sin, out_dtype, W, scale, T=64):
+    """Bit-exact chunked sliding window with on-the-fly RoPE rotation per 256-block chunk for long-context prefill:
+    avoids materializing full-sequence rotated Q_sr and K_sr tensors when RoPE is window-only."""
+    from . import trunk_triton as tt
+    B, H, N, D = Q.shape
+    dt = out_dtype or Q.dtype
+    Vm = V.to(dt) if V.dtype != dt else V
+    if not _bh_mergeable(Vm):
+        Vm = Vm.contiguous()
+    sv = Vm.stride()
+    j0, nfull = W // T, N // T
+    nblk = nfull - j0
+    out = torch.empty(B, N, H, D, device=Q.device, dtype=dt)
+    qw = tt.rope(Q[:, :, :W], cos[:W], sin[:W], dt)
+    kw = tt.rope(K[:, :, :W], cos[:W], sin[:W], dt)
+    out[:, :W].copy_(_window_rows(qw, kw, Vm[:, :, :W], 0, W, W, scale).transpose(1, 2))
+    del qw, kw
+    if nblk > 0:
+        m = _band(T, T + W, -W, W, dt, Q.device)
+        bch = 256
+        for b0 in range(0, nblk, bch):
+            b1 = min(b0 + bch, nblk)
+            nb_c = b1 - b0
+            q_s, q_e = W + b0 * T, W + b1 * T
+            k_s, k_e = b0 * T, q_e
+            qc = tt.rope(Q[:, :, q_s:q_e], cos[q_s:q_e], sin[q_s:q_e], dt)
+            kc = tt.rope(K[:, :, k_s:k_e], cos[k_s:k_e], sin[k_s:k_e], dt)
+            sq, sk = qc.stride(), kc.stride()
+            qv = qc.as_strided((nb_c, B * H, T, D), (T * sq[2], sq[1], sq[2], sq[3]), qc.storage_offset())
+            kv = kc.as_strided((nb_c, B * H, T + W, D), (T * sk[2], sk[1], sk[2], sk[3]), kc.storage_offset())
+            vv = Vm.as_strided((nb_c, B * H, T + W, D), (T * sv[2], sv[1], sv[2], sv[3]),
+                               Vm.storage_offset() + k_s * sv[2])
+            o = F.scaled_dot_product_attention(qv, kv, vv, attn_mask=m[None, None], scale=scale)
+            out[:, q_s:q_e].view(B, nb_c, T, H, D).copy_(o.view(nb_c, B, H, T, D).permute(1, 0, 3, 2, 4))
+            del qc, kc, o
+    if nfull * T < N:
+        k0 = max(0, nfull * T - W)
+        qt = tt.rope(Q[:, :, nfull * T:N], cos[nfull * T:N], sin[nfull * T:N], dt)
+        kt = tt.rope(K[:, :, k0:N], cos[k0:N], sin[k0:N], dt)
+        mt = _band(N - nfull * T, N - k0, k0 - nfull * T, W, dt, Q.device)
+        ot = F.scaled_dot_product_attention(qt, kt, Vm[:, :, k0:N], attn_mask=mt[None, None], scale=scale)
+        out[:, nfull * T:].copy_(ot.transpose(1, 2))
+        del qt, kt, ot
     return out.transpose(1, 2)
 
 
