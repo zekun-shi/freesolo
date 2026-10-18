@@ -207,7 +207,7 @@ def _batched_sliding_window_rope(Q, K, V, cos, sin, out_dtype, W, scale, T=64):
     del qw, kw
     if nblk > 0:
         m = _band(T, T + W, -W, W, dt, Q.device)
-        bch = 256
+        bch = 128
         for b0 in range(0, nblk, bch):
             b1 = min(b0 + bch, nblk)
             nb_c = b1 - b0
@@ -221,8 +221,9 @@ def _batched_sliding_window_rope(Q, K, V, cos, sin, out_dtype, W, scale, T=64):
             vv = Vm.as_strided((nb_c, B * H, T + W, D), (T * sv[2], sv[1], sv[2], sv[3]),
                                Vm.storage_offset() + k_s * sv[2])
             o = F.scaled_dot_product_attention(qv, kv, vv, attn_mask=m[None, None], scale=scale)
+            del qc, kc, qv, kv
             out[:, q_s:q_e].view(B, nb_c, T, H, D).copy_(o.view(nb_c, B, H, T, D).permute(1, 0, 3, 2, 4))
-            del qc, kc, o
+            del o
     if nfull * T < N:
         k0 = max(0, nfull * T - W)
         qt = tt.rope(Q[:, :, nfull * T:N], cos[nfull * T:N], sin[nfull * T:N], dt)

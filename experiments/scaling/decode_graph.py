@@ -54,9 +54,10 @@ class GraphedDecoder:
         # each layer's kbuf / vbuf is bound in prefill(): to the cache's own preallocated buffers when their
         # capacity covers Lmax (one KV copy, as the FS-B decoder does), else to fresh graph-owned buffers
         self.layer_bufs = []
-        for _ in range(self.nL):
+        for i in range(self.nL):
             self.layer_bufs.append({
                 "pos_t": self.pos_t, "win_idx": self.win_idx, "win_pos": self.win_pos,
+                "sigma": self.attn[i].sigma,
                 "pool": {"empty": True},
             })
 
@@ -124,7 +125,7 @@ class GraphedDecoder:
                 buf["pool"] = pc
                 continue
             C = pc["C"]
-            if (not sp) or sp.get("empty", True) or sp.get("dense", False) or sp.get("C") != C or ("tok_idx" in pc) != ("tok_idx" in sp):
+            if (not sp) or sp.get("empty", True) or sp.get("dense", False) or sp.get("C") != C or ("tok_idx" in pc) != ("tok_idx" in sp) or ("Kbar_cand_t" in pc) != ("Kbar_cand_t" in sp):
                 sp = {
                     "empty": False, "M_vis": pc["M_vis"], "C": C,
                     "Kbar_cand": torch.zeros_like(pc["Kbar_cand"]),
@@ -133,6 +134,8 @@ class GraphedDecoder:
                     "ok_cell": torch.zeros_like(pc["ok_cell"]),
                     "cand_c": torch.zeros_like(pc["cand_c"]),
                 }
+                if "Kbar_cand_t" in pc:
+                    sp["Kbar_cand_t"] = torch.zeros_like(pc["Kbar_cand_t"])
                 if "tok_idx" in pc:
                     sp["tok_idx"] = torch.zeros_like(pc["tok_idx"])
                 buf["pool"] = sp
@@ -140,18 +143,19 @@ class GraphedDecoder:
             sp["Kbar_cand"].copy_(pc["Kbar_cand"]); sp["ceil_cand"].copy_(pc["ceil_cand"])
             sp["cen_cand"].copy_(pc["cen_cand"]); sp["ok_cell"].copy_(pc["ok_cell"])
             sp["cand_c"].copy_(pc["cand_c"])
+            if "Kbar_cand_t" in pc:
+                sp["Kbar_cand_t"].copy_(pc["Kbar_cand_t"])
             if "tok_idx" in pc:
                 sp["tok_idx"].copy_(pc["tok_idx"])
 
     @torch.no_grad()
     def _refresh_window(self):
-        pos = self.pos
-        idx = self._ar + pos
-        self.win_idx.copy_(idx)
-        self.win_pos.copy_(idx)
-        self.pos_t.fill_(pos)
+        self.pos_t.fill_(self.pos)
 
     def _trunk_graph(self):
+        idx = self._ar + self.pos_t
+        self.win_idx.copy_(idx)
+        self.win_pos.copy_(idx)
         m = self.m
         x = m.drop(m.tok_emb(self.tok_static))
         for i, block in enumerate(self.blocks):
@@ -159,7 +163,9 @@ class GraphedDecoder:
             x = x + attn.graph_decode_layer(_norm_cast(block.ln1, x), buf)
             x = x + block.ffn(_norm_cast(block.ln2, x))
         x = _norm_fp32(m.ln_final, x)
-        return _lm_head_fp32(m, x, 4096)         # the cached_generate head, as in FSBGraphedDecoder
+        logits = _lm_head_fp32(m, x, 4096)         # the cached_generate head, as in FSBGraphedDecoder
+        self.static_next = logits[:, 0, :].float().argmax(dim=-1)
+        return logits
 
     def _pool_cap_key(self):
         p0 = self.layer_bufs[0]["pool"]
@@ -204,8 +210,11 @@ class GraphedDecoder:
         if self.graph is None:
             self._capture()
         self.graph.replay()
-        logits = self.static_logits[:, 0, :].float()
-        self.next_tok = logits.argmax(dim=-1)
+        if getattr(self, "static_next", None) is not None:
+            self.next_tok = self.static_next
+        else:
+            logits = self.static_logits[:, 0, :].float()
+            self.next_tok = logits.argmax(dim=-1)
         self._advance_cache_bookkeeping()
         self.pos += 1
         return self.next_tok
@@ -291,13 +300,18 @@ class FSBGraphedDecoder:
         self._blk = None
 
     def _step_body(self):
+        idx = self._ar + self.pos_t
+        self.win_idx.copy_(idx)
+        self.win_pos.copy_(idx)
         m = self.m
         x = m.drop(m.tok_emb(self.tok_static))
         for i, blk in enumerate(self.blocks):
             x = x + self.attn[i].graph_decode_layer_fsb(_norm_cast(blk.ln1, x), self.cache[i], self.buf)
             x = x + blk.ffn(_norm_cast(blk.ln2, x))
         x = _norm_fp32(m.ln_final, x)
-        return _lm_head_fp32(m, x, 4096)[:, 0, :]
+        logits = _lm_head_fp32(m, x, 4096)[:, 0, :]
+        self.static_next = logits.argmax(dim=-1)
+        return logits
 
     @torch.no_grad()
     def _capture(self):
@@ -334,9 +348,6 @@ class FSBGraphedDecoder:
     def step(self):
         p = self.pos
         self.tok_static.copy_(self.next_tok.view(1, 1))
-        idx = self._ar + p
-        self.win_idx.copy_(idx)
-        self.win_pos.copy_(idx)
         self.pos_t.fill_(p)
         if self.graph is None:
             self._capture()                     # warms up (writes this token's K / V) and captures; same values
@@ -349,7 +360,7 @@ class FSBGraphedDecoder:
             else:
                 self._blk = p // self.Bq        # slots refreshed in place: the capture survives the block change
         self.graph.replay()
-        self.next_tok = self.static_logits.argmax(dim=-1)
+        self.next_tok = self.static_next
         for c in self.cache:                    # cell bookkeeping of the token the graph wrote at position p
             c.advance_in_place()
         self.pos = p + 1
@@ -448,6 +459,8 @@ class GraphedPrefiller:
         for b in m.blocks:
             b.attn.fsattn._fsb_stats = None
         torch.cuda.synchronize(self.dev)
+        if hasattr(torch._C, "_cuda_clearCublasWorkspaces"):
+            torch._C._cuda_clearCublasWorkspaces()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.dev)
         for b, acc in zip(m.blocks, accs):

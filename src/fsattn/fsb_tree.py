@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 
 import torch
 import torch.nn as nn
@@ -1511,7 +1512,9 @@ class ForestCache:
         return slot
 
     def _pad_cells(self, Kbar_all, ceil_all, M_vis, spread_all=None):
-        owner = self._pad_src if self._pad_src is not None else self
+        owner = (self._pad_src() if callable(self._pad_src) else self._pad_src) if self._pad_src is not None else self
+        if owner is None:
+            owner = self
         T, Dh = self.T, self.Dh
         M_pad = max(512, 1 << (M_vis - 1).bit_length())
         buf = owner._pad_buf
@@ -1628,7 +1631,9 @@ class ForestCache:
         grew = nn is not None and any(mc[0].tolist())
         if self.F is not None and not grew:
             return
-        Kmax = max(int(math.floor(math.log2(m_max))), self.k_cap) if m_max > 0 else 0
+        m_upper = m_max + max(0, self.m_cap - M_vis) if self.k_cap > 0 else m_max
+        prev_k = self.F["Kmax"] if self.F is not None else 0
+        Kmax = max(int(math.floor(math.log2(m_upper))), prev_k) if m_upper > 0 else prev_k
         bits_h = [[(mi >> k) & 1 for k in range(Kmax + 1)] for mi in m_h]
         jb_h = [[((mi >> (k + 1)) << 1) if b else 0 for k, b in enumerate(row)] for mi, row in zip(m_h, bits_h)]
         need = [any(row[k] for row in bits_h) for k in range(Kmax + 1)]
@@ -1653,6 +1658,7 @@ class ForestCache:
                 F_cuda = self._cuda_forest(Kbar_all, ceil_all, M_vis, spread_all, [tau], sel=sel)
             if dset and F_cuda is not None:
                 chunks.update(self._cuda_chunk_all(F_cuda, Kbar_all, jbase, bits, dset))
+                F_cuda = None
                 dirty.update(dset)
                 dset = []
             ks_loop = dset
@@ -1913,9 +1919,14 @@ def fsb_long_range(attn, Q, K, V, sigma, N, kv_padded=None, _stage_check=False):
         return fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N, tokK)
     lr0 = readout_handoff(attn)                                 # restored if the deferred capacity check redoes the layer
     with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
-        Kpv = Kp.view(B, H, M, s, Dh)
-        Kbar = Kpv.mean(dim=3).float()
-        ceil_c = Kpv.float().norm(dim=-1).amax(dim=-1)
+        from .fsl_select_cuda import cache_cell_stats
+        st_c = cache_cell_stats(Kp, M, s) if (not attn.fsb_leaf_radius and not torch.is_grad_enabled()) else None
+        if st_c is not None:
+            Kbar, ceil_c = st_c
+        else:
+            Kpv = Kp.view(B, H, M, s, Dh)
+            Kbar = Kpv.mean(dim=3).float()
+            ceil_c = Kpv.float().norm(dim=-1).amax(dim=-1)
         if getattr(attn, "_cell_stats_out", None) is not None and not pad:
             attn._cell_stats_out.append((K, Kbar, ceil_c))      # FSKVCache.prefill: the same ops on the same view
         spread = None
@@ -2386,7 +2397,7 @@ def _capture_decode_graph(g, fn):
 
 
 @torch.no_grad()
-def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None):
+def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=None):
     B, H, _, Dh = q_t.shape
     s = attn.cell_stride
     dev = q_t.device
@@ -2395,11 +2406,12 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None):
     from .fsb_route import fsb_route_q, route_on, radius_rows
     qr = fsb_route_q(attn, q_t.float()).reshape(T, 1, Dh) if route_on(attn) else q
     pos_t = pos if torch.is_tensor(pos) else torch.full((), float(pos), device=dev)
-    qpos = pos_t.float().view(1, 1).expand(T, 1)
+    qpos = (pos_f if pos_f is not None else pos_t.float()).view(1, 1).expand(T, 1)
     utau = getattr(fc, "utau", None)
     # query-independent per-block values (fixed policy): recomputed whenever the forests, spines or the
     # head parameters change, so every token sees exactly the values it would compute itself
-    key = (getattr(fc, "serial", 0), B, H, attn.sel_scale._version, attn.sel_scale.data_ptr(), attn.fsb_width,
+    key = (getattr(fc, "serial", 0), B, H, attn.sel_scale._version, attn.sel_scale.data_ptr(),
+           attn.log_sigma._version, attn.log_sigma.data_ptr(), attn.fsb_width,
            attn.fsb_delta, int(getattr(attn, "fsb_union_width", 0) or 0))
     tk = getattr(fc, "_tok", None)
     if attn.fsb_policy_mode == "fixed" and tk is not None and tk["key"] == key:
@@ -2416,7 +2428,7 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None):
                                            torch.bitwise_left_shift(torch.ones_like(Du), Du))
         if attn.fsb_policy_mode == "fixed":
             fc._tok = tk = {"key": key, "head_id": head_id, "lam": lam, "W": W, "delta": delta, "ukw": ukw}
-    sigv = sigma.float()[head_id].view(T, 1, 1)
+    sigv = tk["sigv"] if (tk is not None and sigma is tk.get("sigma") and "sigv" in tk) else sigma.float()[head_id].view(T, 1, 1)
     rr = getattr(attn, "fsb_rerank_score", "leaf") if getattr(attn, "fsb_read_top", 0) > 0 else "leaf"
     rq = q if (getattr(attn, "fsb_read_top", 0) > 0 and getattr(attn, "fsb_rerank_query", "route") == "raw" and qr is not q) else None
     tokK = None
@@ -2445,7 +2457,7 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None):
     if prov is not None:
         fc._last_prov = prov[0]
     from .fsb_fast_step import decode_readout_fast
-    rout = decode_readout_fast(attn, cache, q_t, sel, pos_t)
+    rout = decode_readout_fast(attn, cache, q_t, sel, pos_t, sr=sr)
     return rout if rout is not None else _fsb_decode_readout(attn, q_t, cache, sel, pos_t, full_buffer=True)
 
 
@@ -2538,7 +2550,8 @@ def _forest_budgets(attn, fc, B, H, dev):
     # those _forest_token (and _forest_token_plain's lazy "bud" branch) computes at token time. Learned policies
     # keep their per-query, per-token budgets: this refreshes nothing and any graph re-captures on their pointers.
     T = B * H
-    key = (getattr(fc, "serial", 0), B, H, attn.sel_scale._version, attn.sel_scale.data_ptr(), attn.fsb_width,
+    key = (getattr(fc, "serial", 0), B, H, attn.sel_scale._version, attn.sel_scale.data_ptr(),
+           attn.log_sigma._version, attn.log_sigma.data_ptr(), attn.fsb_width,
            attn.fsb_delta, int(getattr(attn, "fsb_union_width", 0) or 0))
     tk = getattr(fc, "_tok", None)
     if attn.fsb_policy_mode != "fixed" or fc.SP is None or fc.F is None:
@@ -2559,6 +2572,8 @@ def _forest_budgets(attn, fc, B, H, dev):
         return tk
     head_id = torch.arange(H, device=dev)[None, :].expand(B, H).reshape(T)
     lam = attn.sel_scale.float()[head_id].view(T, 1, 1)
+    sig = attn.sigma
+    sigv = sig.float()[head_id].view(T, 1, 1)
     W, D, _ = choose_actions(attn, lam, head_id, fc.m_tot, fc.SP["height"], fc.F["Kmax"] + 1, training=False)
     delta = (fc.SP["height"][:, None] - D).clamp(min=0)
     bud = torch.bitwise_left_shift(torch.ones_like(delta), delta)
@@ -2586,6 +2601,8 @@ def _forest_budgets(attn, fc, B, H, dev):
     ukw_old = tk.get("ukw") or {}
     tk["head_id"] = _put(tk.get("head_id"), head_id)
     tk["lam"] = _put(tk.get("lam"), lam)
+    tk["sigma"] = _put(tk.get("sigma"), sig)
+    tk["sigv"] = _put(tk.get("sigv"), sigv)
     tk["W"] = _put(tk.get("W"), W)
     tk["delta"] = _put(tk.get("delta"), delta)
     tk["bud"] = _put(tk.get("bud"), bud)
@@ -2665,7 +2682,7 @@ def fsb_graph_registry(attn, cache):
         reg += [sig(SP["node"]), sig(SP["root"]), sig(SP["t_idx"]), sig(SP["height"]), sig(fc.m_tot)]
     if tk is not None:
         reg += [sig(tk.get("W")), sig(tk.get("bud")), sig(tk.get("bud_u")), sig(tk.get("union_W")),
-                sig(tk.get("lam")), sig(tk.get("head_id"))]
+                sig(tk.get("lam")), sig(tk.get("sigma")), sig(tk.get("sigv")), sig(tk.get("head_id"))]
         ukw = tk.get("ukw") or {}
         reg += [sig(ukw.get("union_delta")), sig(ukw.get("union_W"))]
     u = getattr(fc, "utau", None)
@@ -2706,7 +2723,7 @@ def fsb_decode_prepare(attn, cache, B, H, Dh, dev, pos):
             return
         if fresh or fc.utau is None:
             fc.utau = ForestCache(T, Dh, dev, lean=fc.lean)
-        fc.utau._pad_src = fc
+        fc.utau._pad_src = weakref.ref(fc)
         fc.utau.m_cap = fc.m_cap
         fc.utau.k_cap = fc.k_cap
         fc.utau.ingest(Kbar_all, ceil_all, M_vis, attn.fsb_tau_union.view(1, H).expand(B, H).reshape(T),
@@ -2749,6 +2766,7 @@ def fsb_decode_prepare(attn, cache, B, H, Dh, dev, pos):
         _utau_block(Kbar_all, ceil_all, M_vis if fc.SP is not None else 0, fresh=True)
         fc.graph = None
         fc.serial = getattr(fc, "serial", 0) + 1
+    fc._pad_buf = None
     fc.sel_cfg = cfg
     live = not (fc.SP is None or (not fc.live and not hybrid_on(attn)
                                   and not (getattr(fc, "utau", None) is not None and fc.utau.live)))
@@ -2758,7 +2776,7 @@ def fsb_decode_prepare(attn, cache, B, H, Dh, dev, pos):
 
 
 @torch.no_grad()
-def fsb_decode_token(attn, q_t, cache, sigma, pos_t):
+def fsb_decode_token(attn, q_t, cache, sigma, pos_t, pos_f=None, sr=None):
     # the per-token FS-B read of a whole-step decode graph (the block's forests prepared by fsb_decode_prepare)
     fc = cache._fsb_forest
     B, H, _, Dh = q_t.shape
@@ -2766,7 +2784,7 @@ def fsb_decode_token(attn, q_t, cache, sigma, pos_t):
         fsb_read_acc(attn, torch.zeros(B * H, device=q_t.device))
         return q_t.new_zeros(B, H, 1, Dh)
     from .fsb_route import route_radius
-    out = _forest_token(attn, q_t, cache, sigma, pos_t, fc, c_h=route_radius(attn))
+    out = _forest_token(attn, q_t, cache, sigma, pos_t, fc, c_h=route_radius(attn), pos_f=pos_f, sr=sr)
     if getattr(attn, "_fsb_read_acc", None) is not None:          # the read statistics of the eager path, in-graph
         fsb_read_acc(attn, (fc._last_sel >= 0).sum(-1))
         if getattr(fc, "utau", None) is not None or union_quota_on(attn):
@@ -2784,7 +2802,8 @@ def _fsb_decode_step_forest(attn, q_t, cache, sigma, pos):
     if not live:
         fsb_read_acc(attn, torch.zeros(T, device=dev))
         return q_t.new_zeros(B, H, 1, Dh)
-    use_graph = os.environ.get("FSB_DECODE_GRAPH", "1") == "1" and q_t.is_cuda and cache._k_buf is not None
+    use_graph = (os.environ.get("FSB_DECODE_GRAPH", "1") == "1" and q_t.is_cuda
+                 and cache._k_buf is not None and not getattr(attn, "_fsb_graph_broken", False))
     from .fsb_route import route_radius
     c_now = route_radius(attn)
     if not use_graph:
@@ -2801,12 +2820,25 @@ def _fsb_decode_step_forest(attn, q_t, cache, sigma, pos):
     if G is None:
         q_s = q_t.clone(); pos_s = torch.tensor(float(pos), device=dev); sig_s = sigma.detach().clone()
         c_s = c_now.clone() if c_now is not None else None
-        side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            _forest_token(attn, q_s, cache, sig_s, pos_s, fc, c_h=c_s)
-        torch.cuda.current_stream().wait_stream(side)
-        g = torch.cuda.CUDAGraph()
-        out_s = _capture_decode_graph(g, lambda: _forest_token(attn, q_s, cache, sig_s, pos_s, fc, c_h=c_s))
+        try:
+            side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                _forest_token(attn, q_s, cache, sig_s, pos_s, fc, c_h=c_s)
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            out_s = _capture_decode_graph(g, lambda: _forest_token(attn, q_s, cache, sig_s, pos_s, fc, c_h=c_s))
+        except RuntimeError as exc:
+            torch.cuda.synchronize()
+            fc.graph = None
+            attn._fsb_graph_broken = True
+            print(f"[fsb-graph] capture failed at pos {pos} ({type(exc).__name__}: {exc}); "
+                  "falling back to eager decode for this module", flush=True)
+            out = _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=c_now)
+            if stats:
+                fsb_read_acc(attn, (fc._last_sel >= 0).sum(-1))
+                if getattr(fc, "utau", None) is not None or union_quota_on(attn):
+                    fsb_utau_acc(attn, getattr(fc, "_last_prov", None))
+            return out
         G = {"g": g, "q": q_s, "pos": pos_s, "sigma": sig_s, "c": c_s, "out": out_s, "kptr": cache._k_buf.data_ptr(),
              "vptr": cache._v_buf.data_ptr(), "shape": tuple(q_t.shape), "dtype": q_t.dtype}
         fc.graph = G

@@ -57,8 +57,11 @@ _STREAMS: dict = {}
 def _stage_pipe(stages: tuple, chk: bool, dev):
     # the side stream a stage's re-rank runs on while the next stage's beams run on the caller's: the same op
     # sequence per stage on disjoint stage slices, so the outputs are identical; needs at least two stages and no
-    # compact check (FSB_STAGE_PIPE=0: the serial stage loop)
-    if chk or len(stages) < 2 or dev.type != "cuda" or os.environ.get("FSB_STAGE_PIPE", "1") == "0":
+    # compact check (FSB_STAGE_PIPE=0: the serial stage loop; with FSB_ROWS_DEFER=1 there is no per-stage host sync
+    # to hide unless FSB_STAGE_PIPE=1 is explicitly set)
+    from .fsb_rows import rows_defer_on
+    pipe = os.environ.get("FSB_STAGE_PIPE")
+    if chk or len(stages) < 2 or dev.type != "cuda" or pipe == "0" or (pipe != "1" and rows_defer_on()):
         return None
     key = str(dev)
     s1 = _STREAMS.get(key)
@@ -384,9 +387,14 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
     lb = _legacy_blocks(attn, nb)
     with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
         # cell statistics with fsb_long_range's own ops (the forests' inputs), handed to the KV cache as it does
-        Kpv = Kp.view(B, H, M, s, Dh)
-        Kbar = Kpv.mean(dim=3).float()
-        ceil_c = Kpv.float().norm(dim=-1).amax(dim=-1)
+        from .fsl_select_cuda import cache_cell_stats
+        st_c = cache_cell_stats(Kp, M, s) if not attn.fsb_leaf_radius else None
+        if st_c is not None:
+            Kbar, ceil_c = st_c
+        else:
+            Kpv = Kp.view(B, H, M, s, Dh)
+            Kbar = Kpv.mean(dim=3).float()
+            ceil_c = Kpv.float().norm(dim=-1).amax(dim=-1)
         if getattr(attn, "_cell_stats_out", None) is not None and not pad:
             attn._cell_stats_out.append((K, Kbar, ceil_c))      # FSKVCache.prefill: the same ops on the same view
         spread = None
@@ -401,11 +409,14 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
         m_b2_all = F.get("utau_mba") if F2 is not None else None
         # one spine launch per forest for every (head, block) row, stage-major (one stage: m_b's own row order)
         rows_of = (lambda m: m.reshape(-1)) if len(stages) == 1 else (lambda m: m.reshape(-1)[cst["mb_index"]])
-        SP = build_spines(F, rows_of(m_b_all), cst["t_rows"])
-        SP2 = build_spines(F2, rows_of(m_b2_all), cst["t_rows"]) if F2 is not None else None
-        Fu, SPu = (F2, SP2) if F2 is not None else (F, SP)
+        mb_rows = rows_of(m_b_all)
+        mb2_rows = rows_of(m_b2_all) if F2 is not None else None
+        Fu = F2 if F2 is not None else F
         qprobe = torch.empty((0, Bq, Dh), dtype=torch.float32, device=dev)
-        fused = fast_beam_ok(F, SP, qprobe, W_max, dm) and (not union or fast_beam_ok(Fu, SPu, qprobe, Wu_max, dm))
+        sp_probe = {"root": mb_rows[:0], "t_idx": cst["t_rows"][:0], "node": qprobe}
+        fused = fast_beam_ok(F, sp_probe, qprobe, W_max, dm) and (
+            not union or fast_beam_ok(Fu, sp_probe, qprobe, Wu_max, dm))
+        del qprobe, sp_probe
         sel32 = torch.empty((B, H, Npad, Kk), dtype=torch.int32, device=dev)
         prov_full = torch.empty((B, H, Npad, Kk), dtype=torch.int8, device=dev) if (
             acc is not None and F2 is not None) else None
@@ -413,8 +424,6 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
         flags, flagged, redo = [], [], []
         q = pair = sel_a = sel_b = nv = nv_u = res = out = pv = None
         if fused:
-            Wt, bt, Wut, but, lam_rows, sig_rows = _row_tables(attn, SP, SP2, attn.sel_scale, sigma,
-                                                               cst["head_rows"], Bq, union)
             rc = attn.fsb_bound_radius_coef
 
             def _beam_stage(b0: int, b1: int):
@@ -427,57 +436,70 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                 qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
                 if nq < nbc * Bq:
                     qv[:, :, nq:].zero_()
-                SPc = _sp_rows(SP, r0, r1)
-                SPuc = _sp_rows(SPu, r0, r1) if F2 is not None else SPc
+                SPc = build_spines(F, mb_rows[r0:r1], cst["t_rows"][r0:r1])
+                SP2c = build_spines(F2, mb2_rows[r0:r1], cst["t_rows"][r0:r1]) if F2 is not None else None
+                SPuc = SP2c if SP2c is not None else SPc
+                Wt, bt, Wut, but, lam_r, sig_r = _row_tables(attn, SPc, SP2c, attn.sel_scale, sigma,
+                                                             cst["head_rows"][r0:r1], Bq, union)
                 qpos = cst["qpos"][r0:r1]
-                lam = lam_rows[r0:r1].view(Tc, 1, 1)
-                sigv = sig_rows[r0:r1].view(Tc, 1, 1)
+                lam = lam_r.view(Tc, 1, 1)
+                sigv = sig_r.view(Tc, 1, 1)
                 pair = sel_b = nv_u = None
                 if union:
                     # both beams in one launch (the stage loop's traverse_forest makes the same call)
-                    pair = forest_beam_pair(F, SPc, Wt[r0:r1], None, W_max, Fu, SPuc, Wut[r0:r1], None, Wu_max, q,
+                    pair = forest_beam_pair(F, SPc, Wt, None, W_max, Fu, SPuc, Wut, None, Wu_max, q,
                                             qpos, lam, sigv, attn.scale, s, dm, attn.fsb_node_score, rc,
-                                            bud=bt[r0:r1], bud_u=but[r0:r1])
+                                            bud=bt, bud_u=but)
                 if pair is not None:
                     (sel_a, nv), (sel_b, nv_u) = pair
                 else:
-                    sel_a, nv = forest_beam_fused(F, SPc, q, qpos, lam, sigv, attn.scale, s, Wt[r0:r1], None, W_max,
-                                                  dm, attn.fsb_node_score, rc, bud=bt[r0:r1])
+                    sel_a, nv = forest_beam_fused(F, SPc, q, qpos, lam, sigv, attn.scale, s, Wt, None, W_max,
+                                                  dm, attn.fsb_node_score, rc, bud=bt)
                     sel_b = None
                     if union:
-                        sel_b, nv_u = forest_beam_fused(Fu, SPuc, q, qpos, lam, sigv, attn.scale, s, Wut[r0:r1], None,
-                                                        Wu_max, dm, attn.fsb_node_score, rc, bud=but[r0:r1])
+                        sel_b, nv_u = forest_beam_fused(Fu, SPuc, q, qpos, lam, sigv, attn.scale, s, Wut, None,
+                                                        Wu_max, dm, attn.fsb_node_score, rc, bud=but)
                 if chk:
                     # FSB_CHECK_COMPACT=1: the full layout's beams, against which the compact output must check
-                    full = forest_beam_fused(F, SPc, q, qpos, lam, sigv, attn.scale, s, Wt[r0:r1], None, W_max,
-                                             attn.fsb_delta_max, attn.fsb_node_score, rc, bud=bt[r0:r1])
+                    full = forest_beam_fused(F, SPc, q, qpos, lam, sigv, attn.scale, s, Wt, None, W_max,
+                                             attn.fsb_delta_max, attn.fsb_node_score, rc, bud=bt)
                     _check_compact(sel_a, nv, full, W_max, attn.fsb_delta_max, dm)
                     if union:
-                        full = forest_beam_fused(Fu, SPuc, q, qpos, lam, sigv, attn.scale, s, Wut[r0:r1], None,
-                                                 Wu_max, attn.fsb_delta_max, attn.fsb_node_score, rc, bud=but[r0:r1])
+                        full = forest_beam_fused(Fu, SPuc, q, qpos, lam, sigv, attn.scale, s, Wut, None,
+                                                 Wu_max, attn.fsb_delta_max, attn.fsb_node_score, rc, bud=but)
                         _check_compact(sel_b, nv_u, full, Wu_max, attn.fsb_delta_max, dm)
                     del full
-                return SPc, qpos, lam, sigv, q, sel_a, sel_b, nv, nv_u
+                t_idx_c = SPc["t_idx"]
+                del SPc, SP2c, SPuc, Wt, bt, Wut, but
+                return {"t_idx": t_idx_c}, qpos, lam, sigv, q, sel_a, sel_b, nv, nv_u
 
             def _rerank_stage(b0: int, b1: int, SPc: dict, qpos, lam, sigv, q, sel_a, sel_b, nv, nv_u):
                 # a stage's block-shared re-rank (fsb_rows.union_rerank_rows) and the int32 stores into the layer's
                 # tables; appends the stage to redo and returns None when a row overflows without the deferred flag
                 if stats and union:
                     nv = nv + nv_u
+                nbc = b1 - b0
+                q0, q1 = b0 * Bq, b1 * Bq
+                Tc = T * nbc
+                s_sl = sel32[:, :, q0:q1]
+                p_sl = prov_full[:, :, q0:q1] if prov_full is not None else None
+                direct = s_sl.is_contiguous()
+                out_buf = s_sl.view(Tc, Bq, Kk) if direct else None
+                pv_buf = p_sl.view(Tc, Bq, Kk) if (direct and p_sl is not None) else None
                 nf = len(flags)
                 res = union_rerank_rows(sel_a, sel_b, q, qpos, lam, sigv, F["cellA"], SPc["t_idx"], attn.scale, s,
-                                        Kk, score, tokK, prov=prov_full is not None, ovf_out=flags, q_bf16=q_bf16)
+                                        Kk, score, tokK, prov=prov_full is not None, ovf_out=flags, q_bf16=q_bf16,
+                                        out=out_buf, pv_out=pv_buf)
                 if len(flags) > nf:
                     flagged.append((b0, b1))                    # its device flag: read after the readout is queued
                 if res is None:
                     redo.append((b0, b1))                       # an overflowing row (FSB_ROWS_DEFER=0 host check)
                     return None
                 out, pv = res
-                nbc = b1 - b0
-                q0, q1 = b0 * Bq, b1 * Bq
-                sel32[:, :, q0:q1].copy_(out.view(B, H, nbc * Bq, Kk))
-                if prov_full is not None:
-                    prov_full[:, :, q0:q1].copy_(pv.view(B, H, nbc * Bq, Kk))
+                if not direct:
+                    s_sl.copy_(out.view(B, H, nbc * Bq, Kk))
+                    if p_sl is not None:
+                        p_sl.copy_(pv.view(B, H, nbc * Bq, Kk))
                 if stats:
                     nv_full[:, :, q0:q1].copy_(nv.view(B, H, nbc * Bq))
                 return res
@@ -486,7 +508,7 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
             if s1 is None:
                 for b0, b1 in stages:
                     out = _rerank_stage(b0, b1, *_beam_stage(b0, b1))
-                    pv = out[1] if out is not None else None
+                    out = pv = None
             else:
                 s0 = torch.cuda.current_stream(dev)
                 ev_b, ev_r, ring = [torch.cuda.Event(), torch.cuda.Event()], [torch.cuda.Event() for _ in stages], \
@@ -516,7 +538,6 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                         ring[k % 2] = (ring[k % 2], out)
                         ev_r[k].record(s1)
                 s0.wait_event(ev_r[-1])
-            del Wt, bt, Wut, but
         else:
             if not _warned:
                 _warned.append(1)
@@ -524,11 +545,11 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                 warnings.warn("FS-B fast prefill: the fused beam does not take this forest's tables, running the "
                               "stage loop's stages (FSB_FAST_PREFILL=0 skips the unused spine work)")
             redo = [(0, nb)]
-    del SP, SP2, SPu, q, pair, sel_a, sel_b, nv, nv_u, res, out, pv
+    del mb_rows, mb2_rows, q, pair, sel_a, sel_b, nv, nv_u, res, out, pv
     if redo:
         # (under the caller's autocast, as fsb_long_range runs its stages)
         _redo_stages(attn, Q, F, m_b_all, sigma, N, Bq, blk_start, tokK, lb, nb, redo, sel32, prov_full, nv_full)
-    F2 = Fu = None                                              # F keeps the filtered forest for a redo
+    F = F2 = Fu = None
     pend = None
     if flags and not torch.cuda.is_current_stream_capturing():
         # device -> pinned host copy of the stage flags; the host waits for it only after the readout is queued
@@ -536,8 +557,6 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
         pend = (torch.empty(fl.shape, dtype=torch.bool, pin_memory=True), torch.cuda.Event())
         pend[0].copy_(fl, non_blocking=True)
         pend[1].record(torch.cuda.current_stream(fl.device))
-    else:
-        F = None
     fused_attn = bool(attn._prune_cfg("fs_fused_attn", "FS_FUSED_ATTN", 0))
 
     def readout():
@@ -553,10 +572,14 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
         if bad:
             # a row with more than UCAP distinct candidates (never seen on real prompts): the stage loop's stages that
             # cover the flagged ones, with the per-stage check, then the readout again with its hand-off restored
+            with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
+                F, _ = _forest_build_stage(attn, Kbar.reshape(T, M, Dh), ceil_c.reshape(T, M), blk_start, s,
+                                           spread.reshape(T, M) if spread is not None else None)
             _redo_stages(attn, Q, F, m_b_all, sigma, N, Bq, blk_start, tokK, lb, nb, bad, sel32, prov_full, nv_full)
+            F = None
             readout_handoff(attn, lr0)
             y = readout()
-    del F
+    del Kbar, ceil_c, spread
     attn._fsb_ppo_rec = []
     n_read = None
     if acc is not None or stats:

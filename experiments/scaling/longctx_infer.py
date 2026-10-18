@@ -279,7 +279,8 @@ def trunk_hidden_states(
 
 
 def _lm_head_fp32(model: FreeSoloLM, hidden: torch.Tensor, lm_chunk_size: int) -> torch.Tensor:
-    W = model.lm_head.weight.float()
+    w = model.lm_head.weight
+    W = w if (torch.is_autocast_enabled() and w.dtype == torch.get_autocast_dtype("cuda")) else w.float()
     P = hidden.shape[1]
     if P <= lm_chunk_size:
         return F.linear(hidden.float(), W)

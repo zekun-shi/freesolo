@@ -235,9 +235,10 @@ class FSAttn(nn.Module):
         # callers run the long-range branch without it there: _lr_handoff_off).
         fuse = (out_short is not None and out_short.is_cuda and not torch.is_grad_enabled()
                 and os.environ.get("FSL_READOUT_FUSED", "1") != "0")
+        from . import fsb_rows as _frows
         self._lr_combine_sr = out_short if fuse else None
         self._lr_combine_ev = sr_event
-        self._lr_inplace_sr = bool(inplace_sr and fuse and not self.fsb_enabled)
+        self._lr_inplace_sr = bool(inplace_sr and fuse and (not self.fsb_enabled or _frows.UCAP >= 512))
         self._lr_combined = False
         self._cell_stats_out = [] if want_cell_stats else None
 
@@ -336,9 +337,12 @@ class FSAttn(nn.Module):
                     content_only=self.sel_content_only, stats_out=st,
                 )
                 if sel_full is not None:
+                    res = self._cell_fused_lr(Q, K, V, sel_full, s, Bq, bias=None)
+                    del sel_full
                     if st:
                         self._cell_stats_out.append((K, st[0][0].float(), st[0][1]))
-                    return self._cell_fused_lr(Q, K, V, sel_full, s, Bq, bias=None)
+                        del st
+                    return res
         Qf = Q.float()
         if pad:
             Kp = torch.cat([K, K.new_zeros(B, H, pad, D)], dim=2)
@@ -648,10 +652,13 @@ class FSAttn(nn.Module):
                                            lam=self.sel_scale, sigv=sigma, scale=sc,
                                            content_only=self.sel_content_only, pool=P, stats_out=st)
                 if sel_full is not None:
+                    res = self._cell_fused_lr(Q, K, V, sel_full, s, Bq)
+                    del sel_full
                     if st:
                         # FSKVCache.prefill: its own ops' bits (torch's bf16 mean, then .float(), as below)
                         self._cell_stats_out.append((K, st[0][0].float(), st[0][1]))
-                    return self._cell_fused_lr(Q, K, V, sel_full, s, Bq)
+                        del st
+                    return res
         Vp = torch.cat([V, V.new_zeros(B, H, pad, D)], dim=2) if pad else V
         cen = (torch.arange(M, device=dev, dtype=torch.float32) + 0.5) * s
         cell_end = (torch.arange(M, device=dev, dtype=torch.float32) + 1.0) * s
@@ -830,8 +837,9 @@ class FSAttn(nn.Module):
         H, D = self.n_heads, self.head_dim
         is_std_prefill = (cache.pos == 0 and N > 1 and not getattr(cache, "lean_prefill", False)
                           and not getattr(cache, "bounded", False))
+        pre_ok = not self.fsb_enabled or (self.cell_stride == 32 and D == 64)
         pre = getattr(cache, "_prealloc", None) if (is_std_prefill and not torch.is_grad_enabled()
-                                                    and not self.fsb_enabled and not compiling()) else None
+                                                    and pre_ok and not compiling()) else None
         cap = N + max(0, int(getattr(cache, "reserve", 0))) if pre is not None else 0
         if (pre is not None and pre[0] == B and pre[1] == N and tuple(pre[2].shape) == (B, H, cap, D)
                 and pre[2].device == x.device):
@@ -850,7 +858,7 @@ class FSAttn(nn.Module):
                 K = wk
                 del wk
                 V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
-        elif is_std_prefill and not torch.is_grad_enabled() and not self.fsb_enabled and not compiling() and N > 4096:
+        elif is_std_prefill and not torch.is_grad_enabled() and pre_ok and not compiling() and N > 4096:
             K = self.W_k(x).view(B, N, H, D).transpose(1, 2).contiguous()
             V = self.W_v(x).view(B, N, H, D).transpose(1, 2).contiguous()
             Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
@@ -873,7 +881,7 @@ class FSAttn(nn.Module):
         if is_std_prefill:
             sigma = self.sigma
             used_chunk_rope = False
-            if (_rope and not _rope_lr and self.fs_uniform_sr and self.causal and not self.fsb_enabled
+            if (_rope and not _rope_lr and self.fs_uniform_sr and self.causal
                     and N > 16384 and Q.is_cuda and not torch.is_grad_enabled() and not compiling()
                     and os.environ.get("FSL_SLIDING_MODE", "chunked").lower() != "flex"
                     and os.environ.get("FSL_WINDOW_STREAM", "0") != "1"):
@@ -1268,12 +1276,8 @@ class FSAttn(nn.Module):
         if (x.is_cuda and B * N == 1 and not torch.is_grad_enabled()
                 and self.W_q.bias is None and self.W_k.bias is None and self.W_v.bias is None
                 and os.environ.get("FSL_TRUNK_FUSED", "1") != "0"):
-            qkv_w, dm = self._ensure_qkv_cache()
-            qkv = F.linear(x, qkv_w)
-            Q = qkv[..., :dm].view(B, N, H, D).transpose(1, 2)
-            K = qkv[..., dm:2 * dm].view(B, N, H, D).transpose(1, 2)
-            V = qkv[..., 2 * dm:].view(B, N, H, D).transpose(1, 2)
-            return Q, K, V
+            qkv_w, _ = self._ensure_qkv_cache()
+            return F.linear(x, qkv_w).view(3, B, H, N, D).unbind(0)
         return (self.W_q(x).view(B, N, H, D).transpose(1, 2),
                 self.W_k(x).view(B, N, H, D).transpose(1, 2),
                 self.W_v(x).view(B, N, H, D).transpose(1, 2))
@@ -1303,8 +1307,15 @@ class FSAttn(nn.Module):
         H, D = self.n_heads, self.head_dim
         Q, K, V = self._qkv_decode(x, B, N, H, D)
         pos_t = buf["pos_t"]
-        out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, self.sigma)
-        out_long = fsb_decode_token(self, Q, cache, self.sigma, pos_t)
+        fc = getattr(cache, "_fsb_forest", None)
+        tk = getattr(fc, "_tok", None)
+        sig = tk.get("sigma") if tk is not None and tk.get("sigma") is not None else self.sigma
+        out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig)
+        win_pos = buf.get("win_pos")
+        pos_f = win_pos[-1:] if win_pos is not None else None
+        out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f, sr=out_short)
+        if out_long.dim() == 3:
+            return self.W_o(out_long)
         out = out_short + self.long_range_scale.unsqueeze(0) * out_long
         return self.W_o(out.transpose(1, 2).contiguous().view(B, N, self.d_model))
 
@@ -1315,7 +1326,9 @@ class FSAttn(nn.Module):
         Q, K, V = self._qkv_decode(x, B, N, H, D)
         kbuf = buf["kbuf"]; vbuf = buf["vbuf"]
         pos_t = buf["pos_t"]
-        sigma = self.sigma
+        sigma = buf.get("sigma")
+        if sigma is None:
+            sigma = self.sigma
         out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma)
         pool = buf["pool"]
         if pool.get("empty", False):

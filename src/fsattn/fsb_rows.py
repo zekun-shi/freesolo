@@ -101,17 +101,21 @@ if _HAVE_TRITON:
 
     @triton.jit
     def _rows_cell_lse(qh, ql, kb, cell, j, d, S, sl, scale, DH: tl.constexpr, LSE_MODE: tl.constexpr,
-                       LO: tl.constexpr):
+                       LO: tl.constexpr, FULL_S: tl.constexpr = False, FULL_D: tl.constexpr = False):
         # the token logsumexp (or max) of the row's queries against one cell's S keys: bf16 tensor-core products of
         # the queries' high part (and, with LO, their low part) accumulated in fp32
-        k = tl.load(kb + (cell * S + j)[:, None] * sl + d[None, :], mask=(j[:, None] < S) & (d[None, :] < DH),
-                    other=0.0).to(tl.bfloat16)
+        if FULL_S and FULL_D:
+            k = tl.load(kb + (cell * S + j)[:, None] * sl + d[None, :]).to(tl.bfloat16)
+        else:
+            k = tl.load(kb + (cell * S + j)[:, None] * sl + d[None, :], mask=(j[:, None] < S) & (d[None, :] < DH),
+                        other=0.0).to(tl.bfloat16)
         kt = tl.trans(k)
         if LO:
             sc = (tl.dot(qh, kt) + tl.dot(ql, kt)) * scale
         else:
             sc = tl.dot(qh, kt) * scale
-        sc = tl.where(j[None, :] < S, sc, float("-inf"))
+        if not FULL_S:
+            sc = tl.where(j[None, :] < S, sc, float("-inf"))
         m = tl.max(sc, axis=1)
         if LSE_MODE:
             m = m + _ld.log(tl.sum(_ld.exp(sc - m[:, None]), axis=1))
@@ -119,10 +123,11 @@ if _HAVE_TRITON:
 
     @triton.jit
     def _rows_lse_loop(qh, ql, kb, CELLS, LSE, r, qi, j, d, U, u0, ustep, ucap, S, sl, scale, BQ: tl.constexpr,
-                       DH: tl.constexpr, LSE_MODE: tl.constexpr, LO: tl.constexpr):
+                       DH: tl.constexpr, LSE_MODE: tl.constexpr, LO: tl.constexpr,
+                       FULL_S: tl.constexpr = False, FULL_D: tl.constexpr = False):
         for u in range(u0, U, ustep):
             cell = tl.load(CELLS + r * ucap + u).to(tl.int64)
-            m = _rows_cell_lse(qh, ql, kb, cell, j, d, S, sl, scale, DH, LSE_MODE, LO)
+            m = _rows_cell_lse(qh, ql, kb, cell, j, d, S, sl, scale, DH, LSE_MODE, LO, FULL_S, FULL_D)
             tl.store(LSE + (r.to(tl.int64) * ucap + u) * BQ + qi, m)
 
     @triton.jit
@@ -152,19 +157,19 @@ if _HAVE_TRITON:
         U = tl.minimum(tl.load(UCNT + r), ucap)          # an overflowing row (deferred check) stays in bounds
         if QBF16:
             _rows_lse_loop(qh, qh, kb, CELLS, LSE, r, qi, j, d, U, p, nprog, ucap, S, sl, scale, BQ, DH, LSE_MODE,
-                           False)
+                           False, S == SP, DH == DHP)
         elif LOSKIP:
             # bf16-exact queries (the raw bf16 Q of eager prefill) have an all-zero low part, whose products are
             # exact zeros: skipping them changes no score (at most the sign of a zero score)
             if tl.max(tl.max(tl.abs(ql.to(tl.float32)), axis=1), axis=0) > 0:
                 _rows_lse_loop(qh, ql, kb, CELLS, LSE, r, qi, j, d, U, p, nprog, ucap, S, sl, scale, BQ, DH, LSE_MODE,
-                               True)
+                               True, S == SP, DH == DHP)
             else:
                 _rows_lse_loop(qh, ql, kb, CELLS, LSE, r, qi, j, d, U, p, nprog, ucap, S, sl, scale, BQ, DH, LSE_MODE,
-                               False)
+                               False, S == SP, DH == DHP)
         else:
             _rows_lse_loop(qh, ql, kb, CELLS, LSE, r, qi, j, d, U, p, nprog, ucap, S, sl, scale, BQ, DH, LSE_MODE,
-                           True)
+                           True, S == SP, DH == DHP)
 
     @triton.jit
     def _rows_select_kernel(SEL, IDX, LSE, CELLA, ca0, ca1, TIDX, QPOS, sq0, sq1, LAM, ls0, SIG, ss0, OUT, PROV,
@@ -220,11 +225,11 @@ if _HAVE_TRITON:
         qm = qi < Bq
         rq = r * Bq + qi
         isa = c < Ca
-        cell = tl.load(SELA + rq[:, None] * Ca + c[None, :], mask=qm[:, None] & isa[None, :], other=-1)
+        cell = tl.load(SELA + rq[:, None] * Ca + c[None, :], mask=qm[:, None] & isa[None, :], other=-1).to(tl.int32)
         if HAS_B:
             jb = tl.where(isa, 0, c - Ca)
             isb = (c >= Ca) & (c < Ca + Cb)
-            cb = tl.load(SELB + rq[:, None] * Cb + jb[None, :], mask=qm[:, None] & isb[None, :], other=-1)
+            cb = tl.load(SELB + rq[:, None] * Cb + jb[None, :], mask=qm[:, None] & isb[None, :], other=-1).to(tl.int32)
             dup = tl.load(DUP + rq, mask=qm, other=0)
             dupb = ((dup[:, None] >> jb[None, :].to(tl.int64)) & 1) != 0
             cell = tl.where(isa[None, :], cell, tl.where(dupb, -1, cb))
@@ -239,22 +244,18 @@ if _HAVE_TRITON:
             u = u + tl.load(LAM + r * ls0) * a * tl.math.erf(
                 tl.math.div_rn(tl.abs(qp[:, None] - (cz.to(tl.float32) + 0.5) * S), 2.0 * tl.load(SIG + r * ss0)))
         u = tl.where(ok, u, float("-inf"))
-        k2 = tl.arange(0, KP2)
-        out = tl.full((BQ, KP2), -1, tl.int64)
-        src = tl.full((BQ, KP2), 0, tl.int32)
         for kk in tl.static_range(KK):
             mx = tl.max(u, axis=1)
             am = tl.argmax(u, axis=1, tie_break_left=True)
             hit = c[None, :] == am[:, None]
             cv = tl.sum(tl.where(hit, cell, 0), axis=1)
-            out = tl.where(k2[None, :] == kk, tl.where(mx > float("-inf"), cv, -1)[:, None], out)
-            src = tl.where(k2[None, :] == kk, am[:, None], src)
-            u = tl.where(hit, float("-inf"), u)
-        om = qm[:, None] & (k2[None, :] < KK)
-        tl.store(OUT + rq[:, None] * KK + k2[None, :], out, mask=om)
-        if PRV:
-            pv = tl.where(out < 0, -1, tl.where(src >= Ca, PROV_BIT, 0))
-            tl.store(PROV + rq[:, None] * KK + k2[None, :], pv.to(tl.int8), mask=om)
+            val = tl.where(mx > float("-inf"), cv, -1)
+            tl.store(OUT + rq * KK + kk, val, mask=qm)
+            if PRV:
+                pv = tl.where(val < 0, -1, tl.where(am >= Ca, PROV_BIT, 0))
+                tl.store(PROV + rq * KK + kk, pv.to(tl.int8), mask=qm)
+            if kk + 1 < KK:
+                u = tl.where(hit, float("-inf"), u)
 
 
 def _row_union(sel: torch.Tensor, Mc: int, ucap: int):
@@ -291,8 +292,9 @@ def rows_ok(q: torch.Tensor, tokK, s: int, K: int, score: str, *, allow_capture:
 @torch.no_grad()
 def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.Tensor, lam: torch.Tensor,
                       sigv: torch.Tensor, cellA: torch.Tensor, t_idx: torch.Tensor, scale: float, s: int, K: int,
-                      score: str, tokK: torch.Tensor, prov: bool = False, ovf_out=None, q_bf16: bool = False):
-    # union_candidates + rerank_top (+ utau_prov_add) for batched prefill rows -> (cells (T',Bq,K) int64,
+                      score: str, tokK: torch.Tensor, prov: bool = False, ovf_out=None, q_bf16: bool = False,
+                      out: torch.Tensor = None, pv_out: torch.Tensor = None):
+    # union_candidates + rerank_top (+ utau_prov_add) for batched prefill rows -> (cells (T',Bq,K) int64 (or out),
     # provenance (T',Bq,K) int8 or None); None when a row has more than UCAP distinct candidates. With a list ovf_out
     # (and FSB_ROWS_DEFER on) that check does not sync: a device flag (True = some row overflowed, the result is
     # invalid and the caller must redo the stage without the rows path) is appended to ovf_out instead. Rows cannot
@@ -329,17 +331,12 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
             return None
     K4 = _key4(tokK)
     BQ = max(16, _pow2(Bq))
-    lse = torch.empty((Tp, UCAP, BQ), dtype=torch.float32, device=dev)
-    _rows_lse_kernel[(Tp, rows_lse_split() if un is not None else 1)](
-        q.reshape(rows, Dh).contiguous(), cells, cnt, K4, lse, t_idx.contiguous(), Bq, UCAP, K4.shape[1],
-        K4.stride(0), K4.stride(1), K4.stride(2), float(scale), s, BQ=BQ, DH=Dh, DHP=max(16, _pow2(Dh)),
-        SP=max(16, _pow2(s)), LSE_MODE=(score != "max"), LOSKIP=rows_loskip_on(), QBF16=q_bf16 and rows_loskip_on(),
-        num_warps=4)
     qv, sq0, sq1 = _row_view(qpos, Tp, Bq)
     lv, ls0, _ = _row_view(lam, Tp, 1)
     sv, ss0, _ = _row_view(sigv, Tp, 1)
-    out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
-    pv = torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev) if prov else out
+    if out is None:
+        out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
+    pv = (pv_out if pv_out is not None else torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev)) if prov else out
     if un is not None and not rows_tile_ok(Bq, C):
         # a tile too large for one program: the per-query select on union_candidates' slots (the CUDA union's
         # positions equal _row_union's for every present cell, the only ones the select reads; same cells bitwise)
@@ -349,12 +346,33 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
         un = None
     if un is not None:
         sa = sel_a.contiguous()
-        _rows_select_rows_kernel[(Tp,)](sa, sel_b.contiguous() if Cb else sa, dup if Cb else cnt, pos, lse, cellA,
-                                        cellA.stride(0), cellA.stride(1), t_idx.contiguous(), qv, sq0, sq1, lv, ls0,
-                                        sv, ss0, out, pv, Bq, Ca, Cb, Mc, UCAP, s, PROV_UTAU, BQ=BQ, CP=_pow2(C),
-                                        KK=K, KP2=_pow2(K), POS=(score == "lse_pos"), PRV=prov, HAS_B=Cb > 0,
-                                        num_warps=4)
+        sb = sel_b.contiguous() if Cb else sa
+        q_c = q.reshape(Tp, Bq, Dh).contiguous()
+        t_c = t_idx.contiguous()
+        r_step = min(Tp, 1024) if Tp > 1024 else max(1, Tp)
+        lse = torch.empty((r_step, UCAP, BQ), dtype=torch.float32, device=dev)
+        for r0 in range(0, Tp, r_step):
+            r1 = min(r0 + r_step, Tp)
+            nr = r1 - r0
+            lse_c = lse[:nr]
+            _rows_lse_kernel[(nr, rows_lse_split())](
+                q_c[r0:r1].reshape(nr * Bq, Dh), cells[r0:r1], cnt[r0:r1], K4, lse_c, t_c[r0:r1], Bq, UCAP,
+                K4.shape[1], K4.stride(0), K4.stride(1), K4.stride(2), float(scale), s, BQ=BQ, DH=Dh,
+                DHP=max(16, _pow2(Dh)), SP=max(16, _pow2(s)), LSE_MODE=(score != "max"), LOSKIP=rows_loskip_on(),
+                QBF16=q_bf16 and rows_loskip_on(), num_warps=4)
+            _rows_select_rows_kernel[(nr,)](
+                sa[r0:r1], sb[r0:r1], dup[r0:r1] if Cb else cnt[r0:r1], pos[r0:r1], lse_c, cellA,
+                cellA.stride(0), cellA.stride(1), t_c[r0:r1], qv[r0:r1], sq0, sq1, lv[r0:r1], ls0,
+                sv[r0:r1], ss0, out[r0:r1], pv[r0:r1] if prov else out[r0:r1], Bq, Ca, Cb, Mc, UCAP, s, PROV_UTAU,
+                BQ=BQ, CP=_pow2(C), KK=K, KP2=_pow2(K), POS=(score == "lse_pos"), PRV=prov, HAS_B=Cb > 0,
+                num_warps=4)
     else:
+        lse = torch.empty((Tp, UCAP, BQ), dtype=torch.float32, device=dev)
+        _rows_lse_kernel[(Tp, 1)](
+            q.reshape(rows, Dh).contiguous(), cells, cnt, K4, lse, t_idx.contiguous(), Bq, UCAP, K4.shape[1],
+            K4.stride(0), K4.stride(1), K4.stride(2), float(scale), s, BQ=BQ, DH=Dh, DHP=max(16, _pow2(Dh)),
+            SP=max(16, _pow2(s)), LSE_MODE=(score != "max"), LOSKIP=rows_loskip_on(), QBF16=q_bf16 and rows_loskip_on(),
+            num_warps=4)
         _rows_select_kernel[(rows,)](sel, pos, lse, cellA, cellA.stride(0), cellA.stride(1), t_idx.contiguous(), qv,
                                      sq0, sq1, lv, ls0, sv, ss0, out, pv, Bq, C, Ca, Mc, UCAP, s, PROV_UTAU,
                                      BQ=BQ, CP=_pow2(C), KK=K, KP2=_pow2(K), POS=(score == "lse_pos"), PRV=prov,

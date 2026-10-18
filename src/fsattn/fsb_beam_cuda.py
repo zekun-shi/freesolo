@@ -333,7 +333,13 @@ def forest_beam_pair_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
                 import warnings
                 warnings.warn(f"FS-B CUDA beam unavailable, using the Triton kernel: {e!r}")
             return None
-    qc, qp = q.contiguous(), qpos.contiguous()
+    qc = q.contiguous()
+    if qpos.is_contiguous():
+        qp, qp_s = qpos, 1
+    elif qpos.stride(0) == 0 and (Bq == 1 or qpos.stride(-1) == 0):
+        qp, qp_s = qpos, 0
+    else:
+        qp, qp_s = qpos.contiguous(), 1
     lm, sg = lam.reshape(-1).contiguous(), sigv.reshape(-1).contiguous()
     rc = radius_coef.reshape(-1).float().contiguous() if rc_t else qc
     keep, outs, ps = [qc, qp, lm, sg, rc], [], []
@@ -350,7 +356,8 @@ def forest_beam_pair_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     P, I64, F32 = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float
     nq = Tp * Bq
     args = [ps[0], ps[1], P(qc.data_ptr()), P(rc.data_ptr()), F32(1.0 if rc_t else float(radius_coef)),
-            P(qp.data_ptr()), P(lm.data_ptr()), P(sg.data_ptr()), I64(Bq), I64(nq), F32(float(scale)), F32(float(s))]
+            P(qp.data_ptr()), P(lm.data_ptr()), P(sg.data_ptr()), I64(Bq), I64(nq), F32(float(scale)), F32(float(s)),
+            I64(qp_s)]
     launch(fn, (nq, 2), 32, dev, args)
     return outs
 
@@ -372,7 +379,7 @@ def beam_rows_on() -> bool:
 def _rows_layout(CAP: int, UMAX: int, QB: int):
     # byte offsets of the rows kernel's dynamic shared memory regions (16-byte aligned) and the total
     sizes = (("MU", max(CAP * 256, QB // 16 * _WARPS_BYTES)), ("UM", 32 * UMAX), ("UM2", 16 * UMAX),
-             ("MARK", 2 * UMAX), ("RANK", 2 * UMAX), ("FRONT", QB * 64), ("SC", QB * 36 * 4), ("CU", QB * 64))
+             ("MARK", 2 * UMAX), ("RANK", 2 * UMAX), ("FRONT", QB * 64), ("SC", QB * 36 * 4), ("CU", QB * 34 * 2))
     off, o = {}, 0
     for name, size in sizes:
         off[name] = o

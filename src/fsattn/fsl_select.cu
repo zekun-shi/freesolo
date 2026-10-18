@@ -695,13 +695,20 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_fused(
     const int row0 = 16 * warp + g;
 #pragma unroll
     for (int nt = 0; nt < NTL; nt++) {
+        const int j0 = 8 * nt + 2 * t4;
 #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const int row = row0 + 8 * (e >> 1);
-            const int j = 8 * nt + 2 * t4 + (e & 1);
-            const unsigned cb = f2bf(acc[nt][e]);                          // the GEMM's bf16 content
-            if (dbg != nullptr && row < Bq) dbg[((bh * nbc + nl) * (long long)Bq + row) * C + j] = (unsigned short)cb;
-            sx[row * SXH + j] = (unsigned short)f2bf(f_mul(bf2f(cb), scale));   // torch: bf16(content * scale)
+        for (int e2 = 0; e2 < 2; e2++) {
+            const int row = row0 + 8 * e2;
+            const unsigned cb0 = f2bf(acc[nt][2 * e2]);
+            const unsigned cb1 = f2bf(acc[nt][2 * e2 + 1]);
+            if (dbg != nullptr && row < Bq) {
+                unsigned short* d_row = dbg + ((bh * nbc + nl) * (long long)Bq + row) * C + j0;
+                d_row[0] = (unsigned short)cb0;
+                d_row[1] = (unsigned short)cb1;
+            }
+            const unsigned s0 = f2bf(f_mul(bf2f(cb0), scale));
+            const unsigned s1 = f2bf(f_mul(bf2f(cb1), scale));
+            *reinterpret_cast<unsigned*>(sx + row * SXH + j0) = s0 | (s1 << 16);
         }
     }
     __syncthreads();
@@ -713,23 +720,31 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_fused(
     for (int i = 0; i < KK; i++) { bv[i] = __int_as_float(0xff800000); bj[i] = 0; }
     // slots without erf in slot order, branch-free (equal scores keep the lower slot: strict >); erf slots are
     // skipped (-inf never enters) and inserted below with the (score, slot) order, which gives the same top KK
-#pragma unroll 8
-    for (int j = 0; j < C; j++) {
-        const float x = bf2f(xr[j]);
-        const int kd = nr[j];
-        float sc = content_only ? x : f_add(x, ts[j]);                 // == fma(lam*ceil, 1.0f, x): erf == 1
-        sc = kd == 0 ? NEG_SCORE : sc;
-        sc = kd == 2 ? __int_as_float(0xff800000) : sc;
-        bool gt[KK];
+#pragma unroll 4
+    for (int j2 = 0; j2 < C; j2 += 2) {
+        const unsigned x2 = *reinterpret_cast<const unsigned*>(xr + j2);
+        const float2 ts2 = *reinterpret_cast<const float2*>(ts + j2);
+        const int2 nr2 = *reinterpret_cast<const int2*>(nr + j2);
 #pragma unroll
-        for (int i = 0; i < KK; i++) gt[i] = sc > bv[i];
+        for (int sub = 0; sub < 2; sub++) {
+            const int j = j2 + sub;
+            const float x = bf2f(sub == 0 ? (x2 & 0xffffu) : (x2 >> 16));
+            const int kd = sub == 0 ? nr2.x : nr2.y;
+            const float ts_v = sub == 0 ? ts2.x : ts2.y;
+            float sc = content_only ? x : f_add(x, ts_v);                 // == fma(lam*ceil, 1.0f, x): erf == 1
+            sc = kd == 0 ? NEG_SCORE : sc;
+            sc = kd == 2 ? __int_as_float(0xff800000) : sc;
+            bool gt[KK];
 #pragma unroll
-        for (int i = KK - 1; i > 0; i--) {
-            bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
-            bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? j : bj[i]);
+            for (int i = 0; i < KK; i++) gt[i] = sc > bv[i];
+#pragma unroll
+            for (int i = KK - 1; i > 0; i--) {
+                bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
+                bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? j : bj[i]);
+            }
+            bv[0] = gt[0] ? sc : bv[0];
+            bj[0] = gt[0] ? j : bj[0];
         }
-        bv[0] = gt[0] ? sc : bv[0];
-        bj[0] = gt[0] ? j : bj[0];
     }
     const int nn = nnear[0];
     const float qpos = f_add((float)tid, bst);
@@ -762,16 +777,16 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_dense_fused(
     const float scale, const long long Npad, const int content_only, const int pflags)
 {
     constexpr int CD = 64;
-    constexpr int SXH = CD + 2;
+    constexpr int SXH = CD + 8;                                               // 72 bf16 (144 B): 16B-aligned rows, 4-bank skew
     extern __shared__ uint4 dsm[];
     unsigned short* qs = reinterpret_cast<unsigned short*>(dsm);
     unsigned short* ks = reinterpret_cast<unsigned short*>(dsm);
     unsigned short* sx = ks + CD * FROW;
-    float* ts = reinterpret_cast<float*>(reinterpret_cast<char*>(dsm) + (((CD * FROW + 128 * SXH) * 2 + 15) / 16) * 16);
-    float* cs = ts + CD;
-    int* nr = reinterpret_cast<int*>(cs + CD);
-    int* nearl = nr + CD;
-    int* nnear = nearl + CD;
+    float* ts_all = reinterpret_cast<float*>(reinterpret_cast<char*>(dsm) + (((CD * FROW + 128 * SXH) * 2 + 15) / 16) * 16);
+    float* cs_all = ts_all + 2 * CD;
+    int* nr_all = reinterpret_cast<int*>(cs_all + 2 * CD);
+    int* nearl_all = nr_all + 2 * CD;
+    int* nnear_all = nearl_all + 2 * CD;
 
     const long long blk = blockIdx.x;
     const long long BH = (long long)gridDim.x / nb;
@@ -807,6 +822,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_dense_fused(
             cp16(qs + r * FROW + w * 8, in ? qb + tok * qsN + w * 8 : qb, in ? 16u : 0u);
         }
         cp_commit();
+        if (tid < 2) nnear_all[tid] = 0;
         cp_wait_all();
     }
     __syncthreads();
@@ -820,30 +836,43 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_dense_fused(
     }
     __syncthreads();
 
+    const uint4* kb_src = reinterpret_cast<const uint4*>(kbar + bh * M * 64);
+    const float* ceil_bh = ceil + bh * M;
+    {
+        const int nc0 = (int)(mvis < CD ? mvis : CD);
+#pragma unroll
+        for (int k = 0; k < 2; k++) {
+            const int v = tid + 256 * k, j = v >> 3, w = v & 7;
+            const bool in = j < nc0;
+            cp16(ks + j * FROW + w * 8, in ? kb_src + j * 8 + w : kb_src, in ? 16u : 0u);
+        }
+        cp_commit();
+    }
+
     float bv[KK];
     int bj[KK];
 #pragma unroll
     for (int i = 0; i < KK; i++) { bv[i] = __int_as_float(0xff800000); bj[i] = -1; }
     const float qpos = f_add((float)tid, bst);
-    const uint4* kb_src = reinterpret_cast<const uint4*>(kbar + bh * M * 64);
 
-    for (long long c0 = 0; c0 < mvis; c0 += CD) {
+    int buf = 0;
+    for (long long c0 = 0; c0 < mvis; c0 += CD, buf ^= 1) {
         const int nc = (int)(mvis - c0 < CD ? mvis - c0 : CD);
-#pragma unroll
-        for (int k = 0; k < 2; k++) {
-            const int v = tid + 256 * k, j = v >> 3, w = v & 7;
-            const bool in = j < nc;
-            cp16(ks + j * FROW + w * 8, in ? kb_src + (c0 + j) * 8 + w : kb_src, in ? 16u : 0u);
-        }
-        cp_commit();
-        if (tid == 0) nnear[0] = 0;
-        __syncthreads();
+        const bool all_far = (nc == CD) && (content_only || (f_sub(bst, f_mul(f_add((float)(c0 + CD - 1), 0.5f), (float)s)) >= erf_margin));
+        float* ts = ts_all + buf * CD;
+        float* cs = cs_all + buf * CD;
+        int* nr = nr_all + buf * CD;
+        int* nearl = nearl_all + buf * CD;
+        int* nnear = nnear_all + buf;
+
         if (tid < CD) {
-            if (tid < nc) {
+            if (all_far) {
+                ts[tid] = content_only ? 0.0f : f_mul(lam_h, ceil_bh[c0 + tid]);
+            } else if (tid < nc) {
                 const long long c = c0 + tid;
                 const float cen = f_mul(f_add((float)c, 0.5f), (float)s);
                 const bool near = !(f_sub(bst, cen) >= erf_margin);
-                ts[tid] = f_mul(lam_h, ceil[bh * M + c]);
+                ts[tid] = f_mul(lam_h, ceil_bh[c]);
                 cs[tid] = cen;
                 nr[tid] = (near && !content_only) ? 2 : 1;
                 if (near && !content_only) nearl[atomicAdd(nnear, 1)] = tid;
@@ -872,55 +901,114 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_dense_fused(
         }
 #pragma unroll
         for (int nt = 0; nt < 8; nt++) {
+            const int j0 = 8 * nt + 2 * t4;
 #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int row = row0 + 8 * (e >> 1);
-                const int j = 8 * nt + 2 * t4 + (e & 1);
-                const unsigned cb = f2bf(acc[nt][e]);
-                sx[row * SXH + j] = (unsigned short)f2bf(f_mul(bf2f(cb), scale));
+            for (int e2 = 0; e2 < 2; e2++) {
+                const int row = row0 + 8 * e2;
+                const unsigned cb0 = f2bf(acc[nt][2 * e2]);
+                const unsigned cb1 = f2bf(acc[nt][2 * e2 + 1]);
+                const unsigned s0 = f2bf(f_mul(bf2f(cb0), scale));
+                const unsigned s1 = f2bf(f_mul(bf2f(cb1), scale));
+                *reinterpret_cast<unsigned*>(sx + row * SXH + j0) = s0 | (s1 << 16);
             }
         }
+        if (tid == 0) nnear_all[buf ^ 1] = 0;
         __syncthreads();
+
+        if (c0 + CD < mvis) {
+            const long long c_next = c0 + CD;
+            const int nc_next = (int)(mvis - c_next < CD ? mvis - c_next : CD);
+#pragma unroll
+            for (int k = 0; k < 2; k++) {
+                const int v = tid + 256 * k, j = v >> 3, w = v & 7;
+                const bool in = j < nc_next;
+                cp16(ks + j * FROW + w * 8, in ? kb_src + (c_next + j) * 8 + w : kb_src, in ? 16u : 0u);
+            }
+            cp_commit();
+        }
 
         if (tid < Bq) {
             const unsigned short* xr = sx + tid * SXH;
+            if (all_far) {
 #pragma unroll 8
-            for (int j = 0; j < CD; j++) {
-                const float x = bf2f(xr[j]);
-                const int kd = nr[j];
-                float sc = content_only ? x : f_add(x, ts[j]);
-                sc = (kd != 1) ? __int_as_float(0xff800000) : sc;
-                const int cell = (int)c0 + j;
-                bool gt[KK];
+                for (int j8 = 0; j8 < CD; j8 += 8) {
+                    const uint4 x8 = *reinterpret_cast<const uint4*>(xr + j8);
+                    const unsigned xv[4] = { x8.x, x8.y, x8.z, x8.w };
 #pragma unroll
-                for (int i = 0; i < KK; i++) gt[i] = sc > bv[i];
+                    for (int pair = 0; pair < 2; pair++) {
+                        const int j4 = j8 + 4 * pair;
+                        const float4 ts4 = *reinterpret_cast<const float4*>(ts + j4);
+                        const float tsv[4] = { ts4.x, ts4.y, ts4.z, ts4.w };
 #pragma unroll
-                for (int i = KK - 1; i > 0; i--) {
-                    bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
-                    bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? cell : bj[i]);
+                        for (int w = 0; w < 2; w++) {
+                            const unsigned x2 = xv[2 * pair + w];
+#pragma unroll
+                            for (int sub = 0; sub < 2; sub++) {
+                                const int idx = 2 * w + sub;
+                                const int j = j4 + idx;
+                                const float x = bf2f(sub == 0 ? (x2 & 0xffffu) : (x2 >> 16));
+                                const float sc = content_only ? x : f_add(x, tsv[idx]);
+                                const int cell = (int)c0 + j;
+                                bool gt[KK];
+#pragma unroll
+                                for (int i = 0; i < KK; i++) gt[i] = sc > bv[i];
+#pragma unroll
+                                for (int i = KK - 1; i > 0; i--) {
+                                    bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
+                                    bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? cell : bj[i]);
+                                }
+                                bv[0] = gt[0] ? sc : bv[0];
+                                bj[0] = gt[0] ? cell : bj[0];
+                            }
+                        }
+                    }
                 }
-                bv[0] = gt[0] ? sc : bv[0];
-                bj[0] = gt[0] ? cell : bj[0];
-            }
-            const int nn = nnear[0];
-            for (int u = 0; u < nn; u++) {
-                const int j = nearl[u];
-                const int cell = (int)c0 + j;
-                const float d = __uint_as_float(__float_as_uint(f_sub(qpos, cs[j])) & 0x7fffffffu);
-                const float sc = f_fma(ts[j], erf_tl(f_div_full(d, den)), bf2f(xr[j]));
-                bool gt[KK];
+            } else {
+#pragma unroll 4
+                for (int j2 = 0; j2 < CD; j2 += 2) {
+                    const unsigned x2 = *reinterpret_cast<const unsigned*>(xr + j2);
+                    const float2 ts2 = *reinterpret_cast<const float2*>(ts + j2);
+                    const int2 nr2 = *reinterpret_cast<const int2*>(nr + j2);
 #pragma unroll
-                for (int i = 0; i < KK; i++) gt[i] = sc > bv[i] || (sc == bv[i] && cell < bj[i]);
+                    for (int sub = 0; sub < 2; sub++) {
+                        const int j = j2 + sub;
+                        const float x = bf2f(sub == 0 ? (x2 & 0xffffu) : (x2 >> 16));
+                        const int kd = sub == 0 ? nr2.x : nr2.y;
+                        const float ts_v = sub == 0 ? ts2.x : ts2.y;
+                        float sc = content_only ? x : f_add(x, ts_v);
+                        sc = (kd != 1) ? __int_as_float(0xff800000) : sc;
+                        const int cell = (int)c0 + j;
+                        bool gt[KK];
 #pragma unroll
-                for (int i = KK - 1; i > 0; i--) {
-                    bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
-                    bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? cell : bj[i]);
+                        for (int i = 0; i < KK; i++) gt[i] = sc > bv[i];
+#pragma unroll
+                        for (int i = KK - 1; i > 0; i--) {
+                            bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
+                            bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? cell : bj[i]);
+                        }
+                        bv[0] = gt[0] ? sc : bv[0];
+                        bj[0] = gt[0] ? cell : bj[0];
+                    }
                 }
-                bv[0] = gt[0] ? sc : bv[0];
-                bj[0] = gt[0] ? cell : bj[0];
+                const int nn = nnear[0];
+                for (int u = 0; u < nn; u++) {
+                    const int j = nearl[u];
+                    const int cell = (int)c0 + j;
+                    const float d = __uint_as_float(__float_as_uint(f_sub(qpos, cs[j])) & 0x7fffffffu);
+                    const float sc = f_fma(ts[j], erf_tl(f_div_full(d, den)), bf2f(xr[j]));
+                    bool gt[KK];
+#pragma unroll
+                    for (int i = 0; i < KK; i++) gt[i] = sc > bv[i] || (sc == bv[i] && cell < bj[i]);
+#pragma unroll
+                    for (int i = KK - 1; i > 0; i--) {
+                        bv[i] = gt[i - 1] ? bv[i - 1] : (gt[i] ? sc : bv[i]);
+                        bj[i] = gt[i - 1] ? bj[i - 1] : (gt[i] ? cell : bj[i]);
+                    }
+                    bv[0] = gt[0] ? sc : bv[0];
+                    bj[0] = gt[0] ? cell : bj[0];
+                }
             }
         }
-        __syncthreads();
     }
     if (tid < Bq) {
         int* o = sel + (bh * Npad + n * Bq + tid) * (long long)KK;
@@ -929,3 +1017,150 @@ extern "C" __global__ void __launch_bounds__(256, 4) fsl_dense_fused(
     }
 }
 #endif
+
+// ---- coalesced CUDA replacement for _fs_dense_decode_topk_split_kernel (AUTOCAST_BF16=1, D=64) ----
+// Each CTA handles one (bh, sm) split of BLOCK_C <= 1024 cells using 4 warps (128 threads).
+// Instead of strided per-thread loads of Kbar[c, d] with stride 64 across c (which causes 16x L1 over-fetch),
+// each warp cooperatively loads 32 cells of 64 floats using 100% coalesced float4 reads into shared memory,
+// then each thread computes the exact 16-step bf16 dot product for its cell from shared memory.
+extern "C" __global__ void __launch_bounds__(128, 4) fsl_dense_decode_topk(
+    const void* __restrict__ Q, const float* __restrict__ Kbar, const float* __restrict__ ceil,
+    const long long* __restrict__ pos_ptr, const int* __restrict__ m_vis_ptr,
+    const void* __restrict__ lam, const void* __restrict__ sigv,
+    float* __restrict__ part_s, int* __restrict__ part_c,
+    const long long sqb, const long long sqh, const long long H,
+    const float scale, const int max_cells, const int cell_size,
+    const int k_sel, const int split_m, const int block_c, const int pflags)
+{
+    __shared__ float smem[4][32][65];
+    __shared__ float s_sc[1024];
+    __shared__ float q_bf[64];
+
+    const int blk = blockIdx.x;
+    const int bh = blk / split_m;
+    const int sm = blk - bh * split_m;
+    const long long b = bh / H, h = bh - b * H;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int m_vis = *m_vis_ptr;
+    const int limit = m_vis < max_cells ? m_vis : max_cells;
+    const float pos_f = (float)(*pos_ptr);
+    const float lam_h = ld_par(lam, pflags & 1, h);
+    const float sg = ld_par(sigv, pflags & 2, h);
+    const float den = f_add(sg, sg);
+    const float erf_margin = f_mul(__uint_as_float(XS_SAFE), den);
+    const float scale_bf = bf2f(f2bf(scale));
+    const float s_f = (float)cell_size;
+
+    if (tid < 64) {
+        float qv;
+        if (pflags & 4) {
+            qv = bf2f((reinterpret_cast<const unsigned short*>(Q) + b * sqb + h * sqh)[tid]);
+        } else {
+            qv = bf2f(f2bf((reinterpret_cast<const float*>(Q) + b * sqb + h * sqh)[tid]));
+        }
+        q_bf[tid] = qv;
+    }
+    __syncthreads();
+
+    const int c_start = sm * block_c;
+    const float* kb_bh = Kbar + (long long)bh * max_cells * 64;
+    const float* ceil_bh = ceil + (long long)bh * max_cells;
+
+    for (int c_chunk = 0; c_chunk < block_c; c_chunk += 128) {
+        const int c_base = c_chunk + warp * 32;
+        const int col4 = lane & 15;
+#pragma unroll
+        for (int u = 0; u < 16; u++) {
+            const int cell_local = u * 2 + (lane >> 4);
+            const int c_idx = c_start + c_base + cell_local;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (c_idx < limit) {
+                v = *reinterpret_cast<const float4*>(kb_bh + (long long)c_idx * 64 + col4 * 4);
+            }
+            float* dst = &smem[warp][cell_local][col4 * 4];
+            dst[0] = v.x;
+            dst[1] = v.y;
+            dst[2] = v.z;
+            dst[3] = v.w;
+        }
+        __syncwarp();
+
+        const int c_local = c_base + lane;
+        const int c = c_start + c_local;
+        float sc = __int_as_float(0xff800000);
+        if (c_local < block_c && c < limit) {
+            const float* k_smem = smem[warp][lane];
+            float dot = 0.0f;
+#pragma unroll
+            for (int tx = 0; tx < 16; tx++) {
+                const float k0 = bf2f(f2bf(k_smem[0 + tx]));
+                const float k1 = bf2f(f2bf(k_smem[16 + tx]));
+                const float k2 = bf2f(f2bf(k_smem[32 + tx]));
+                const float k3 = bf2f(f2bf(k_smem[48 + tx]));
+                const float t_tx = f_add(f_add(f_add(f_mul(q_bf[0 + tx], k0), f_mul(q_bf[16 + tx], k1)),
+                                               f_mul(q_bf[32 + tx], k2)),
+                                         f_mul(q_bf[48 + tx], k3));
+                dot = f_add(dot, t_tx);
+            }
+            const float content = bf2f(f2bf(f_mul(bf2f(f2bf(dot)), scale_bf)));
+            const float cen = f_mul(f_add((float)c, 0.5f), s_f);
+            const float ceil_v = ceil_bh[c];
+            const float ts_v = f_mul(lam_h, ceil_v);
+            const float dist = __uint_as_float(__float_as_uint(f_sub(pos_f, cen)) & 0x7fffffffu);
+            const float erf_v = (dist >= erf_margin) ? 1.0f : erf_tl(f_div_full(dist, den));
+            sc = f_add(content, f_mul(ts_v, erf_v));
+        }
+        if (c_local < block_c) {
+            s_sc[c_local] = sc;
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        const int out_base = (bh * split_m + sm) * k_sel;
+        const int sentinel = max_cells + block_c;
+        for (int slot = 0; slot < k_sel; slot++) {
+            float my_max = __int_as_float(0xff800000);
+            for (int idx = tid; idx < block_c; idx += 32) {
+                const float v = s_sc[idx];
+                my_max = v > my_max ? v : my_max;
+            }
+#pragma unroll
+            for (int d = 16; d >= 1; d >>= 1) {
+                const float o = __shfl_xor_sync(0xffffffffu, my_max, d);
+                my_max = o > my_max ? o : my_max;
+            }
+            const bool has_valid = my_max > __int_as_float(0xff800000);
+            int my_best = sentinel;
+            if (has_valid) {
+                for (int idx = tid; idx < block_c; idx += 32) {
+                    const int c = c_start + idx;
+                    if (c < limit && s_sc[idx] == my_max) {
+                        my_best = c;
+                        break;
+                    }
+                }
+            }
+#pragma unroll
+            for (int d = 16; d >= 1; d >>= 1) {
+                const int o = __shfl_xor_sync(0xffffffffu, my_best, d);
+                my_best = o < my_best ? o : my_best;
+            }
+            const bool valid = my_best < m_vis;
+            if (tid == 0) {
+                part_s[out_base + slot] = valid ? my_max : __int_as_float(0xff800000);
+                part_c[out_base + slot] = valid ? my_best : -1;
+                if (valid) {
+                    s_sc[my_best - c_start] = __int_as_float(0xff800000);
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+

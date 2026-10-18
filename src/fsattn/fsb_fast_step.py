@@ -197,45 +197,71 @@ if _HAVE_TRITON:
         res = tl.where(has & (outu > float("-inf")), outs, -1)
         tl.store(OUT + pid * K + k2, res, mask=k2 < K)
 
-    @triton.jit
-    def _fsb_union_pos_kernel(SELA, SELB, SEL, X, QPOS, sq0, sq1, SIG, ss0, ss1, Ca, Cb, C, Bq, S,
-                              CAP: tl.constexpr, CBP: tl.constexpr, HAS_B: tl.constexpr, POS: tl.constexpr):
-        # one query row r = t' * Bq + b: union_candidates (beam-b cells that beam a also found become -1) and,
-        # for lse_pos, rerank_top's erf argument |qpos - (cell + 0.5) s| / (2 sigma) of every slot with the same
-        # IEEE operations; the caller applies torch.erf (Triton's erf rounds differently)
-        r = tl.program_id(0)
-        t = r // Bq
-        b = r - t * Bq
-        ia = tl.arange(0, CAP)
-        a = tl.load(SELA + r * Ca + ia, mask=ia < Ca, other=-1)
-        tl.store(SEL + r * C + ia, a, mask=ia < Ca)
-        if POS:
-            qp = tl.load(QPOS + t * sq0 + b * sq1)
-            den = 2.0 * tl.load(SIG + t * ss0 + b * ss1)
-            xa = tl.math.div_rn(tl.abs(qp - (a.to(tl.float32) + 0.5) * S), den)
-            tl.store(X + r * C + ia, xa, mask=ia < Ca)
-        if HAS_B:
-            ib = tl.arange(0, CBP)
-            sb_ = tl.load(SELB + r * Cb + ib, mask=ib < Cb, other=-1)
-            dup = tl.sum(((sb_[:, None] == a[None, :]) & (ia[None, :] < Ca)).to(tl.int32), axis=1) > 0
-            sb_ = tl.where(dup, -1, sb_)
-            tl.store(SEL + r * C + Ca + ib, sb_, mask=ib < Cb)
-            if POS:
-                xb = tl.math.div_rn(tl.abs(qp - (sb_.to(tl.float32) + 0.5) * S), den)
-                tl.store(X + r * C + Ca + ib, xb, mask=ib < Cb)
+    import struct as _struct
+
+    def _hf(u: int):
+        return tl.constexpr(_struct.unpack("!f", _struct.pack("!I", u))[0])
+
+    _ERF_C0A, _ERF_C0B = _hf(0x38EB4C3A), _hf(0x38B1E96A)
+    _ERF_C1A, _ERF_C1B = _hf(0xBAAE005B), _hf(0xBA574D20)
+    _ERF_C2A, _ERF_C2B = _hf(0x3C09919F), _hf(0x3BAAD5EA)
+    _ERF_C3A, _ERF_C3B = _hf(0xBD24D99A), _hf(0xBCDC1BE7)
+    _ERF_C4A, _ERF_C4B = _hf(0x3E235519), _hf(0x3DE718AF)
+    _ERF_C5A, _ERF_C5B = _hf(0x3F69B4F9), _hf(0xBEC093AC)
+    _ERF_C6A, _ERF_C6B = _hf(0x3F210A14), _hf(0x3E0375D3)
+    _ERF_THR = _hf(0x3F8060FE)
 
     @triton.jit
-    def _fsb_upar_kernel(Q, SEL, TIDX, KEY, E, CELLA, ca0, ca1, LAM, ls0, ls1, U,
-                         C, Bq, Hh, sb, sh, sl, scale, S, Mc,
-                         DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr,
-                         LSE: tl.constexpr, POS: tl.constexpr):
-        # one u score of _fsb_usel_kernel per program (grid row * C + candidate), with the same per-candidate
-        # arithmetic, so the scores it writes are identical: one warp per candidate instead of one row per program
+    def _erf_torch_tl(x):
+        # CUDA's built-in erff(x) (as called by torch.erf), instruction for instruction
+        a = tl.inline_asm_elementwise("abs.f32 $0, $1;", "=f,f", [x], dtype=tl.float32, is_pure=True, pack=1)
+        big = a >= _ERF_THR
+        u = tl.where(big, a, x * x)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [tl.where(big, _ERF_C0A, _ERF_C0B), u, tl.where(big, _ERF_C1A, _ERF_C1B)],
+                                      dtype=tl.float32, is_pure=True, pack=1)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [r, u, tl.where(big, _ERF_C2A, _ERF_C2B)], dtype=tl.float32, is_pure=True, pack=1)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [r, u, tl.where(big, _ERF_C3A, _ERF_C3B)], dtype=tl.float32, is_pure=True, pack=1)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [r, u, tl.where(big, _ERF_C4A, _ERF_C4B)], dtype=tl.float32, is_pure=True, pack=1)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [r, u, tl.where(big, _ERF_C5A, _ERF_C5B)], dtype=tl.float32, is_pure=True, pack=1)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [r, u, tl.where(big, _ERF_C6A, _ERF_C6B)], dtype=tl.float32, is_pure=True, pack=1)
+        s = tl.where(big, -a, x)
+        r = tl.inline_asm_elementwise("fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f",
+                                      [r, s, s], dtype=tl.float32, is_pure=True, pack=1)
+        ex = tl.inline_asm_elementwise("ex2.approx.ftz.f32 $0, $1;", "=f,f", [r], dtype=tl.float32, is_pure=True, pack=1)
+        rb = 1.0 - ex
+        rb = ((x.to(tl.int32, bitcast=True) & (-0x80000000)) | rb.to(tl.int32, bitcast=True)).to(tl.float32, bitcast=True)
+        return tl.where(big, rb, r)
+
+    @triton.jit
+    def _fsb_upar_kernel(Q, SELA, SELB, TIDX, KEY, QPOS, sq0, sq1, SIG, ss0, ss1, CELLA, ca0, ca1, LAM, ls0, ls1, U,
+                         Ca, Cb, C, Bq, Hh, sb, sh, sl, scale, S, Mc,
+                         CAP: tl.constexpr, DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr,
+                         HAS_B: tl.constexpr, LSE: tl.constexpr, POS: tl.constexpr):
+        # one u score per program (grid row * C + candidate), fusing union_candidates deduplication and torch.erf
         pid = tl.program_id(0)
         r = pid // C
-        cell = tl.load(SEL + pid)
+        cand = pid - r * C
+        if HAS_B:
+            if cand < Ca:
+                cell = tl.load(SELA + r * Ca + cand)
+            else:
+                cell = tl.load(SELB + r * Cb + (cand - Ca))
+                if cell >= 0:
+                    ia = tl.arange(0, CAP)
+                    a_row = tl.load(SELA + r * Ca + ia, mask=ia < Ca, other=-2)
+                    if tl.sum((a_row == cell).to(tl.int32), axis=0) > 0:
+                        cell = cell - (cell + 1)
+        else:
+            cell = tl.load(SELA + pid)
         if cell >= 0:
             t = r // Bq
+            b = r - t * Bq
             seq = tl.load(TIDX + t)
             bi = seq // Hh
             hi = seq - bi * Hh
@@ -254,22 +280,31 @@ if _HAVE_TRITON:
             else:
                 res = m
             if POS:
-                lam = tl.load(LAM + t * ls0 + (r - t * Bq) * ls1)
+                qp = tl.load(QPOS + t * sq0 + b * sq1)
+                den = 2.0 * tl.load(SIG + t * ss0 + b * ss1)
+                x = tl.math.div_rn(tl.abs(qp - (cell.to(tl.float32) + 0.5) * S), den)
+                lam = tl.load(LAM + t * ls0 + b * ls1)
                 a = tl.load(CELLA + seq * ca0 + tl.minimum(cell, Mc - 1) * ca1)
-                res = res + (lam * a) * tl.load(E + pid)
+                res = res + (lam * a) * _erf_torch_tl(x)
             tl.store(U + pid, res)
         else:
             tl.store(U + pid, float("-inf"))
 
     @triton.jit
-    def _fsb_selpv_kernel(U, SEL, OUT, PROV, C, K, Ca, PROV_BIT,
-                          CWP: tl.constexpr, KP2: tl.constexpr, PRV: tl.constexpr):
+    def _fsb_selpv_kernel(U, SELA, SELB, OUT, PROV, C, K, Ca, Cb, PROV_BIT,
+                          CWP: tl.constexpr, KP2: tl.constexpr, HAS_B: tl.constexpr, PRV: tl.constexpr):
         # the tail of _fsb_usel_kernel (stable descending top-K over the row's u scores, ties by slot, the -inf
         # mask and the utau provenance), reading u written by _fsb_upar_kernel: the same ranks and outputs
         r = tl.program_id(0)
         i = tl.arange(0, CWP)
         u = tl.load(U + r * C + i, mask=i < C, other=float("-inf"))
-        sel = tl.load(SEL + r * C + i, mask=i < C, other=-1)
+        if HAS_B:
+            isa = i < Ca
+            sa = tl.load(SELA + r * Ca + i, mask=isa, other=-1)
+            sb = tl.load(SELB + r * Cb + (i - Ca), mask=(i >= Ca) & (i < C), other=-1)
+            sel = tl.where(isa, sa, sb)
+        else:
+            sel = tl.load(SELA + r * Ca + i, mask=i < C, other=-1)
         gt = (u[None, :] > u[:, None]) | ((u[None, :] == u[:, None]) & (i[None, :] < i[:, None]))
         gt = gt & (i[None, :] < C)
         rank = tl.sum(gt.to(tl.int32), axis=1)
@@ -286,10 +321,11 @@ if _HAVE_TRITON:
             tl.store(PROV + r * K + k2, pv.to(tl.int8), mask=k2 < K)
 
     @triton.jit
-    def _fsb_decread_kernel(Q, SEL, KEY, VAL, POS, W, OUT,
-                            sqb, sqh, skb, skh, skn, svb, svh, svn, sob, soh,
+    def _fsb_decread_kernel(Q, SEL, KEY, VAL, POS, W, SR, LRS, OUT,
+                            sqb, sqh, skb, skh, skn, svb, svh, svn, srb, srh, sob, soh,
                             scale, eps, Hh, K, S,
-                            DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr, KK: tl.constexpr):
+                            DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr, KK: tl.constexpr,
+                            HAS_SR: tl.constexpr, LRS_BF16: tl.constexpr):
         # _fsb_decode_readout for one decode query per (batch, head) row: the K selected cells' token keys and values
         # gathered, q.k scores, masked bf16/fp32 softmax over the K * S tokens, the weighted value sum, the empty-row
         # zero and attn.lr_norm. torch's operation order and store roundings with different reduction trees (the two
@@ -326,6 +362,15 @@ if _HAVE_TRITON:
         rms = tl.math.rsqrt((ms + eps).to(Q.dtype.element_ty).to(tl.float32)).to(Q.dtype.element_ty).to(tl.float32)
         wq = tl.load(W + d, mask=d < DH, other=0.0).to(tl.float32)
         y = ((xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq).to(Q.dtype.element_ty)
+        if HAS_SR:
+            sr = tl.load(SR + bi * srb + hi * srh + d, mask=d < DH, other=0.0).to(tl.float32)
+            lrs = tl.load(LRS + hi).to(tl.float32)
+            yf = y.to(tl.float32)
+            if LRS_BF16:
+                scaled_lr = (lrs * yf).to(Q.dtype.element_ty).to(tl.float32)
+            else:
+                scaled_lr = lrs * yf
+            y = (sr + scaled_lr).to(OUT.dtype.element_ty)
         tl.store(OUT + bi * sob + hi * soh + d, y, mask=d < DH)
 
 
@@ -486,36 +531,31 @@ def _row_view(x: torch.Tensor, Tp: int, Bq: int):
 def union_rerank_fast(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.Tensor, lam: torch.Tensor,
                       sigv: torch.Tensor, cellA: torch.Tensor, t_idx: torch.Tensor, scale: float, s: int, K: int,
                       score: str, tokK: torch.Tensor, prov: bool = False):
-    # bit-exact union_candidates + rerank_top (no rr_w / read margin / prior scale) + utau_prov_add: the union and
-    # the lse_pos erf argument in one kernel, torch.erf, then the u scores one program per (row, candidate) and the
-    # stable top-K / provenance in a second one — the same values as _fsb_usel_kernel's fused loop, only regridded
-    # -> (read cells (T',Bq,K) int64, provenance (T',Bq,K) int8 when prov else None)
+    # bit-exact union_candidates + rerank_top (no rr_w / read margin / prior scale) + utau_prov_add: u scores (with
+    # union deduplication and exact CUDA erff fused) one program per (row, candidate) and the stable top-K /
+    # provenance in a second one -> (read cells (T',Bq,K) int64, provenance (T',Bq,K) int8 when prov else None)
     from .fsb_rerank import PROV_UTAU, _key4
     Tp, Bq, Ca = sel_a.shape
     Cb = 0 if sel_b is None else sel_b.shape[-1]
     C, rows, Dh, dev = Ca + Cb, Tp * Bq, q.shape[-1], q.device
     pos = score == "lse_pos"
-    sel = torch.empty((Tp, Bq, C), dtype=torch.long, device=dev)
-    x = torch.empty((Tp, Bq, C), dtype=torch.float32, device=dev) if pos else sel
     qv, sq0, sq1 = _row_view(qpos, Tp, Bq)
     sv, ss0, ss1 = _row_view(sigv, Tp, Bq)
-    _fsb_union_pos_kernel[(rows,)](sel_a, sel_b if Cb else sel_a, sel, x, qv, sq0, sq1, sv, ss0, ss1, Ca, Cb, C, Bq,
-                                   s, CAP=_pow2(Ca), CBP=_pow2(max(Cb, 1)), HAS_B=Cb > 0, POS=pos,
-                                   enable_fp_fusion=False)
-    if pos:
-        torch.erf(x, out=x)
     K4 = _key4(tokK)
     lv, ls0, ls1 = _row_view(lam, Tp, Bq)
     u = torch.empty((rows, C), dtype=torch.float32, device=dev)
-    _fsb_upar_kernel[(rows * C,)](q.reshape(rows, Dh).contiguous(), sel, t_idx.contiguous(), K4, x, cellA,
-                                  cellA.stride(0), cellA.stride(1), lv, ls0, ls1, u, C, Bq, K4.shape[1],
-                                  K4.stride(0), K4.stride(1), K4.stride(2), float(scale), s, cellA.shape[1],
-                                  DH=Dh, DHP=_pow2(Dh), SP=_pow2(s), LSE=(score != "max"), POS=pos,
+    sb_arg = sel_b if Cb else sel_a
+    _fsb_upar_kernel[(rows * C,)](q.reshape(rows, Dh).contiguous(), sel_a, sb_arg, t_idx.contiguous(), K4, qv, sq0, sq1,
+                                  sv, ss0, ss1, cellA, cellA.stride(0), cellA.stride(1), lv, ls0, ls1, u,
+                                  Ca, Cb, C, Bq, K4.shape[1], K4.stride(0), K4.stride(1), K4.stride(2), float(scale),
+                                  s, cellA.shape[1], CAP=_pow2(Ca), DH=Dh, DHP=_pow2(Dh), SP=_pow2(s),
+                                  HAS_B=Cb > 0, LSE=(score != "max"), POS=pos,
                                   num_warps=2, enable_fp_fusion=False)
     out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
     pv = torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev) if prov else out
-    _fsb_selpv_kernel[(rows,)](u, sel, out, pv, C, K, Ca, PROV_UTAU, CWP=_pow2(C), KP2=_pow2(K), PRV=prov,
-                               num_warps=4, enable_fp_fusion=False)
+    cwp = _pow2(C)
+    _fsb_selpv_kernel[(rows,)](u, sel_a, sb_arg, out, pv, C, K, Ca, Cb, PROV_UTAU, CWP=cwp, KP2=_pow2(K),
+                               HAS_B=Cb > 0, PRV=prov, num_warps=1 if cwp <= 64 else 4, enable_fp_fusion=False)
     return out, (pv if prov else None)
 
 
@@ -548,7 +588,7 @@ def decode_readout_ok(attn, q_t: torch.Tensor, sel, pos_t, Kp, Vp) -> bool:
 
 
 @torch.no_grad()
-def decode_readout_fast(attn, cache, q_t: torch.Tensor, sel, pos_t):
+def decode_readout_fast(attn, cache, q_t: torch.Tensor, sel, pos_t, sr=None):
     # _fsb_decode_readout (full_buffer source selection) as one kernel per decode query; None when unsupported.
     # The capture check runs before anything touches the cache: on eager tokens the readout token buffers must
     # stay untouched for the reference chain to build them once.
@@ -562,12 +602,26 @@ def decode_readout_fast(attn, cache, q_t: torch.Tensor, sel, pos_t):
     K, s = sel.shape[-1], attn.cell_stride
     q3 = q_t[:, :, 0, :]
     sel2 = sel.contiguous().view(B * H, K)
-    out = torch.empty(B, H, 1, Dh, device=q_t.device, dtype=q_t.dtype)
+    lrs = attn.long_range_scale.view(-1)
+    has_sr = (sr is not None and sr.shape == q_t.shape and sr.dtype == q_t.dtype
+              and sr.stride(3) == 1 and lrs.is_contiguous() and lrs.dtype in (torch.bfloat16, torch.float32))
+    if has_sr:
+        sr3 = sr[:, :, 0, :]
+        out = torch.empty(B, 1, H * Dh, device=q_t.device, dtype=q_t.dtype)
+        sob, soh = H * Dh, Dh
+        srb, srh = sr3.stride(0), sr3.stride(1)
+    else:
+        sr3 = q3
+        out = torch.empty(B, H, 1, Dh, device=q_t.device, dtype=q_t.dtype)
+        sob, soh = out.stride(0), out.stride(1)
+        srb, srh = 0, 0
+    lrs_bf16 = (q_t.dtype == torch.bfloat16) and (lrs.dtype == torch.bfloat16)
     _fsb_decread_kernel[(B * H,)](
-        q3, sel2, Kp, Vp, pos_t, attn.lr_norm.scale, out,
+        q3, sel2, Kp, Vp, pos_t, attn.lr_norm.scale, sr3, lrs, out,
         q3.stride(0), q3.stride(1), Kp.stride(0), Kp.stride(1), Kp.stride(2),
-        Vp.stride(0), Vp.stride(1), Vp.stride(2), out.stride(0), out.stride(1),
+        Vp.stride(0), Vp.stride(1), Vp.stride(2), srb, srh, sob, soh,
         float(attn.scale), float(attn.lr_norm.eps), H, K, s,
         DH=Dh, DHP=_pow2(Dh), SP=_pow2(s), KK=_pow2(K),
+        HAS_SR=has_sr, LRS_BF16=lrs_bf16,
         num_warps=4, enable_fp_fusion=False)
     return out

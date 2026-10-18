@@ -80,7 +80,6 @@ struct BeamP {
 // per-warp scratch of the warp-per-query descent
 struct __align__(16) WarpS {
     float sc[32];
-    float cnt[32], chl[32], chr[32];
     const float* ptr[32];
     int cref[32];
     int nref[WM];
@@ -98,9 +97,6 @@ __device__ __forceinline__ void score_children(const int lane, const int n, cons
     constexpr int G = 32 / CH;
     const int c = lane / G;
     const bool cv = c < n;
-    const float* pc = S.ptr[c];
-    const float rad = __ldg(pc + DH), amax = __ldg(pc + DH + 1), pmin = __ldg(pc + DH + 2);
-    const float cnt = __ldg(pc + DH + 3), chl = __ldg(pc + DH + 4), chr = __ldg(pc + DH + 5);
     float v[CH];
 #pragma unroll
     for (int i = 0; i < CH; i++) {
@@ -109,7 +105,11 @@ __device__ __forceinline__ void score_children(const int lane, const int n, cons
 #pragma unroll
         for (int k = 0; k < PER; k++) {
             const int col = lane + 32 * k;
+#if DH == DHP
+            x[k] = f_mul(qv[k], __ldg(p + col));
+#else
             x[k] = f_mul(qv[k], (col < DH) ? __ldg(p + col) : 0.0f);
+#endif
         }
         v[i] = lane_halve(x);
     }
@@ -120,16 +120,20 @@ __device__ __forceinline__ void score_children(const int lane, const int n, cons
     if constexpr (CH >= 32) rs_round<CH / 32>(v, lane, 1);
 #pragma unroll
     for (int o = G / 2; o >= 1; o >>= 1) v[0] = f_add(v[0], __shfl_xor_sync(FULL, v[0], o));
-    float content = f_mul(v[0], scale);
-#if BOUND
-    content = f_add(content, f_mul(f_mul(qn, rad), scale));
-#endif
-    const float pmin_pos = f_mul(f_add(pmin, 0.5f), cell_size);
-    const float dx = __int_as_float(__float_as_int(f_sub(qpos, pmin_pos)) & 0x7fffffff);
-    const float score = f_add(content, f_mul(f_mul(lam, amax), erf_tl(f_div_full(dx, sig2))));
     if ((lane % G) == 0) {
-        S.sc[c] = cv ? score : NEG_INF;
-        if (cv) { S.cnt[c] = cnt; S.chl[c] = chl; S.chr[c] = chr; }
+        float score = NEG_INF;
+        if (cv) {
+            const float* pc = S.ptr[c];
+            const float rad = __ldg(pc + DH), amax = __ldg(pc + DH + 1), pmin = __ldg(pc + DH + 2);
+            float content = f_mul(v[0], scale);
+#if BOUND
+            content = f_add(content, f_mul(f_mul(qn, rad), scale));
+#endif
+            const float pmin_pos = f_mul(f_add(pmin, 0.5f), cell_size);
+            const float dx = __int_as_float(__float_as_int(f_sub(qpos, pmin_pos)) & 0x7fffffff);
+            score = f_add(content, f_mul(f_mul(lam, amax), erf_tl(f_div_full(dx, sig2))));
+        }
+        S.sc[c] = score;
     }
 }
 
@@ -170,6 +174,7 @@ __device__ __forceinline__ void warp_descend(WarpS& S, const int lane, const flo
             score_children<16>(lane, n, qv, qn, qpos, lam, sig2, scale, cell_size, S);
         else
             score_children<32>(lane, n, qv, qn, qpos, lam, sig2, scale, cell_size, S);
+        if (lane < WM) S.nref[lane] = -1;
         __syncwarp();
         // carried slots keep their order ahead of every child; children rank by (score desc, slot asc): the children
         // scoring strictly higher (idle slots hold -inf and never count) plus the equal scores (+0 == -0) at a lower
@@ -192,16 +197,24 @@ __device__ __forceinline__ void warp_descend(WarpS& S, const int lane, const flo
         const bool c_ok = lane < n && sc > -5e8f && crank < wbeam && crank < WM;
         const int ncb = __popc(car & lt);
         const bool f_ok = carried && side == 0 && ncb < wbeam && ncb < WM;
-        if (lane < WM) S.nref[lane] = -1;
-        __syncwarp();
-        if (f_ok) { S.nref[ncb] = f_ref; S.ncnt[ncb] = f_cnt; S.nchl[ncb] = f_chl; S.nchr[ncb] = f_chr; }
+        if (f_ok) {
+            S.nref[ncb] = f_ref;
+            if (lev + 1 < KMAXP1) { S.ncnt[ncb] = f_cnt; S.nchl[ncb] = f_chl; S.nchr[ncb] = f_chr; }
+        }
         if (c_ok) {
-            S.nref[crank] = S.cref[lane]; S.ncnt[crank] = S.cnt[lane]; S.nchl[crank] = S.chl[lane];
-            S.nchr[crank] = S.chr[lane];
+            S.nref[crank] = S.cref[lane];
+            if (lev + 1 < KMAXP1) {
+                const float* pc = S.ptr[lane];
+                S.ncnt[crank] = __ldg(pc + DH + 3);
+                S.nchl[crank] = __ldg(pc + DH + 4);
+                S.nchr[crank] = __ldg(pc + DH + 5);
+            }
         }
         __syncwarp();
-        if (in_w) { f_ref = S.nref[slot]; f_cnt = S.ncnt[slot]; f_chl = S.nchl[slot]; f_chr = S.nchr[slot]; }
-        __syncwarp();
+        if (in_w) {
+            f_ref = S.nref[slot];
+            if (lev + 1 < KMAXP1) { f_cnt = S.ncnt[slot]; f_chl = S.nchl[slot]; f_chr = S.nchr[slot]; }
+        }
     }
     // cells epilogue: src/off/len of each frontier node, then the cell ids from the leaf (src == 1) or admission table
     if (in_w && side == 0) S.nref[slot] = f_ref;
@@ -237,7 +250,11 @@ __device__ __forceinline__ void warp_query(WarpS& S, const int lane, const float
 #pragma unroll
     for (int k = 0; k < PER; k++) {
         const int col = lane + 32 * k;
+#if DH == DHP
+        qv[k] = qp[col];
+#else
         qv[k] = (col < DH) ? qp[col] : 0.0f;
+#endif
         x2[k] = f_mul(qv[k], qv[k]);
     }
     float qs = lane_halve(x2);
@@ -287,9 +304,9 @@ extern "C" __global__ void __launch_bounds__(32)
 fsb_beam_pair_cuda(const BeamP B0, const BeamP B1,
                    const float* __restrict__ Q, const float* __restrict__ RC, const float rc_s,
                    const float* __restrict__ QPOS, const float* __restrict__ LAM, const float* __restrict__ SIG,
-                   const i64 Bq, const i64 nq, const float scale, const float cell_size) {
+                   const i64 Bq, const i64 nq, const float scale, const float cell_size, const i64 qpos_s) {
     __shared__ WarpS ws;
-    const int lane = threadIdx.x & 31;
+    const int lane = threadIdx.x;
     const i64 pid = (i64)blockIdx.x;
     if (pid >= nq) return;
     const BeamP B = blockIdx.y ? B1 : B0;
@@ -300,9 +317,10 @@ fsb_beam_pair_cuda(const BeamP B0, const BeamP B1,
 #else
     const float rcq = rc_s;
 #endif
-    warp_query(ws, lane, Q + pid * DH, rcq, QPOS[pid], LAM[t], f_mul(2.0f, SIG[t]), (float)B.BUDGET[pid], B.WBEAM[pid],
-               (int)B.ROOT[t], B.KMAXP1, scale, cell_size, B.CHUNK + tidx * B.Ntot * NC, B.SPINE + t * B.Sp * NC,
-               B.LEAF + tidx * B.Ltot, B.ADM + tidx * B.Mm, B.Ltot, B.Mm, B.CELLS + pid * (WM * R), B.NVIS + pid);
+    warp_query(ws, lane, Q + pid * DH, rcq, QPOS[pid * qpos_s], LAM[t], f_mul(2.0f, SIG[t]), (float)B.BUDGET[pid],
+               B.WBEAM[pid], (int)B.ROOT[t], B.KMAXP1, scale, cell_size, B.CHUNK + tidx * B.Ntot * NC,
+               B.SPINE + t * B.Sp * NC, B.LEAF + tidx * B.Ltot, B.ADM + tidx * B.Mm, B.Ltot, B.Mm,
+               B.CELLS + pid * (WM * R), B.NVIS + pid);
 }
 // >>> SECTION: _ROWS_KERNEL <<<
 
@@ -311,6 +329,7 @@ fsb_beam_pair_cuda(const BeamP B0, const BeamP B1,
 #define NT (2 * QB)
 #define NWARP_R (NT / 32)
 #define SCS 36                                    // score row stride (floats): conflict-free float4 rows
+#define CUS 34                                    // child-union row stride (shorts): 17 banks, conflict-free int loads
 #define EMPTY_E ((int)0x80000000)
 #define CAR0 (UMAX + 64)                          // carried frontier entry: CAR0 + node ref (spine refs >= -64)
 
@@ -401,12 +420,54 @@ __device__ __forceinline__ float half_dot(const float* qr, const unsigned b) {
     return halve32(x);
 }
 
+__device__ __forceinline__ float halve16(float* x) {
+#pragma unroll
+    for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) x[4 * m + j] = f_add(x[4 * m + j], x[4 * m + 8 + j]);
+#pragma unroll
+    for (int j = 0; j < 4; j++) x[j] = f_add(x[j], x[4 + j]);
+    x[0] = f_add(x[0], x[2]);
+    x[1] = f_add(x[1], x[3]);
+    return f_add(x[0], x[1]);
+}
+
+__device__ __forceinline__ void half_dot2(const float* qr, const unsigned ba, const unsigned bb,
+                                          float& sa, float& sb) {
+    float xa[16], xb[16];
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        const float4 va = lds128(ba ^ (16u * m));
+        const float4 vb = lds128(bb ^ (16u * m));
+        xa[4 * m] = f_mul(qr[4 * m], va.x); xa[4 * m + 1] = f_mul(qr[4 * m + 1], va.y);
+        xa[4 * m + 2] = f_mul(qr[4 * m + 2], va.z); xa[4 * m + 3] = f_mul(qr[4 * m + 3], va.w);
+        xb[4 * m] = f_mul(qr[4 * m], vb.x); xb[4 * m + 1] = f_mul(qr[4 * m + 1], vb.y);
+        xb[4 * m + 2] = f_mul(qr[4 * m + 2], vb.z); xb[4 * m + 3] = f_mul(qr[4 * m + 3], vb.w);
+    }
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        const int m4 = m + 4;
+        const float4 va = lds128(ba ^ (16u * m4));
+        const float4 vb = lds128(bb ^ (16u * m4));
+        xa[4 * m] = f_add(xa[4 * m], f_mul(qr[4 * m4], va.x));
+        xa[4 * m + 1] = f_add(xa[4 * m + 1], f_mul(qr[4 * m4 + 1], va.y));
+        xa[4 * m + 2] = f_add(xa[4 * m + 2], f_mul(qr[4 * m4 + 2], va.z));
+        xa[4 * m + 3] = f_add(xa[4 * m + 3], f_mul(qr[4 * m4 + 3], va.w));
+        xb[4 * m] = f_add(xb[4 * m], f_mul(qr[4 * m4], vb.x));
+        xb[4 * m + 1] = f_add(xb[4 * m + 1], f_mul(qr[4 * m4 + 1], vb.y));
+        xb[4 * m + 2] = f_add(xb[4 * m + 2], f_mul(qr[4 * m4 + 2], vb.z));
+        xb[4 * m + 3] = f_add(xb[4 * m + 3], f_mul(qr[4 * m4 + 3], vb.w));
+    }
+    sa = halve16(xa);
+    sb = halve16(xb);
+}
+
 // stage union slots [u0, u0 + nt) of buffer b, one warp per node: mu split into even / odd columns (the tile), rad /
-// amax / pmin, and cnt / children for the next level (cp.async, 4 bytes each; slots without a node are skipped: no
-// query has them as a child)
+// lam * amax / pmin_pos, and cnt / children for the next level (cp.async, 4 bytes each; slots without a node are
+// skipped: no query has them as a child)
 __device__ __forceinline__ void stage_tile(const int u0, const int nt, const int b, const int lane, const int wid,
                                            float4* s_umeta, float4* s_um2, float* s_mu, const float* cbase,
-                                           const float* sbase) {
+                                           const float* sbase, const float lam, const float cell_size) {
     const int c0 = (lane & 1) * 32 + (lane >> 1);                      // tile column of node column `lane`
     for (int ul = wid; ul < nt; ul += NWARP_R) {
         const int u = u0 + ul;
@@ -416,9 +477,11 @@ __device__ __forceinline__ void stage_tile(const int u0, const int nt, const int
             float* d = s_mu + ul * 64;
             cp_async4(d + c0, p + lane);
             cp_async4(d + c0 + 16, p + lane + 32);
-            if (lane < 6)
-                cp_async4(lane < 3 ? reinterpret_cast<float*>(s_um2 + u) + lane
-                                   : reinterpret_cast<float*>(s_umeta + b * UMAX + u) + lane - 2, p + DH + lane);
+            if (lane < 3)
+                cp_async4(reinterpret_cast<float*>(s_umeta + b * UMAX + u) + 1 + lane, p + DH + 3 + lane);
+            if (lane == 0)
+                s_um2[ul] = make_float4(__ldg(p + DH), f_mul(lam, __ldg(p + DH + 1)),
+                                        f_mul(f_add(__ldg(p + DH + 2), 0.5f), cell_size), 0.0f);
         }
     }
 }
@@ -437,8 +500,8 @@ __device__ __forceinline__ void rank_write(const float* srow, const short* curow
 #pragma unroll
     for (int k = 0; k < NB / 2; k++) {
         const int c = 2 * k + h;
-        if (c < n) {
-            const float sc = h ? s[2 * k + 1] : s[2 * k];
+        const float sc = h ? s[2 * k + 1] : s[2 * k];
+        if (c < n && sc > -5e8f) {
             int r = h ? (int)(s[2 * k] >= sc) : (int)(s[2 * k + 1] > sc);
 #pragma unroll
             for (int m = 0; m < NB; m++) {
@@ -446,7 +509,7 @@ __device__ __forceinline__ void rank_write(const float* srow, const short* curow
                 else if (m > 2 * k + 1) r = add_gt(r, s[m], sc);
             }
             const int crank = ncar + r;
-            if (sc > -5e8f && crank < wbeam && crank < WM) frow[crank] = (int)curow[c];
+            if (crank < wbeam && crank < WM) frow[crank] = (int)curow[c];
         }
     }
 }
@@ -490,7 +553,7 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
     short* s_rank = reinterpret_cast<short*>(smem + OFF_RANK);      // [UMAX] their rank
     int* s_front = reinterpret_cast<int*>(smem + OFF_FRONT);        // [QB][16] frontier entries
     float* s_sc = reinterpret_cast<float*>(smem + OFF_SC);          // [QB][SCS] child dots, then scores
-    short* s_cu = reinterpret_cast<short*>(smem + OFF_CU);          // [QB][32] child union slots
+    short* s_cu = reinterpret_cast<short*>(smem + OFF_CU);          // [QB][CUS] child union slots
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     const int qi = tid >> 1, h = tid & 1, rot = lane & 7;
 #ifdef PROF
@@ -556,7 +619,7 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
     const float bud = qok ? (float)BUDGET[pid] : 0.0f;
     const i64 wbeam = qok ? WBEAM[pid] : 0;
     int* frow = s_front + qi * 16;
-    short* curow = s_cu + qi * 32;
+    short* curow = s_cu + qi * CUS;
     float* srow = s_sc + qi * SCS;
     // the union before level 0 is the root (buffer 1); every query starts from it
     if (tid == 0 && root != -1) {
@@ -651,7 +714,8 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
         // ---- C: stage the first tile of the union (cp.async) while this query lists its children (slot order) as union
         // slots and fills -inf past n; then prefetch the next level's candidates
         const int npass = (Pc + CAP - 1) / CAP;
-        stage_tile(0, min(CAP, Pc), cb, lane, wid, s_umeta, s_um2, s_mu, cbase, sbase);
+        const int nw = __any_sync(FULL, n > 16) ? 32 : (__any_sync(FULL, n > 8) ? 16 : (__any_sync(FULL, n > 0) ? 8 : 0));
+        stage_tile(0, min(CAP, Pc), cb, lane, wid, s_umeta, s_um2, s_mu, cbase, sbase, lam, cell_size);
         PMARK(8);
         if (n > 0) {
 #pragma unroll
@@ -665,75 +729,81 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
                     if (two & 2u) curow[c0 + (two & 1u)] = (short)(r2 + 1);
                 }
             }
-            for (int c = n + h; c < 32; c += 2) srow[c] = NEG_INF;
+            for (int c = n + h; c < nw; c += 2) srow[c] = NEG_INF;
         }
         PMARK(9);
         cp_async_wait_all();
         __syncthreads();                                              // B3: tile 0 staged, children listed
         PMARK(10);
-        for (int u = tid; u < min(CAP, Pc); u += NT) {               // candidates of the next union -> L2
-            const float4 um = s_umeta[cb * UMAX + u];
-            if (__float_as_int(um.x) != -1 && um.y > 1.0f) {
-                prefetch_node(node_at(cbase, sbase, fchild(um.z)), fchild(um.z));
-                prefetch_node(node_at(cbase, sbase, fchild(um.w)), fchild(um.w));
+        if (lev + 1 < KMAXP1) {
+            for (int u = tid; u < min(CAP, Pc); u += NT) {           // candidates of the next union -> L2
+                const float4 um = s_umeta[cb * UMAX + u];
+                if (__float_as_int(um.x) != -1 && um.y > 1.0f) {
+                    prefetch_node(node_at(cbase, sbase, fchild(um.z)), fchild(um.z));
+                    prefetch_node(node_at(cbase, sbase, fchild(um.w)), fchild(um.w));
+                }
             }
         }
         PMARK(4);
         // ---- D: child dots, two at a time: each lane sums its half of both, the halves are swapped and lane h keeps
-        // child c + h's dot. A union larger than the tile takes several passes.
+        // child c + h's dot and computes its score in place. A union larger than the tile takes several passes.
         const unsigned tb = (unsigned)__cvta_generic_to_shared(s_mu) + 128u * h + 16u * rot;
         if (npass == 1) {
             for (int c = 0; c < n; c += 2) {
                 const int uu = *reinterpret_cast<const int*>(curow + c);
-                const int ua = (int)(short)(uu & 0xffff), ub = c + 1 < n ? (uu >> 16) : ua;
-                const float sa = half_dot(qr, tb + 256u * ua);
-                const float sb = half_dot(qr, tb + 256u * ub);
+                const bool hb = c + 1 < n;
+                const int ua = (int)(short)(uu & 0xffff), ub = hb ? (uu >> 16) : ua;
+                const float4 tm = s_um2[h ? ub : ua];
+                float sa, sb;
+                half_dot2(qr, tb + 256u * ua, tb + 256u * ub, sa, sb);
                 const float dot = f_add(h ? sb : sa, __shfl_xor_sync(pmask, h ? sa : sb, 1));
-                if (h == 0 || c + 1 < n) srow[c + h] = dot;
+                if (h == 0 || hb) {
+                    float content = f_mul(dot, scale);
+#if BOUND
+                    content = f_add(content, f_mul(f_mul(qn, tm.x), scale));
+#endif
+                    const float dx = __int_as_float(__float_as_int(f_sub(qpos, tm.z)) & 0x7fffffff);
+                    srow[c + h] = f_add(content, f_mul(tm.y, erf_tl(f_div_full(dx, sig2))));
+                }
             }
         } else {
             for (int p = 0; p < npass; p++) {
                 const int t0 = p * CAP, t1 = min(t0 + CAP, Pc);
                 if (p > 0) {
                     __syncthreads();
-                    stage_tile(t0, t1 - t0, cb, lane, wid, s_umeta, s_um2, s_mu, cbase, sbase);
+                    stage_tile(t0, t1 - t0, cb, lane, wid, s_umeta, s_um2, s_mu, cbase, sbase, lam, cell_size);
                     cp_async_wait_all();
                     __syncthreads();
                 }
                 for (int c = 0; c < n; c += 2) {
-                    const int ua = curow[c];
+                    const int uu = *reinterpret_cast<const int*>(curow + c);
                     const bool hb = c + 1 < n;
-                    const int ub = hb ? (int)curow[c + 1] : ua;
+                    const int ua = (int)(short)(uu & 0xffff), ub = hb ? (uu >> 16) : ua;
                     const bool ina = ua >= t0 && ua < t1, inb = hb && ub >= t0 && ub < t1;
                     if (!ina && !inb) continue;
-                    const float sa = half_dot(qr, tb + 256u * (ina ? ua - t0 : 0));
-                    const float sb = half_dot(qr, tb + 256u * (inb ? ub - t0 : 0));
+                    const int la = ina ? ua - t0 : 0, lb = inb ? ub - t0 : 0;
+                    const float4 tm = s_um2[h ? lb : la];
+                    float sa, sb;
+                    half_dot2(qr, tb + 256u * la, tb + 256u * lb, sa, sb);
                     const float dot = f_add(h ? sb : sa, __shfl_xor_sync(pmask, h ? sa : sb, 1));
-                    if (h ? inb : ina) srow[c + h] = dot;
-                }
-            }
-        }
-        // ---- D2: scores of this lane's children from their dots
-        if (n > 0) {
-#pragma unroll 2
-            for (int c = h; c < n; c += 2) {
-                const float4 tm = s_um2[curow[c]];
-                float content = f_mul(srow[c], scale);
+                    if (h ? inb : ina) {
+                        float content = f_mul(dot, scale);
 #if BOUND
-                content = f_add(content, f_mul(f_mul(qn, tm.x), scale));
+                        content = f_add(content, f_mul(f_mul(qn, tm.x), scale));
 #endif
-                const float pmin_pos = f_mul(f_add(tm.z, 0.5f), cell_size);
-                const float dx = __int_as_float(__float_as_int(f_sub(qpos, pmin_pos)) & 0x7fffffff);
-                srow[c] = f_add(content, f_mul(f_mul(lam, tm.y), erf_tl(f_div_full(dx, sig2))));
+                        const float dx = __int_as_float(__float_as_int(f_sub(qpos, tm.z)) & 0x7fffffff);
+                        srow[c + h] = f_add(content, f_mul(tm.y, erf_tl(f_div_full(dx, sig2))));
+                    }
+                }
             }
         }
         PMARK(5);
         // ---- E: the new frontier: carried slots keep their order (positions below the beam width), the children
         // follow at ncar + rank
         if (!done) {
-            __syncwarp(pmask);
-#pragma unroll
-            for (int j = 0; j < 8; j++) frow[8 * h + j] = EMPTY_E;
+            const int4 emp4 = make_int4(EMPTY_E, EMPTY_E, EMPTY_E, EMPTY_E);
+            *reinterpret_cast<int4*>(frow + 8 * h) = emp4;
+            *reinterpret_cast<int4*>(frow + 8 * h + 4) = emp4;
             __syncwarp(pmask);
 #pragma unroll
             for (int j = 0; j < 8; j++) {
@@ -743,9 +813,13 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
                     if (ncb < wbeam && ncb < WM) frow[ncb] = e[j];
                 }
             }
-            if (n > 16) rank_write<32>(srow, curow, frow, n, h, ncar, wbeam);
-            else if (n > 8) rank_write<16>(srow, curow, frow, n, h, ncar, wbeam);
-            else if (n > 0) rank_write<8>(srow, curow, frow, n, h, ncar, wbeam);
+            if (nw == 32) {
+                if (n > 0) rank_write<32>(srow, curow, frow, n, h, ncar, wbeam);
+            } else if (nw == 16) {
+                if (n > 0) rank_write<16>(srow, curow, frow, n, h, ncar, wbeam);
+            } else if (nw == 8) {
+                if (n > 0) rank_write<8>(srow, curow, frow, n, h, ncar, wbeam);
+            }
             __syncwarp(pmask);
             nvis += n;
         }

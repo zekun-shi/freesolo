@@ -56,7 +56,10 @@ _mods: dict = {}
 # with one warning: the selection (legacy path from then on) and the KV cache's cell statistics (torch ops)
 _failed_select: list = []
 _failed_stats: list = []
-_NAMES = ("fsl_ceil", "fsl_cellstats", "fsl_topp", "fsl_topp_par", "fsl_prep", "fsl_select", "fsl_select_g")
+_NAMES = (
+    "fsl_ceil", "fsl_cellstats", "fsl_topp", "fsl_topp_par",
+    "fsl_prep", "fsl_select", "fsl_select_g", "fsl_dense_decode_topk",
+)
 _DEBUG: list | None = None      # tests: a list collects (b0, bf16 content, path) of every chunk
 
 
@@ -460,7 +463,7 @@ def fsl_fast_select(Q, Kp, *, N, M, s, Bq, nb, NBCH, Pk, Wc, kk, lam, sigv, scal
 
 
 def _dense_fused_smem() -> int:
-    return ((64 * 72 + 128 * 66) * 2 + 15) // 16 * 16 + (4 * 64 + 1) * 4 + 16
+    return ((64 * 72 + 128 * 72) * 2 + 15) // 16 * 16 + (8 * 64 + 2) * 4 + 16
 
 
 @torch.no_grad()
@@ -515,4 +518,52 @@ def fsl_dense_fast_select(Q, Kp, *, N, M, s, Bq, nb, kk, lam, sigv, scale, conte
              float(scale), Npad, 1 if content_only else 0, pflags),
             smem=_dense_fused_smem(), dev=di)
     return sel_full
+
+
+@torch.no_grad()
+def fsl_dense_decode_topk(
+    q_t: torch.Tensor, Kbar_all: torch.Tensor, ceil_all: torch.Tensor,
+    pos_t: torch.Tensor, m_vis_t: torch.Tensor, lam: torch.Tensor, sigv: torch.Tensor,
+    part_s: torch.Tensor, part_c: torch.Tensor,
+    scale: float, max_cells: int, cell_size: int, k_sel: int, split_m: int, block_c: int,
+) -> bool:
+    """Coalesced CUDA split-topk kernel for dense FS decode (AUTOCAST_BF16=1, D=64)."""
+    if (compiling() or not fast_select_on() or os.environ.get("FSL_DENSE_DECODE_CUDA", "1") == "0"
+            or not (1 <= block_c <= 1024 and 1 <= k_sel <= 16)):
+        return False
+    B, H, _, D = q_t.shape
+    dev = q_t.device
+    if (D != 64 or dev.index != torch.cuda.current_device()
+            or Kbar_all.stride(0) != H * max_cells * 64 or Kbar_all.stride(1) != max_cells * 64
+            or Kbar_all.stride(2) != 64 or Kbar_all.stride(3) != 1 or Kbar_all.data_ptr() % 16 != 0
+            or ceil_all.stride(0) != H * max_cells or ceil_all.stride(1) != max_cells or ceil_all.stride(2) != 1
+            or pos_t.dtype != torch.int64 or m_vis_t.dtype != torch.int32
+            or lam.dtype not in (torch.float32, torch.bfloat16)
+            or sigv.dtype not in (torch.float32, torch.bfloat16)):
+        return False
+    key = next((k for k in _mods if k[0] == dev.index), None)
+    try:
+        if key is None and torch.cuda.is_current_stream_capturing():
+            return False
+        fs = _mods[key][0] if key is not None else _functions(dev, 2, 4)
+    except Exception as e:
+        _latch(_failed_select, "FS dense decode CUDA topk unavailable, using Triton fallback", e)
+        return False
+    pflags = (
+        (1 if lam.dtype == torch.bfloat16 else 0)
+        | (2 if sigv.dtype == torch.bfloat16 else 0)
+        | (4 if q_t.dtype == torch.bfloat16 else 0)
+    )
+    _launch(
+        fs["fsl_dense_decode_topk"], B * H * split_m, 128, "PPPPPPPPPqqqfiiiiii",
+        (q_t.data_ptr(), Kbar_all.data_ptr(), ceil_all.data_ptr(),
+         pos_t.data_ptr(), m_vis_t.data_ptr(), lam.data_ptr(), sigv.data_ptr(),
+         part_s.data_ptr(), part_c.data_ptr(),
+         q_t.stride(0), q_t.stride(1), H,
+         float(scale), int(max_cells), int(cell_size),
+         int(k_sel), int(split_m), int(block_c), int(pflags)),
+        dev=dev.index,
+    )
+    return True
+
 

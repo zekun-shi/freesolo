@@ -219,7 +219,7 @@ def _table_store(key, hit) -> None:
             _tables.popitem(last=False)
 
 
-def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int):
+def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, only_layv: bool = False):
     # static task table of one launch and the layout vector, cached per shape and grouping: an LRU of the _TABLES_MAX
     # most recently used shapes, plus every table a CUDA graph captured (_table_lookup). Built outside graph capture:
     # the first call of a shape runs before any capture of it, as for the kernels.
@@ -232,7 +232,12 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int):
     # order: see wait_flag in the kernel source).
     key = (T, M, nf, g, kmax_cuda, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)))
     hit, pinned = _table_lookup(key)
-    if hit is None:
+    if hit is None and only_layv:
+        lay = forest_layout(M)
+        hit = (None, torch.tensor(_layvec(lay, g), dtype=torch.int32, device=dev), [], 0, 0,
+               {torch.cuda.current_stream(dev).cuda_stream})
+        _table_store(key, hit)
+    elif hit is None or (not only_layv and hit[0] is None):
         lay = forest_layout(M)
         use = [k for k in lay["ks"] if k <= kmax_cuda and (_ONLY_K is None or k in _ONLY_K)]
         big = sorted((k for k in use if k >= 10), reverse=True)
@@ -284,8 +289,9 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int):
         while ready:
             flush(force=True)
         assert not children
+        layv = hit[1] if hit is not None else torch.tensor(_layvec(lay, g), dtype=torch.int32, device=dev)
         hit = (torch.tensor(rows if rows else [[0] * 8 + [-1, -1]], dtype=torch.int32, device=dev).reshape(-1, 10).contiguous(),
-               torch.tensor(_layvec(lay, g), dtype=torch.int32, device=dev), [(0, len(rows))] if rows else [], len(big), len(flags),
+               layv, [(0, len(rows))] if rows else [], len(big), len(flags),
                {torch.cuda.current_stream(dev).cuda_stream})          # the streams that read the table
         _table_store(key, hit)
     if not pinned:
@@ -293,7 +299,8 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int):
         # other stream that read it as well
         s = torch.cuda.current_stream(dev)
         if s.cuda_stream not in hit[5]:
-            hit[0].record_stream(s)
+            if hit[0] is not None:
+                hit[0].record_stream(s)
             hit[1].record_stream(s)
             hit[5].add(s.cuda_stream)
     return hit[:5]
@@ -397,7 +404,7 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
     if not rows:
         rows = [[0] * 8 + [-1, -1]]
     pro, bld = _functions(dev, Dh)
-    layv = _tasks(T, M, nf, _group(), dev, kmax_cuda)[1]     # the shape's registry table's layout vector
+    layv = _tasks(T, M, nf, _group(), dev, kmax_cuda, only_layv=True)[1]     # the shape's registry table's layout vector
     tasks = torch.tensor(rows, dtype=torch.int32, device=dev).reshape(-1, 10).contiguous()
     Kbar = Kbar.contiguous(); ceil_c = ceil_c.contiguous()
     sp = spread.contiguous() if spread is not None else ceil_c

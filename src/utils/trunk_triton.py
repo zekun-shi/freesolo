@@ -314,7 +314,7 @@ if triton is not None:
     @triton.jit
     def _fsl_pool_refresh_kernel(
         TOPP, KBAR_ALL, CEIL_ALL,
-        KBAR_OUT, CEIL_OUT, CEN_OUT, OK_OUT, CAND_OUT,
+        KBAR_OUT, KBAR_OUT_T, CEIL_OUT, CEN_OUT, OK_OUT, CAND_OUT,
         skab, skah, skac, scab, scah,
         skob, skoh, skoc, scob, scoh,
         hi, blk_start_f, s_f, Pk, C,
@@ -358,12 +358,17 @@ if triton is not None:
             kbar_vals,
             mask=cmask[:, None] & dmask[None, :],
         )
+        tl.store(
+            KBAR_OUT_T + b * skob + h * skoh + d[:, None] * C + c[None, :],
+            tl.trans(kbar_vals),
+            mask=dmask[:, None] & cmask[None, :],
+        )
 
     @triton.jit
     def _fsl_lr_decode_combine_kernel(
         Q, KBAR, CEIL, CEN, OK, CAND, POS, LAM, SIG,
         K, V, SR, W_NORM, LRS, O,
-        sqb, sqh, skbb, skbh, skbc, scb, sch,
+        sqb, sqh, skbb, skbh, skbc, skbd, scb, sch,
         skb, skh, skn, svb, svh, svn, srb, srh,
         N_KV, sc, eps, C,
         H: tl.constexpr, D: tl.constexpr, SCALE: tl.constexpr,
@@ -389,10 +394,10 @@ if triton is not None:
                 q2 = tl.load(q_base + (32 + tx)).to(tl.bfloat16).to(tl.float32)
                 q3 = tl.load(q_base + (48 + tx)).to(tl.bfloat16).to(tl.float32)
 
-                k0 = tl.load(kb_base + (0 + tx), mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
-                k1 = tl.load(kb_base + (16 + tx), mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
-                k2 = tl.load(kb_base + (32 + tx), mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
-                k3 = tl.load(kb_base + (48 + tx), mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k0 = tl.load(kb_base + (0 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k1 = tl.load(kb_base + (16 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k2 = tl.load(kb_base + (32 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k3 = tl.load(kb_base + (48 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
 
                 t_tx = (((q0 * k0) + (q1 * k1)) + (q2 * k2)) + (q3 * k3)
                 dot = dot + t_tx
@@ -409,10 +414,10 @@ if triton is not None:
                 q2 = tl.load(q_base + (4 * i + 2)).to(tl.float32)
                 q3 = tl.load(q_base + (4 * i + 3)).to(tl.float32)
 
-                k0 = tl.load(kb_base + (4 * i + 0), mask=cmask, other=0.0).to(tl.float32)
-                k1 = tl.load(kb_base + (4 * i + 1), mask=cmask, other=0.0).to(tl.float32)
-                k2 = tl.load(kb_base + (4 * i + 2), mask=cmask, other=0.0).to(tl.float32)
-                k3 = tl.load(kb_base + (4 * i + 3), mask=cmask, other=0.0).to(tl.float32)
+                k0 = tl.load(kb_base + (4 * i + 0) * skbd, mask=cmask, other=0.0).to(tl.float32)
+                k1 = tl.load(kb_base + (4 * i + 1) * skbd, mask=cmask, other=0.0).to(tl.float32)
+                k2 = tl.load(kb_base + (4 * i + 2) * skbd, mask=cmask, other=0.0).to(tl.float32)
+                k3 = tl.load(kb_base + (4 * i + 3) * skbd, mask=cmask, other=0.0).to(tl.float32)
 
                 acc0 = tl.math.fma(q0, k0, acc0)
                 acc1 = tl.math.fma(q1, k1, acc1)
@@ -937,6 +942,10 @@ def fsl_pool_refresh(topP: torch.Tensor, Kbar_all: torch.Tensor, ceil_all: torch
             and out["ceil_cand"].is_contiguous() and out["cen_cand"].is_contiguous()
             and out["ok_cell"].is_contiguous() and out["cand_c"].is_contiguous()):
         Kbar_out = out["Kbar_cand"]
+        Kbar_out_t = out.get("Kbar_cand_t")
+        if Kbar_out_t is None or tuple(Kbar_out_t.shape) != (B, H, D, C) or not Kbar_out_t.is_contiguous():
+            Kbar_out_t = torch.empty((B, H, D, C), device=dev, dtype=torch.float32)
+            out["Kbar_cand_t"] = Kbar_out_t
         ceil_out = out["ceil_cand"]
         cen_out = out["cen_cand"]
         ok_out = out["ok_cell"]
@@ -945,13 +954,15 @@ def fsl_pool_refresh(topP: torch.Tensor, Kbar_all: torch.Tensor, ceil_all: torch
         res = out
     else:
         Kbar_out = torch.empty((B, H, C, D), device=dev, dtype=torch.float32)
+        Kbar_out_t = torch.empty((B, H, D, C), device=dev, dtype=torch.float32)
         ceil_out = torch.empty((B, H, C), device=dev, dtype=torch.float32)
         cen_out = torch.empty((B, H, C), device=dev, dtype=torch.float32)
         ok_out = torch.empty((B, H, C), device=dev, dtype=torch.bool)
         cand_out = torch.empty((B, H, C), device=dev, dtype=torch.int64)
         res = {
             "empty": False, "M_vis": M_vis, "C": C,
-            "Kbar_cand": Kbar_out, "ceil_cand": ceil_out, "cen_cand": cen_out,
+            "Kbar_cand": Kbar_out, "Kbar_cand_t": Kbar_out_t,
+            "ceil_cand": ceil_out, "cen_cand": cen_out,
             "ok_cell": ok_out, "cand_c": cand_out,
         }
     hi = blk_start // s - 1
@@ -959,7 +970,7 @@ def fsl_pool_refresh(topP: torch.Tensor, Kbar_all: torch.Tensor, ceil_all: torch
     block_d = max(16, triton.next_power_of_2(D))
     _fsl_pool_refresh_kernel[(B * H,)](
         topP_c, Kbar_all, ceil_all,
-        Kbar_out, ceil_out, cen_out, ok_out, cand_out,
+        Kbar_out, Kbar_out_t, ceil_out, cen_out, ok_out, cand_out,
         Kbar_all.stride(0), Kbar_all.stride(1), Kbar_all.stride(2),
         ceil_all.stride(0), ceil_all.stride(1),
         Kbar_out.stride(0), Kbar_out.stride(1), Kbar_out.stride(2),
@@ -1057,17 +1068,25 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
         m_vis_t = pool["m_vis_t"]
         part_s = pool["part_s"]
         part_c = pool["part_c"]
-        _fs_dense_decode_topk_split_kernel[(B * H, split_m)](
-            q_t[:, :, 0, :], Kbar_all, ceil_all, pos_t, m_vis_t, attn.sel_scale, sigma,
-            part_s, part_c,
-            q_t.stride(0), q_t.stride(1),
-            Kbar_all.stride(0), Kbar_all.stride(1), Kbar_all.stride(2),
-            ceil_all.stride(0), ceil_all.stride(1),
-            float(attn.scale), C,
-            H=H, D=D, CELL_SIZE=s, K_SELECT=k_sel, SPLIT_M=split_m, BLOCK_C=block_c,
-            AUTOCAST_BF16=autocast_bf16,
-            num_warps=2 if block_c <= 64 else 4, num_stages=2, enable_fp_fusion=False,
-        )
+        used_cuda = False
+        if autocast_bf16:
+            from ..fsattn.fsl_select_cuda import fsl_dense_decode_topk
+            used_cuda = fsl_dense_decode_topk(
+                q_t, Kbar_all, ceil_all, pos_t, m_vis_t, attn.sel_scale.view(-1), sigma.view(-1),
+                part_s, part_c, float(attn.scale), C, s, k_sel, split_m, block_c,
+            )
+        if not used_cuda:
+            _fs_dense_decode_topk_split_kernel[(B * H, split_m)](
+                q_t[:, :, 0, :], Kbar_all, ceil_all, pos_t, m_vis_t, attn.sel_scale, sigma,
+                part_s, part_c,
+                q_t.stride(0), q_t.stride(1),
+                Kbar_all.stride(0), Kbar_all.stride(1), Kbar_all.stride(2),
+                ceil_all.stride(0), ceil_all.stride(1),
+                float(attn.scale), C,
+                H=H, D=D, CELL_SIZE=s, K_SELECT=k_sel, SPLIT_M=split_m, BLOCK_C=block_c,
+                AUTOCAST_BF16=autocast_bf16,
+                num_warps=2 if block_c <= 64 else 4, num_stages=2, enable_fp_fusion=False,
+            )
         _fs_dense_decode_readout_combine_kernel[(B * H,)](
             q_t[:, :, 0, :], part_s, part_c, pos_t, m_vis_t,
             kbuf, vbuf, out_short[:, :, 0, :], w_norm, lrs, out,
@@ -1084,16 +1103,24 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
         return out
     k_sel = min(int(attn.cell_topk), M_vis, C)
     Kbar_cand = pool["Kbar_cand"]
+    Kbar_cand_t = pool.get("Kbar_cand_t")
+    if (Kbar_cand_t is not None and tuple(Kbar_cand_t.shape) == (B, H, D, C)
+            and Kbar_cand_t.dtype == torch.float32 and Kbar_cand_t.is_contiguous()):
+        kb_src = Kbar_cand_t
+        skbc, skbd = 1, Kbar_cand_t.stride(2)
+    else:
+        kb_src = Kbar_cand
+        skbc, skbd = Kbar_cand.stride(2), 1
     ceil_cand = pool["ceil_cand"]
     cen_cand = pool["cen_cand"]
     ok_cell = pool["ok_cell"]
     cand_c = pool["cand_c"]
     block_c = max(16, triton.next_power_of_2(C))
     _fsl_lr_decode_combine_kernel[(B * H,)](
-        q_t[:, :, 0, :], Kbar_cand, ceil_cand, cen_cand, ok_cell, cand_c, pos_t, attn.sel_scale, sigma,
+        q_t[:, :, 0, :], kb_src, ceil_cand, cen_cand, ok_cell, cand_c, pos_t, attn.sel_scale, sigma,
         kbuf, vbuf, out_short[:, :, 0, :], w_norm, lrs, out,
         q_t.stride(0), q_t.stride(1),
-        Kbar_cand.stride(0), Kbar_cand.stride(1), Kbar_cand.stride(2),
+        kb_src.stride(0), kb_src.stride(1), skbc, skbd,
         ceil_cand.stride(0), ceil_cand.stride(1),
         kbuf.stride(0), kbuf.stride(1), kbuf.stride(2),
         vbuf.stride(0), vbuf.stride(1), vbuf.stride(2),
@@ -1106,4 +1133,5 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
         num_warps=4, num_stages=2, enable_fp_fusion=False,
     )
     return out
+
 
