@@ -43,6 +43,10 @@ Both variants retrieve single needles at 262k — 64x the training length — wi
 
 ### Inference efficiency
 
+<div align="center">
+<img src="assets/img/inference-efficiency.png" width="720" alt="FreeSolo and Raven inference efficiency across context lengths"/>
+</div>
+
 340M scale on one A100-40GB (bf16, batch 1, each model's fastest CUDA-graph serving path; `*` = eager fallback on a path without graph capture, `experiments/scaling/bench_efficiency.py`):
 
 | Model | Prefill, Ktok/s (4k/16k/64k/131k) | Decode, tok/s (4k/16k/64k/131k) | Prefill peak, GiB (4k/16k/64k/131k) | Decode peak, GiB (4k/16k/64k/131k) |
