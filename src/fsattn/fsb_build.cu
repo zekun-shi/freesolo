@@ -4,6 +4,7 @@
 __device__ __forceinline__ float f_mul_ftz(float a, float b) { float r; asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float f_div_ftz(float a, float b) { float r; asm("div.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float f_max(float a, float b) { float r; asm("max.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_min(float a, float b) { float r; asm("min.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float f_pow2neg(int p) { return __int_as_float((127 - p) << 23); }      // 2^-p, p <= 126
 __device__ __forceinline__ float f_sz(unsigned neg) { return neg ? -0.0f : 0.0f; }
 __device__ __forceinline__ unsigned sgn(float v) { return __float_as_uint(v) >> 31; }
@@ -1019,8 +1020,7 @@ __device__ __forceinline__ float g_cross(const GS& S, const int d) {
     return a[0];
 }
 
-// one G node: V = 2^lvn rows of chunk (k, j), node index n at level l; slots from SRC (cells, slot order);
-// sorted order written to DST (may alias SRC); record written; returns nothing
+template <bool LEAN = false>
 __device__ void g_node(const Args& A, const GS& S, const int f, const int t, const int k, const int j, const int l,
                        const int n, const i64* SRC64, const int* SRC, int* DST, const bool fold, const bool has_sp) {
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
@@ -1121,14 +1121,16 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
             float rad = has_sp ? rq0 : f_sqrt_ftz(rq0);
             if (has_sp && fold) rad = f_max(rad, 0.0f);
             // record scalars
-            const int nodes = (2 << k) - 1, rb = A.lay[k] + j * nodes, h = (1 << l) - 1 + n;
+            const int jo = LEAN ? 0 : j;
+            const int nodes = (2 << k) - 1, rb = A.lay[k] + jo * nodes, h = (1 << l) - 1 + n;
             float* p = A.node[f] + ((i64)t * A.Ntot + rb + h) * NC + DH;
             p[0] = rad; p[1] = f_max(am0, 0.0f); p[2] = (float)pm0; p[3] = (float)V;
             p[4] = (float)(rb + 2 * h + 1); p[5] = (float)(rb + 2 * h + 2); p[6] = 1.0f;
-            p[7] = (float)(A.lay[16 + k] + j * (1 << k) + n * V); p[8] = (float)V;
+            p[7] = (float)(A.lay[16 + k] + jo * (1 << k) + n * V); p[8] = (float)V;
         }
         if (tid < DH) {
-            const int nodes = (2 << k) - 1, rb = A.lay[k] + j * nodes, h = (1 << l) - 1 + n;
+            const int jo = LEAN ? 0 : j;
+            const int nodes = (2 << k) - 1, rb = A.lay[k] + jo * nodes, h = (1 << l) - 1 + n;
             A.node[f][((i64)t * A.Ntot + rb + h) * NC + tid] = S.mu[tid];
         }
         __syncthreads();
@@ -1306,6 +1308,7 @@ __device__ __forceinline__ void zb_of_row(const SM& S, const int ci, const int r
 }
 
 // type 0, k <= 5: a batch of nsub chunks of height k, one warp per 32 slots
+template <bool LEAN = false>
 __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const int t, const int k, const int j0, const int nsub,
                                          const bool fold) {
     extern __shared__ float smem[];
@@ -1314,12 +1317,14 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
     const int M = A.M, has_sp = A.has_sp;
     const int mt = (int)A.mt[f][t];
     const int nfull = max(0, min((mt >> k) - j0, nsub));
-    empty_chunks(A, f, t, k, j0 + nfull, j0 + nsub);
+    const int jo = LEAN ? 0 : j0;
+    empty_chunks(A, f, t, k, jo + nfull, jo + nsub);
     const int gs0 = 32 * wid;
     if (gs0 >= (nfull << k)) return;
     Rec R;
     R.node = A.node[f] + (i64)t * A.Ntot * NC; R.leaf = A.leaf[f] + (i64)t * A.Ltot;
-    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = j0; R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
+    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo;
+    R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = min(k, 5);
     float* Xw = S.Xs + wid * 32 * XS;
     int* pw = S.pw + wid * 32;
@@ -1377,6 +1382,7 @@ __device__ __forceinline__ void cw_phases(const int lv0, float (&x)[32][PER], co
 }
 
 // type 0, 6 <= k <= 9: a batch of nsub chunks of height k (512 slots), C phase then W phase
+template <bool LEAN = false>
 __device__ __forceinline__ void task_cbatch(const Args& A, const int f, const int t, const int k, const int j0, const int nsub,
                                          const bool fold) {
     extern __shared__ float smem[];
@@ -1385,11 +1391,13 @@ __device__ __forceinline__ void task_cbatch(const Args& A, const int f, const in
     const int M = A.M, has_sp = A.has_sp;
     const int mt = (int)A.mt[f][t];
     const int nfull = max(0, min((mt >> k) - j0, nsub));
-    empty_chunks(A, f, t, k, j0 + nfull, j0 + nsub);
+    const int jo = LEAN ? 0 : j0;
+    empty_chunks(A, f, t, k, jo + nfull, jo + nsub);
     if (nfull == 0) return;
     Rec R;
     R.node = A.node[f] + (i64)t * A.Ntot * NC; R.leaf = A.leaf[f] + (i64)t * A.Ltot;
-    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = j0; R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
+    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo;
+    R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = 5;
     const int nrow = nfull << k;
     {
@@ -1413,6 +1421,7 @@ __device__ __forceinline__ void task_cbatch(const Args& A, const int f, const in
 }
 
 // type 1: G node of chunk j0 (height k >= 10), level l0, index n0
+template <bool LEAN = false>
 __device__ __forceinline__ void task_gnode(const Args& A, const int f, const int t, const int k, const int j0, const int l0,
                                         const int n0, const bool fold, const int flag, const int dep) {
     extern __shared__ float smem[];
@@ -1420,19 +1429,23 @@ __device__ __forceinline__ void task_gnode(const Args& A, const int f, const int
     const int mt = (int)A.mt[f][t];
     const bool full = ((j0 + 1) << k) <= mt;
     if (!full) {
-        if (l0 == 0) empty_chunks(A, f, t, k, j0, j0 + 1);
+        if (l0 == 0) {
+            const int jo = LEAN ? 0 : j0;
+            empty_chunks(A, f, t, k, jo, jo + 1);
+        }
         return;
     }
     if (dep >= 0) wait_flag(A.ctl + dep);
     int* scr = A.scr + (((i64)f * A.nbig + (k - 10)) * A.T + t) * M + ((i64)j0 << k);
     const GS G = gcarve(smem);
     const int V = 1 << (k - l0);
-    g_node(A, G, f, t, k, j0, l0, n0, l0 == 0 ? A.adm[f] + (i64)t * M + ((i64)j0 << k) : nullptr, scr + n0 * V,
-           scr + n0 * V, fold, A.has_sp != 0);
+    g_node<LEAN>(A, G, f, t, k, j0, l0, n0, l0 == 0 ? A.adm[f] + (i64)t * M + ((i64)j0 << k) : nullptr, scr + n0 * V,
+                 scr + n0 * V, fold, A.has_sp != 0);
     set_flag(A.ctl + flag);
 }
 
 // type 2: the 512-row subtree at level k - 9, index n0, of chunk j0 (height k >= 10)
+template <bool LEAN = false>
 __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t, const int k, const int j0, const int n0,
                                       const bool fold, const int dep) {
     extern __shared__ float smem[];
@@ -1445,7 +1458,8 @@ __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t
     const int* scr = A.scr + (((i64)f * A.nbig + (k - 10)) * A.T + t) * M + ((i64)j0 << k) + n0 * 512;
     Rec R;
     R.node = A.node[f] + (i64)t * A.Ntot * NC; R.leaf = A.leaf[f] + (i64)t * A.Ltot;
-    R.k = k; R.ks = 9; R.l0 = k - 9; R.n0 = n0; R.jb = j0; R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
+    R.k = k; R.ks = 9; R.l0 = k - 9; R.n0 = n0; R.jb = LEAN ? 0 : j0;
+    R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = 1; R.zsh = 5;
     {
         const int c = __ldcg(scr + tid);
@@ -1471,6 +1485,7 @@ __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t
     cw_phases(9, x, S, R, A.kb + (i64)t * M * DH, tid, lane, wid, 512, 10, fold, has_sp != 0);
 }
 
+template <bool LEAN = false>
 __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const int* __restrict__ LAY,
                  const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
                  const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
@@ -1486,15 +1501,151 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
     const int* tk = TASKS + 10 * blockIdx.x;
     const int type = tk[0], f = tk[1], t = tk[2], k = tk[3], j0 = tk[4], nsub = tk[5], l0 = tk[6], n0 = tk[7];
     const int flag = tk[8], dep = tk[9];
+    if constexpr (LEAN) {
+        A.adm[0] += (i64)t * (i64)(LAY[34] - M);
+        if (ADM1 != nullptr) A.adm[1] += (i64)t * (i64)(LAY[35] - M);
+        A.kb += (i64)t * (i64)(LAY[36] - M) * DH;
+        A.ce += (i64)t * (i64)(LAY[37] - M);
+        if (has_sp) A.spr += (i64)t * (i64)(LAY[38] - M);
+    }
     const bool fold = (LAY[32] >> k) & 1;
     DBG_MARK(0);
     if (type == 0) {
-        if (k <= 5) task_wbatch(A, f, t, k, j0, nsub, fold);
-        else task_cbatch(A, f, t, k, j0, nsub, fold);
+        if (k <= 5) task_wbatch<LEAN>(A, f, t, k, j0, nsub, fold);
+        else task_cbatch<LEAN>(A, f, t, k, j0, nsub, fold);
     } else if (type == 1) {
-        task_gnode(A, f, t, k, j0, l0, n0, fold, flag, dep);
+        task_gnode<LEAN>(A, f, t, k, j0, l0, n0, fold, flag, dep);
     } else {
-        task_sub(A, f, t, k, j0, n0, fold, dep);
+        task_sub<LEAN>(A, f, t, k, j0, n0, fold, dep);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+fsb_prep_lean_tasks(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
+                    i64* __restrict__ JB0, const i64* __restrict__ MT0,
+                    const u64 k_packed, const int n_k, const int T,
+                    const int fold_mask, const int Kmax_lean,
+                    const int M_adm0, const int M_kb, const int M_ce, const int M_spr) {
+    const int tid = threadIdx.x;
+    const int nrec = n_k * T;
+    for (int r = tid; r < nrec; r += 256) {
+        const int idx = r / T, t = r - idx * T;
+        const int k = (int)((k_packed >> (4 * idx)) & 0xFull);
+        const i64 mi = MT0[t];
+        const int j0 = ((mi >> k) & 1ll) ? (int)((mi >> (k + 1)) << 1) : ((int)(mi >> k) + 1);
+        int* tk = TASKS_OUT + 10 * r;
+        tk[0] = 0; tk[1] = 0; tk[2] = t; tk[3] = k; tk[4] = j0;
+        tk[5] = 1; tk[6] = 0; tk[7] = 0; tk[8] = -1; tk[9] = -1;
+    }
+    if (tid < 16) {
+        LAY_OUT[tid] = (2 << tid) - tid - 2;
+        LAY_OUT[16 + tid] = (1 << tid) - 1;
+    } else if (tid == 32) {
+        LAY_OUT[32] = fold_mask;
+        LAY_OUT[33] = Kmax_lean;
+        LAY_OUT[34] = M_adm0;
+        LAY_OUT[35] = 0;
+        LAY_OUT[36] = M_kb;
+        LAY_OUT[37] = M_ce;
+        LAY_OUT[38] = M_spr;
+        LAY_OUT[39] = 0;
+    }
+    if (JB0 != nullptr) {
+        const int K1 = Kmax_lean + 1;
+        for (int e = tid; e < T * K1; e += 256) {
+            const int tt = e / K1, kk = e - tt * K1;
+            const i64 mi = MT0[tt];
+            JB0[e] = ((mi >> kk) & 1ll) ? ((mi >> (kk + 1)) << 1) : 0ll;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+fsb_spine_lean(const float* __restrict__ NODE0, const i64* __restrict__ MT0,
+               float* __restrict__ SP_NODE, i64* __restrict__ SP_ROOT,
+               i64* __restrict__ SP_HGT, const int T, const int Ntot, const int Kmax_lean) {
+    const int t = blockIdx.x * 16 + (threadIdx.x >> 5);
+    if (t >= T) return;
+    const int lane = threadIdx.x & 31;
+    const i64 m = MT0[t];
+    const int S = Kmax_lean + 1;
+    const float* nt = NODE0 + (i64)t * Ntot * NC;
+    float r_mu[PER];
+#pragma unroll
+    for (int i = 0; i < PER; i++) r_mu[i] = 0.0f;
+    float r_rad = 0.0f, r_am = 0.0f, r_pm = 1073741824.0f, r_cnt = 0.0f;
+    i64 r_ref = -1, pop = 0, hb = 0;
+    for (int k = 0; k < S; k++) {
+        const i64 kk = (i64)k;
+        const i64 off = m & ~((2ll << kk) - 1ll);
+        const i64 croot = (i64)((2 << k) - k - 2);
+        const bool bit = ((m >> kk) & 1ll) != 0;
+        const bool present = bit;
+        const bool mk = present && (r_cnt > 0.0f);
+        float* row = SP_NODE + ((i64)t * S + kk) * NC;
+        if (present) {
+            const float* np = nt + min(max(croot, 0ll), (i64)(Ntot - 1)) * NC;
+            float c_mu[PER];
+#pragma unroll
+            for (int i = 0; i < PER; i++) c_mu[i] = np[lane + 32 * i];
+            const float c_rad = np[DH];
+            const float c_am = np[DH + 1];
+            const float c_pm = np[DH + 2];
+            const float c_cnt = np[DH + 3];
+            if (mk) {
+                const float tot = f_max(f_add(c_cnt, r_cnt), 1.0f);
+                float n_mu[PER], sq0[PER], sq1[PER];
+#pragma unroll
+                for (int i = 0; i < PER; i++) {
+                    n_mu[i] = f_div_ftz(f_add(f_mul(c_cnt, c_mu[i]), f_mul(r_cnt, r_mu[i])), tot);
+                    const float a = f_sub(c_mu[i], n_mu[i]);
+                    const float b = f_sub(r_mu[i], n_mu[i]);
+                    sq0[i] = f_mul(a, a);
+                    sq1[i] = f_mul(b, b);
+                }
+                const float nrm0 = f_sqrt_ftz(dim_allsum(sq0));
+                const float nrm1 = f_sqrt_ftz(dim_allsum(sq1));
+                const float n_rad = f_max(f_add(c_rad, nrm0), f_add(r_rad, nrm1));
+                const float n_am = f_max(c_am, r_am);
+                const float n_pm = f_min(c_pm, r_pm);
+                const float n_cnt = f_add(c_cnt, r_cnt);
+#pragma unroll
+                for (int i = 0; i < PER; i++) row[lane + 32 * i] = n_mu[i];
+                if (lane == 0) {
+                    row[DH] = n_rad;
+                    row[DH + 1] = n_am;
+                    row[DH + 2] = n_pm;
+                    row[DH + 3] = n_cnt;
+                    row[DH + 4] = (float)croot;
+                    row[DH + 5] = (float)r_ref;
+                    row[DH + 6] = 2.0f;
+                    row[DH + 7] = (float)off;
+                    row[DH + 8] = n_cnt;
+                }
+#pragma unroll
+                for (int i = 0; i < PER; i++) r_mu[i] = n_mu[i];
+                r_rad = n_rad; r_am = n_am; r_pm = n_pm; r_cnt = n_cnt;
+                r_ref = -(kk + 2);
+            } else {
+#pragma unroll
+                for (int i = 0; i < PER; i++) row[lane + 32 * i] = 0.0f;
+                if (lane < 9) row[DH + lane] = (lane == 4 || lane == 5) ? -1.0f : 0.0f;
+#pragma unroll
+                for (int i = 0; i < PER; i++) r_mu[i] = c_mu[i];
+                r_rad = c_rad; r_am = c_am; r_pm = c_pm; r_cnt = c_cnt;
+                r_ref = croot;
+            }
+            pop += 1;
+            hb = kk;
+        } else {
+#pragma unroll
+            for (int i = 0; i < PER; i++) row[lane + 32 * i] = 0.0f;
+            if (lane < 9) row[DH + lane] = (lane == 4 || lane == 5) ? -1.0f : 0.0f;
+        }
+    }
+    if (lane == 0) {
+        SP_ROOT[t] = (m > 0) ? r_ref : -1ll;
+        SP_HGT[t] = (m > 1) ? (hb + (pop >= 2 ? 1ll : 0ll)) : 0ll;
     }
 }
 
@@ -1508,7 +1659,34 @@ fsb_forest_build(const int* __restrict__ TASKS, const int* __restrict__ LAY,
                  const int has_sp, const int nbig, const int T) {
     extern __shared__ float smem[];
     DBG_START();
-    build_task(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot,
-               has_sp, nbig, T);
+    build_task<false>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot,
+                      has_sp, nbig, T);
     DBG_END();
 }
+
+extern "C" __global__ void __launch_bounds__(512, 1)
+fsb_forest_build_lean(const int* __restrict__ TASKS, const int* __restrict__ LAY,
+                      const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
+                      const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
+                      const i64* __restrict__ MT0, const i64* __restrict__ MT1,
+                      float* __restrict__ NODE0, float* __restrict__ NODE1, i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
+                      int* __restrict__ SCR, int* __restrict__ CTL, const int M, const int Ntot, const int Ltot,
+                      const int has_sp, const int nbig, const int T,
+                      i64* __restrict__ JB0, i64* __restrict__ JB1) {
+    extern __shared__ float smem[];
+    if (blockIdx.x == 0 && JB0 != nullptr) {
+        const int K1 = LAY[33] + 1;
+        for (int e = threadIdx.x; e < T * K1; e += 512) {
+            const int t = e / K1, k = e - t * K1;
+            const i64 mi = MT0[t];
+            JB0[e] = ((mi >> k) & 1) ? ((mi >> (k + 1)) << 1) : 0;
+            if (JB1 != nullptr) {
+                const i64 mi1 = MT1[t];
+                JB1[e] = ((mi1 >> k) & 1) ? ((mi1 >> (k + 1)) << 1) : 0;
+            }
+        }
+    }
+    build_task<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot,
+                     has_sp, nbig, T);
+}
+

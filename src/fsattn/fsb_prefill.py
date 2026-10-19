@@ -430,12 +430,15 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                 # a stage's fp32 query copy and its beams (one pair launch when the union beam takes the tables)
                 nbc = b1 - b0
                 Tc, r0, r1, q0, q1 = T * nbc, T * b0, T * b1, b0 * Bq, b1 * Bq
-                q = torch.empty((Tc, Bq, Dh), dtype=torch.float32, device=dev)
-                qv = q.view(B, H, nbc * Bq, Dh)
                 nq = min(q1, N) - q0
-                qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
-                if nq < nbc * Bq:
-                    qv[:, :, nq:].zero_()
+                if q_bf16 and len(stages) == 1 and nq == nbc * Bq and Q.is_contiguous() and Q.data_ptr() % 16 == 0:
+                    q = Q.view(Tc, Bq, Dh)
+                else:
+                    q = torch.empty((Tc, Bq, Dh), dtype=torch.bfloat16 if q_bf16 else torch.float32, device=dev)
+                    qv = q.view(B, H, nbc * Bq, Dh)
+                    qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
+                    if nq < nbc * Bq:
+                        qv[:, :, nq:].zero_()
                 SPc = build_spines(F, mb_rows[r0:r1], cst["t_rows"][r0:r1])
                 SP2c = build_spines(F2, mb2_rows[r0:r1], cst["t_rows"][r0:r1]) if F2 is not None else None
                 SPuc = SP2c if SP2c is not None else SPc
@@ -504,40 +507,46 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                     nv_full[:, :, q0:q1].copy_(nv.view(B, H, nbc * Bq))
                 return res
 
-            s1 = _stage_pipe(stages, chk, dev)
-            if s1 is None:
-                for b0, b1 in stages:
-                    out = _rerank_stage(b0, b1, *_beam_stage(b0, b1))
-                    out = pv = None
-            else:
-                s0 = torch.cuda.current_stream(dev)
-                ev_b, ev_r, ring = [torch.cuda.Event(), torch.cuda.Event()], [torch.cuda.Event() for _ in stages], \
-                    [None, None]
+            from . import fsb_rows as _rows_mod
+            _prev_scr = _rows_mod._active_scratch
+            _rows_mod._active_scratch = {} if len(stages) > 1 else None
+            try:
+                s1 = _stage_pipe(stages, chk, dev)
+                if s1 is None:
+                    for b0, b1 in stages:
+                        out = _rerank_stage(b0, b1, *_beam_stage(b0, b1))
+                        out = pv = None
+                else:
+                    s0 = torch.cuda.current_stream(dev)
+                    ev_b, ev_r, ring = [torch.cuda.Event(), torch.cuda.Event()], [torch.cuda.Event() for _ in stages], \
+                        [None, None]
 
-                def _beam_k(k: int):
-                    # a stage's beams, enqueued one stage ahead of its re-rank so the re-rank's capacity check
-                    # (FSB_ROWS_DEFER=0 syncs the host) does not leave the caller's stream with nothing to run:
-                    # the slot's previous stage's re-rank must be done reading its buffers before this stage's
-                    # writes reuse them (ev_r, and the ring holds them alive)
-                    if k >= 2:
-                        s0.wait_event(ev_r[k - 2])
-                    ring[k % 2] = None
-                    got = _beam_stage(*stages[k])
-                    ring[k % 2] = got
-                    ev_b[k % 2].record(s0)
-                    return got
+                    def _beam_k(k: int):
+                        # a stage's beams, enqueued one stage ahead of its re-rank so the re-rank's capacity check
+                        # (FSB_ROWS_DEFER=0 syncs the host) does not leave the caller's stream with nothing to run:
+                        # the slot's previous stage's re-rank must be done reading its buffers before this stage's
+                        # writes reuse them (ev_r, and the ring holds them alive)
+                        if k >= 2:
+                            s0.wait_event(ev_r[k - 2])
+                        ring[k % 2] = None
+                        got = _beam_stage(*stages[k])
+                        ring[k % 2] = got
+                        ev_b[k % 2].record(s0)
+                        return got
 
-                _beam_k(0)
-                for k, (b0, b1) in enumerate(stages):
-                    if k + 1 < len(stages):
-                        _beam_k(k + 1)
-                    with torch.cuda.stream(s1):
-                        s1.wait_event(ev_b[k % 2])
-                        out = _rerank_stage(b0, b1, *ring[k % 2])
-                        pv = out[1] if out is not None else None
-                        ring[k % 2] = (ring[k % 2], out)
-                        ev_r[k].record(s1)
-                s0.wait_event(ev_r[-1])
+                    _beam_k(0)
+                    for k, (b0, b1) in enumerate(stages):
+                        if k + 1 < len(stages):
+                            _beam_k(k + 1)
+                        with torch.cuda.stream(s1):
+                            s1.wait_event(ev_b[k % 2])
+                            out = _rerank_stage(b0, b1, *ring[k % 2])
+                            pv = out[1] if out is not None else None
+                            ring[k % 2] = (ring[k % 2], out)
+                            ev_r[k].record(s1)
+                    s0.wait_event(ev_r[-1])
+            finally:
+                _rows_mod._active_scratch = _prev_scr
         else:
             if not _warned:
                 _warned.append(1)

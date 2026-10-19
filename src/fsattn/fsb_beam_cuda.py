@@ -54,6 +54,7 @@ _LEGACY_KERNEL = _BEAM_CU["_LEGACY_KERNEL"]
 _NWARP = 4                                               # queries (warps) per block
 _lock = threading.Lock()
 _funcs: dict = {}
+_mods: dict = {}
 _beam_fns: dict = {}
 _libs: dict = {}
 _failed: list = []                                       # the warp kernel failed to build: every CUDA beam is off
@@ -179,10 +180,16 @@ def load_function(device: torch.device, src: str, name: str):
                 _check(cuda.cuCtxGetCurrent(ctypes.byref(ctx)), "cuCtxGetCurrent")
                 if not ctx.value:
                     raise RuntimeError("no current CUDA context")
-                maj, mnr = torch.cuda.get_device_capability(device)
-                image = compile_image(src, 10 * maj + mnr)
-                mod, f = ctypes.c_void_p(), ctypes.c_void_p()
-                _check(cuda.cuModuleLoadData(ctypes.byref(mod), image), "cuModuleLoadData")
+                mkey = (device.index, src)
+                m = _mods.get(mkey)
+                if m is None:
+                    maj, mnr = torch.cuda.get_device_capability(device)
+                    image = compile_image(src, 10 * maj + mnr)
+                    mod = ctypes.c_void_p()
+                    _check(cuda.cuModuleLoadData(ctypes.byref(mod), image), "cuModuleLoadData")
+                    m = _mods[mkey] = (mod, image)
+                mod, image = m
+                f = ctypes.c_void_p()
                 _check(cuda.cuModuleGetFunction(ctypes.byref(f), mod, name.encode()), "cuModuleGetFunction")
                 fn = _funcs[key] = (f, mod, image)
     return fn[0]
@@ -243,8 +250,8 @@ def forest_beam_cuda(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, lam
     R = 1 << delta_max
     DHP = 1 << max(Dh - 1, 0).bit_length()
     rc_t = torch.is_tensor(radius_coef)
-    f32, i64, dev = torch.float32, torch.int64, q.device
-    if not (W.dtype == bud.dtype == i64 and qpos.dtype == lam.dtype == sigv.dtype == f32
+    f32, bf16, i64, dev = torch.float32, torch.bfloat16, torch.int64, q.device
+    if not (q.dtype in (f32, bf16) and W.dtype == bud.dtype == i64 and qpos.dtype == lam.dtype == sigv.dtype == f32
             and F["node"].dtype == SP["node"].dtype == f32 and (not rc_t or radius_coef.is_floating_point())
             and all(t.device == dev for t in (W, bud, qpos, lam, sigv, F["node"], SP["node"], F["leaf"], F["adm"],
                                               SP["root"], SP["t_idx"]))):
@@ -270,9 +277,10 @@ def forest_beam_cuda(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, lam
     chunk, spine = F["node"], SP["node"]
     cells = torch.empty((Tp, Bq, W_max * R), dtype=torch.long, device=q.device)
     nvis = torch.empty((Tp, Bq), dtype=torch.float32, device=q.device)
-    keep = [SP["root"].contiguous(), q.contiguous(), qpos.contiguous(), lam.reshape(-1).contiguous(),
+    qin = q.float() if (legacy and q.dtype == bf16) else q
+    keep = [SP["root"].contiguous(), qin.contiguous(), qpos.contiguous(), lam.reshape(-1).contiguous(),
             sigv.reshape(-1).contiguous(), W.contiguous(), bud.contiguous(), SP["t_idx"].contiguous(),
-            radius_coef.reshape(-1).float().contiguous() if rc_t else q]
+            radius_coef.reshape(-1).float().contiguous() if rc_t else qin]
     root, qc, qp, lm, sg, wb, bd, ti, rc = keep
     P, I64, F32, I32 = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
     nq = Tp * Bq
@@ -281,6 +289,8 @@ def forest_beam_cuda(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, lam
             P(wb.data_ptr()), P(bd.data_ptr()), P(ti.data_ptr()), P(chunk.data_ptr()), P(spine.data_ptr()),
             P(F["leaf"].data_ptr()), P(F["adm"].data_ptr()), I64(chunk.shape[1]), I64(spine.shape[1]),
             I64(F["Ltot"]), I64(F["M"]), I64(Bq), I64(nq), F32(float(scale)), F32(float(s)), I32(F["Kmax"] + 1)]
+    if not legacy:
+        args.append(I32(1 if qin.dtype == bf16 else 0))
     launch(fn, (nq + nw - 1) // nw, 32 * nw, q.device, args)
     return cells, nvis
 
@@ -306,9 +316,10 @@ def forest_beam_pair_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     DHP = 1 << max(Dh - 1, 0).bit_length()
     NC = beams[0][0]["node"].shape[-1]
     rc_t = torch.is_tensor(radius_coef)
-    f32, i64, dev = torch.float32, torch.int64, q.device
+    f32, bf16, i64, dev = torch.float32, torch.bfloat16, torch.int64, q.device
     if not (32 <= DHP <= 256 and 1 <= WM <= 16 and NC == Dh + 9
-            and q.dtype == qpos.dtype == lam.dtype == sigv.dtype == f32 and (not rc_t or radius_coef.is_floating_point())
+            and q.dtype in (f32, bf16) and qpos.dtype == lam.dtype == sigv.dtype == f32
+            and (not rc_t or radius_coef.is_floating_point())
             and all(W_max == WM and W.dtype == bud.dtype == i64 and F["node"].dtype == SP["node"].dtype == f32
                     and F["node"].shape[-1] == NC and W.shape == bud.shape == (Tp, Bq)
                     and all(t.device == dev for t in (W, bud, F["node"], SP["node"], F["leaf"], F["adm"],
@@ -353,11 +364,11 @@ def forest_beam_pair_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
                          F["adm"].data_ptr(), F["node"].shape[1], SP["node"].shape[1], F["Ltot"], F["M"], Tp,
                          F["Kmax"] + 1, 0))
         outs.append((cells, nvis))
-    P, I64, F32 = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float
+    P, I64, F32, I32 = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
     nq = Tp * Bq
     args = [ps[0], ps[1], P(qc.data_ptr()), P(rc.data_ptr()), F32(1.0 if rc_t else float(radius_coef)),
             P(qp.data_ptr()), P(lm.data_ptr()), P(sg.data_ptr()), I64(Bq), I64(nq), F32(float(scale)), F32(float(s)),
-            I64(qp_s)]
+            I64(qp_s), I32(1 if qc.dtype == bf16 else 0)]
     launch(fn, (nq, 2), 32, dev, args)
     return outs
 
@@ -388,11 +399,11 @@ def _rows_layout(CAP: int, UMAX: int, QB: int):
 
 
 def rows_source(NC: int, DH: int, WM: int, R: int, BOUND: bool, RC_T: bool, CAP: int = _ROWS_CAP,
-                UMAX: int = _ROWS_UMAX, QB: int = _ROWS_QB):
+                UMAX: int = _ROWS_UMAX, QB: int = _ROWS_QB, q_bf16: bool = False):
     # -> (source, dynamic shared memory bytes)
     off, total = _rows_layout(CAP, UMAX, QB)
     defs = dict(NC=NC, DH=DH, DHP=64, WM=WM, R=R, BOUND=int(BOUND), RC_T=int(RC_T), CAP=CAP, UMAX=UMAX, QB=QB,
-                MINB=max(1, 256 // QB), OSTAGE=int(QB * WM * R * 8 <= total),
+                MINB=max(1, 256 // QB), OSTAGE=int(QB * WM * R * 8 <= total), Q_BF16=int(q_bf16),
                 **{f"OFF_{k}": v for k, v in off.items()})
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _HELPERS + _KERNEL + _ROWS_KERNEL, total
 
@@ -429,8 +440,9 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     R = 1 << delta_max
     WM = beams[0][4]
     rc_t = torch.is_tensor(radius_coef)
-    f32, i64, dev = torch.float32, torch.int64, q.device
-    if not (q.dtype == qpos.dtype == lam.dtype == sigv.dtype == f32 and (not rc_t or radius_coef.is_floating_point())
+    f32, bf16, i64, dev = torch.float32, torch.bfloat16, torch.int64, q.device
+    if not (q.dtype in (f32, bf16) and qpos.dtype == lam.dtype == sigv.dtype == f32
+            and (not rc_t or radius_coef.is_floating_point())
             and all(W_max == WM and W.dtype == bud.dtype == i64 and F["node"].dtype == SP["node"].dtype == f32
                     and W.shape == bud.shape == (Tp, Bq) and SP["root"].shape[0] >= Tp and SP["t_idx"].shape[0] >= Tp
                     and SP["node"].shape[0] >= Tp
@@ -444,13 +456,14 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     if Tp * Bq == 0:
         return [(torch.empty((Tp, Bq, WM * R), dtype=i64, device=dev), torch.empty((Tp, Bq), dtype=f32, device=dev))
                 for _ in beams]
-    cfg = ("rows", dev.index, Dh + 9, Dh, WM, R, node_score == "bound", rc_t, cap, umax, qb)
+    q_bf16 = q.dtype == bf16
+    cfg = ("rows", dev.index, Dh + 9, Dh, WM, R, node_score == "bound", rc_t, cap, umax, qb, q_bf16)
     ent = _beam_fns.get(cfg)
     if ent is None:
         if torch.cuda.is_current_stream_capturing():
             return None                                                      # never compile inside a graph capture
         try:
-            src, smem = rows_source(Dh + 9, Dh, WM, R, node_score == "bound", rc_t, cap, umax, qb)
+            src, smem = rows_source(Dh + 9, Dh, WM, R, node_score == "bound", rc_t, cap, umax, qb, q_bf16)
             ent = _beam_fns[cfg] = (load_function(dev, src, "fsb_beam_rows"), smem)
         except Exception as e:
             import warnings
@@ -465,7 +478,7 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     fn, smem = ent
     qc, qp = q.contiguous(), qpos.contiguous()
     if qc.data_ptr() % 16:
-        qc = qc.clone()                                                      # the kernel reads query rows as float4s
+        qc = qc.clone()                                                      # the kernel reads query rows as float4s/uint4s
     lm, sg = lam.reshape(-1).contiguous(), sigv.reshape(-1).contiguous()
     rc = radius_coef.reshape(-1).float().contiguous() if rc_t else qc
     keep, outs, ps = [qc, qp, lm, sg, rc], [], []

@@ -104,7 +104,7 @@ if _HAVE_TRITON:
         w = tl.arange(0, WM)
         ref = tl.where(w == 0, tl.load(ROOT + t), -1)
         d = tl.arange(0, DHP)
-        q = tl.load(Q + pid * DH + d, mask=d < DH, other=0.0)          # (DHP,) fp32, zero-padded
+        q = tl.load(Q + pid * DH + d, mask=d < DH, other=0.0).to(tl.float32)          # (DHP,) fp32, zero-padded
         qn = tl.sqrt_rn(tl.sum(_halve_rows(tl.reshape(q * q, (1, DHP)), DHP), axis=0))
         if RC_T:
             qn = qn * tl.load(RC + t)
@@ -159,7 +159,7 @@ if _HAVE_TRITON:
             hi = seq - bi * Hh
             d = tl.arange(0, DHP)
             j = tl.arange(0, SP)
-            q = tl.load(Q + r * DH + d, mask=d < DH, other=0.0)          # (DHP,) fp32, zero-padded
+            q = tl.load(Q + r * DH + d, mask=d < DH, other=0.0).to(tl.float32)          # (DHP,) fp32, zero-padded
             tok = cell * S + j
             k = tl.load(KEY + bi * sb + hi * sh + tok[:, None] * sl + d[None, :],
                         mask=(j[:, None] < S) & (d[None, :] < DH), other=0.0).to(tl.float32)
@@ -241,9 +241,9 @@ if _HAVE_TRITON:
     @triton.jit
     def _fsb_upar_kernel(Q, SELA, SELB, TIDX, KEY, QPOS, sq0, sq1, SIG, ss0, ss1, CELLA, ca0, ca1, LAM, ls0, ls1, U,
                          Ca, Cb, C, Bq, Hh, sb, sh, sl, scale, S, Mc,
-                         CAP: tl.constexpr, DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr,
+                         DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr, FULL_S: tl.constexpr,
                          HAS_B: tl.constexpr, LSE: tl.constexpr, POS: tl.constexpr):
-        # one u score per program (grid row * C + candidate), fusing union_candidates deduplication and torch.erf
+        # one u score per program (grid row * C + candidate), fusing torch.erf
         pid = tl.program_id(0)
         r = pid // C
         cand = pid - r * C
@@ -252,11 +252,6 @@ if _HAVE_TRITON:
                 cell = tl.load(SELA + r * Ca + cand)
             else:
                 cell = tl.load(SELB + r * Cb + (cand - Ca))
-                if cell >= 0:
-                    ia = tl.arange(0, CAP)
-                    a_row = tl.load(SELA + r * Ca + ia, mask=ia < Ca, other=-2)
-                    if tl.sum((a_row == cell).to(tl.int32), axis=0) > 0:
-                        cell = cell - (cell + 1)
         else:
             cell = tl.load(SELA + pid)
         if cell >= 0:
@@ -267,15 +262,22 @@ if _HAVE_TRITON:
             hi = seq - bi * Hh
             d = tl.arange(0, DHP)
             j = tl.arange(0, SP)
-            q = tl.load(Q + r * DH + d, mask=d < DH, other=0.0)          # (DHP,) fp32, zero-padded
+            if DH == DHP:
+                q = tl.load(Q + r * DH + d).to(tl.float32)
+            else:
+                q = tl.load(Q + r * DH + d, mask=d < DH, other=0.0).to(tl.float32)
             tok = cell * S + j
-            k = tl.load(KEY + bi * sb + hi * sh + tok[:, None] * sl + d[None, :],
-                        mask=(j[:, None] < S) & (d[None, :] < DH), other=0.0).to(tl.float32)
+            if FULL_S and DH == DHP:
+                k = tl.load(KEY + bi * sb + hi * sh + tok[:, None] * sl + d[None, :]).to(tl.float32)
+            else:
+                k = tl.load(KEY + bi * sb + hi * sh + tok[:, None] * sl + d[None, :],
+                            mask=(j[:, None] < S) & (d[None, :] < DH), other=0.0).to(tl.float32)
             sc = _halve_rows(k * q[None, :], DHP) * scale                # (SP,) fp32 product, halving dot, * scale
-            sc = tl.where(j < S, sc, float("-inf"))
+            if not FULL_S:
+                sc = tl.where(j < S, sc, float("-inf"))
             m = tl.max(sc, axis=0)
             if LSE:
-                e = tl.where(j < S, _ld.exp(sc - m), 0.0)
+                e = _ld.exp(sc - m) if FULL_S else tl.where(j < S, _ld.exp(sc - m), 0.0)
                 res = m + _ld.log(tl.sum(_halve_rows(tl.reshape(e, (1, SP)), SP), axis=0))
             else:
                 res = m
@@ -300,9 +302,11 @@ if _HAVE_TRITON:
         u = tl.load(U + r * C + i, mask=i < C, other=float("-inf"))
         if HAS_B:
             isa = i < Ca
-            sa = tl.load(SELA + r * Ca + i, mask=isa, other=-1)
+            sa = tl.load(SELA + r * Ca + i, mask=isa, other=-2)
             sb = tl.load(SELB + r * Cb + (i - Ca), mask=(i >= Ca) & (i < C), other=-1)
-            sel = tl.where(isa, sa, sb)
+            dup = (~isa) & (sb >= 0) & (tl.sum((sb[:, None] == sa[None, :]).to(tl.int32), axis=1) > 0)
+            u = tl.where(dup, float("-inf"), u)
+            sel = tl.where(isa, sa, tl.where(dup, -1, sb))
         else:
             sel = tl.load(SELA + r * Ca + i, mask=i < C, other=-1)
         gt = (u[None, :] > u[:, None]) | ((u[None, :] == u[:, None]) & (i[None, :] < i[:, None]))
@@ -383,7 +387,7 @@ def fast_rerank_on() -> bool:
 
 
 def fast_beam_ok(F: dict, SP: dict, q: torch.Tensor, W_max: int, delta_max: int) -> bool:
-    if not (fast_beam_on() and q.is_cuda and q.dtype == torch.float32):
+    if not (fast_beam_on() and q.is_cuda and q.dtype in (torch.float32, torch.bfloat16)):
         return False
     Dh = q.shape[-1]
     return (Dh <= 256 and W_max >= 1 and (W_max & (W_max - 1)) == 0 and W_max * (1 << delta_max) <= 256
@@ -469,7 +473,7 @@ def forest_beam_pair(F: dict, SP: dict, W: torch.Tensor, delta: torch.Tensor, W_
 
 
 def fast_rerank_ok(sel: torch.Tensor, q: torch.Tensor, tokK, s: int, K: int, score: str) -> bool:
-    if not (fast_rerank_on() and q.is_cuda and q.dtype == torch.float32 and q.shape[1] == 1 and tokK is not None):
+    if not (fast_rerank_on() and q.is_cuda and q.dtype in (torch.float32, torch.bfloat16) and q.shape[1] == 1 and tokK is not None):
         return False
     C = sel.shape[-1]
     return (score in ("lse", "lse_pos", "max") and sel.dtype == torch.int64 and sel.is_cuda
@@ -516,7 +520,7 @@ def rerank_top_fast(sel: torch.Tensor, q: torch.Tensor, qpos: torch.Tensor, lam:
 
 def fast_union_rerank_ok(Ca: int, Cb: int, q: torch.Tensor, tokK, s: int, K: int, score: str) -> bool:
     C = Ca + Cb
-    return (fast_rerank_on() and q.is_cuda and q.dtype == torch.float32 and tokK is not None
+    return (fast_rerank_on() and q.is_cuda and q.dtype in (torch.float32, torch.bfloat16) and tokK is not None
             and score in ("lse", "lse_pos", "max") and 1 <= K <= min(16, C) and C <= 512 and s <= 256
             and q.shape[-1] <= 256)
 
@@ -545,17 +549,18 @@ def union_rerank_fast(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
     lv, ls0, ls1 = _row_view(lam, Tp, Bq)
     u = torch.empty((rows, C), dtype=torch.float32, device=dev)
     sb_arg = sel_b if Cb else sel_a
+    sp = _pow2(s)
     _fsb_upar_kernel[(rows * C,)](q.reshape(rows, Dh).contiguous(), sel_a, sb_arg, t_idx.contiguous(), K4, qv, sq0, sq1,
                                   sv, ss0, ss1, cellA, cellA.stride(0), cellA.stride(1), lv, ls0, ls1, u,
                                   Ca, Cb, C, Bq, K4.shape[1], K4.stride(0), K4.stride(1), K4.stride(2), float(scale),
-                                  s, cellA.shape[1], CAP=_pow2(Ca), DH=Dh, DHP=_pow2(Dh), SP=_pow2(s),
+                                  s, cellA.shape[1], DH=Dh, DHP=_pow2(Dh), SP=sp, FULL_S=(s == sp),
                                   HAS_B=Cb > 0, LSE=(score != "max"), POS=pos,
                                   num_warps=2, enable_fp_fusion=False)
     out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
     pv = torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev) if prov else out
     cwp = _pow2(C)
     _fsb_selpv_kernel[(rows,)](u, sel_a, sb_arg, out, pv, C, K, Ca, Cb, PROV_UTAU, CWP=cwp, KP2=_pow2(K),
-                               HAS_B=Cb > 0, PRV=prov, num_warps=1 if cwp <= 64 else 4, enable_fp_fusion=False)
+                               HAS_B=Cb > 0, PRV=prov, num_warps=4, enable_fp_fusion=False)
     return out, (pv if prov else None)
 
 
@@ -623,5 +628,5 @@ def decode_readout_fast(attn, cache, q_t: torch.Tensor, sel, pos_t, sr=None):
         float(attn.scale), float(attn.lr_norm.eps), H, K, s,
         DH=Dh, DHP=_pow2(Dh), SP=_pow2(s), KK=_pow2(K),
         HAS_SR=has_sr, LRS_BF16=lrs_bf16,
-        num_warps=4, enable_fp_fusion=False)
+        num_warps=8, enable_fp_fusion=False)
     return out

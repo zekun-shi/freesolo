@@ -45,7 +45,7 @@ def _source(CA: int, CB: int) -> str:
 
 
 @torch.no_grad()
-def rows_union_cuda(sel_a: torch.Tensor, sel_b, Mc: int, ud: int):
+def rows_union_cuda(sel_a: torch.Tensor, sel_b, Mc: int, ud: int, scratch: dict = None):
     # the row union of the beams' cells (T',Bq,Ca) and (T',Bq,Cb) -> (cells (T',ud) int32 ascending, count (T',) int32,
     # position of each present cell (T',Mc) int32 (other entries unset), duplicate beam-b slots (T',Bq) int64 bitmask
     # or None, overflow flag () bool: some row has more than ud cells); None when NVRTC is unavailable
@@ -70,10 +70,22 @@ def rows_union_cuda(sel_a: torch.Tensor, sel_b, Mc: int, ud: int):
     sb = sel_b.contiguous() if Cb else sa
     if sa.data_ptr() % 16 or sb.data_ptr() % 16:
         sa, sb = sa.clone(), (sb.clone() if Cb else sa)
-    cells = torch.empty((Tp, ud), dtype=torch.int32, device=dev)
-    cnt = torch.empty((Tp,), dtype=torch.int32, device=dev)
-    pos = torch.empty((Tp, Mc), dtype=torch.int32, device=dev)
-    dup = torch.empty((Tp, Bq), dtype=torch.int64, device=dev) if Cb else cnt
+    if scratch is not None and Tp > 0:
+        u_key = ("union", Tp, ud, Mc, Bq, bool(Cb))
+        u_bufs = scratch.get(u_key)
+        if u_bufs is None:
+            cells = torch.empty((Tp, ud), dtype=torch.int32, device=dev)
+            cnt = torch.empty((Tp,), dtype=torch.int32, device=dev)
+            pos = torch.empty((Tp, Mc), dtype=torch.int32, device=dev)
+            dup = torch.empty((Tp, Bq), dtype=torch.int64, device=dev) if Cb else cnt
+            scratch[u_key] = (cells, cnt, pos, dup)
+        else:
+            cells, cnt, pos, dup = u_bufs
+    else:
+        cells = torch.empty((Tp, ud), dtype=torch.int32, device=dev)
+        cnt = torch.empty((Tp,), dtype=torch.int32, device=dev)
+        pos = torch.empty((Tp, Mc), dtype=torch.int32, device=dev)
+        dup = torch.empty((Tp, Bq), dtype=torch.int64, device=dev) if Cb else cnt
     # rows cannot exceed ud cells when the context has at most ud: the kernel then never writes the flag
     ovf = (torch.zeros if Mc > ud else torch.empty)((), dtype=torch.bool, device=dev)
     if Tp == 0:

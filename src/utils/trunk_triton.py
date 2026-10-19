@@ -142,7 +142,8 @@ if triton is not None:
         tl.store(O + row * (J * 128) + offs, y.to(O.dtype.element_ty))
 
     @triton.jit
-    def _rms_1row_kernel(X, W, O, eps, D: tl.constexpr, T: tl.constexpr, V: tl.constexpr):
+    def _rms_1row_kernel(X, RES, W, O, eps, D: tl.constexpr, T: tl.constexpr, V: tl.constexpr,
+                         HAS_RES: tl.constexpr = False):
         # Single-row (rows == 1) one-pass RMSNorm reproducing ATen's reduce_kernel<512, 1, MeanOps> reduction order
         # (D = 128: V = 1, T = 128; D in 256..2048: V = 4, T = D // 4; inter-warp halving tree first, then intra-warp
         # shfl_down offsets 1, 2, 4, 8, 16), followed by rsqrt(mean + eps), (x * r) * w and the output cast.
@@ -152,14 +153,24 @@ if triton is not None:
         if V == 4:
             ii = tl.arange(0, 4)
             offs = ww[:, None, None] * 128 + tt[None, :, None] * 4 + ii[None, None, :]
-            x = tl.load(X + offs).to(tl.float32)
+            if HAS_RES:
+                x_raw = (tl.load(X + offs).to(tl.float32) + tl.load(RES + offs).to(tl.float32)).to(X.dtype.element_ty)
+                tl.store(X + offs, x_raw)
+                x = x_raw.to(tl.float32)
+            else:
+                x = tl.load(X + offs).to(tl.float32)
             sq = x * x
             v = tl.sum(tl.where(ii[None, None, :] == 0, sq, 0.0), axis=2)
             for i in tl.static_range(1, 4):
                 v = v + tl.sum(tl.where(ii[None, None, :] == i, sq, 0.0), axis=2)
         else:
             offs = ww[:, None] * 32 + tt[None, :]
-            x = tl.load(X + offs).to(tl.float32)
+            if HAS_RES:
+                x_raw = (tl.load(X + offs).to(tl.float32) + tl.load(RES + offs).to(tl.float32)).to(X.dtype.element_ty)
+                tl.store(X + offs, x_raw)
+                x = x_raw.to(tl.float32)
+            else:
+                x = tl.load(X + offs).to(tl.float32)
             v = x * x
         v = tl.sum(tl.reshape(v, (2, NW // 2, 32)), axis=0)
         if NW >= 4:
@@ -267,41 +278,70 @@ if triton is not None:
     def _sr_softmax_cast_kernel(
         Scores, PosT, WinPos, Sigma, WOut,
         scale, W_win, Lw,
-        H: tl.constexpr, UNIFORM: tl.constexpr, LOG2_L: tl.constexpr,
+        H: tl.constexpr, UNIFORM: tl.constexpr, LOG2_L: tl.constexpr, VALID_IT: tl.constexpr,
     ):
         row = tl.program_id(0)
-        NIT: tl.constexpr = (1 << LOG2_L) // 32
+        NIT_FULL: tl.constexpr = (1 << LOG2_L) // 32
+        ONE_TAIL: tl.constexpr = (NIT_FULL >= 2) and (VALID_IT == (NIT_FULL // 2) + 1)
+        NIT: tl.constexpr = (NIT_FULL // 2) if ONE_TAIL else NIT_FULL
+        LOOP_IT: tl.constexpr = NIT if ONE_TAIL else VALID_IT
+
         ii = tl.arange(0, NIT)
         tt = tl.arange(0, 32)
         idx = ii[:, None] * 32 + tt[None, :]
-        valid = idx < Lw
-
-        s_raw = tl.load(Scores + row * Lw + idx, mask=valid, other=0.0).to(tl.float32)
-        s_scaled = s_raw * scale
-
         pos_t = tl.load(PosT).to(tl.float32)
-        pos_w = tl.load(WinPos + idx, mask=valid, other=0.0).to(tl.float32)
-        dist = tl.abs(pos_t - pos_w)
-        band = dist <= W_win
+        if not UNIFORM:
+            sig2 = 2.0 * tl.load(Sigma + (row % H)).to(tl.float32)
+
+        if ONE_TAIL:
+            s_raw = tl.load(Scores + row * Lw + idx).to(tl.float32)
+            pos_w = tl.load(WinPos + idx).to(tl.float32)
+            dist = tl.abs(pos_t - pos_w)
+            band = dist <= W_win
+        else:
+            valid = idx < Lw
+            s_raw = tl.load(Scores + row * Lw + idx, mask=valid, other=0.0).to(tl.float32)
+            pos_w = tl.load(WinPos + idx, mask=valid, other=0.0).to(tl.float32)
+            dist = tl.abs(pos_t - pos_w)
+            band = valid & (dist <= W_win)
 
         if UNIFORM:
-            m = tl.where(band, 0.0, float("-inf"))
+            el = tl.where(band, s_raw * scale, float("-inf"))
         else:
-            sig = tl.load(Sigma + (row % H)).to(tl.float32)
-            arg = _div_rn_f32(dist, 2.0 * sig)
+            arg = _div_rn_f32(dist, sig2)
             erfc_v = _libdevice.erfc(arg)
             clamped = tl.where(erfc_v < 1e-10, 1e-10, erfc_v)
             bias = _libdevice.log(clamped)
-            m = tl.where(band, bias, float("-inf"))
+            el = tl.where(band, s_raw * scale + bias, float("-inf"))
 
-        el = tl.where(valid, s_scaled + m, float("-inf"))
-        mx = tl.max(el, axis=0)
-        mx = tl.max(mx, axis=0)
+        mx = tl.max(tl.max(el, axis=0), axis=0)
 
-        ex = tl.where(valid, _libdevice.exp(el - mx), 0.0)
+        if ONE_TAIL:
+            idx_t = NIT * 32 + tt
+            valid_t = idx_t < Lw
+            s_raw_t = tl.load(Scores + row * Lw + idx_t, mask=valid_t, other=0.0).to(tl.float32)
+            pos_w_t = tl.load(WinPos + idx_t, mask=valid_t, other=0.0).to(tl.float32)
+            dist_t = tl.abs(pos_t - pos_w_t)
+            band_t = valid_t & (dist_t <= W_win)
+            if UNIFORM:
+                el_t = tl.where(band_t, s_raw_t * scale, float("-inf"))
+            else:
+                arg_t = _div_rn_f32(dist_t, sig2)
+                erfc_t = _libdevice.erfc(arg_t)
+                clamped_t = tl.where(erfc_t < 1e-10, 1e-10, erfc_t)
+                bias_t = _libdevice.log(clamped_t)
+                el_t = tl.where(band_t, s_raw_t * scale + bias_t, float("-inf"))
+            mx = tl.maximum(mx, tl.max(el_t, axis=0))
+            ex = _libdevice.exp(el - mx)
+            ex_t = tl.where(valid_t, _libdevice.exp(el_t - mx), 0.0)
+        else:
+            ex = tl.where(valid, _libdevice.exp(el - mx), 0.0)
+
         acc = tl.sum(tl.where(ii[:, None] == 0, ex, 0.0), axis=0)
-        for it in tl.static_range(1, NIT):
+        for it in tl.static_range(1, LOOP_IT):
             acc = acc + tl.sum(tl.where(ii[:, None] == it, ex, 0.0), axis=0)
+        if ONE_TAIL:
+            acc = acc + ex_t
         acc = tl.sum(tl.reshape(acc, (2, 16)), axis=0)
         acc = tl.sum(tl.reshape(acc, (2, 8)), axis=0)
         acc = tl.sum(tl.reshape(acc, (2, 4)), axis=0)
@@ -309,7 +349,12 @@ if triton is not None:
         tot = tl.sum(acc, axis=0)
 
         w = _div_rn_f32(ex, tot)
-        tl.store(WOut + row * Lw + idx, w.to(WOut.dtype.element_ty), mask=valid)
+        if ONE_TAIL:
+            tl.store(WOut + row * Lw + idx, w.to(WOut.dtype.element_ty))
+            w_t = _div_rn_f32(ex_t, tot)
+            tl.store(WOut + row * Lw + idx_t, w_t.to(WOut.dtype.element_ty), mask=valid_t)
+        else:
+            tl.store(WOut + row * Lw + idx, w.to(WOut.dtype.element_ty), mask=valid)
 
     @triton.jit
     def _fsl_pool_refresh_kernel(
@@ -809,20 +854,27 @@ _ONEPASS_WIDTHS = (256, 512, 1024, 2048)
 _ONEPASS_1ROW_WIDTHS = (128, 256, 512, 1024, 2048)
 
 
-def rms_norm_cast(x: torch.Tensor, weight: torch.Tensor, eps: float, dtype: torch.dtype) -> torch.Tensor:
+def rms_norm_cast(x: torch.Tensor, weight: torch.Tensor, eps: float, dtype: torch.dtype,
+                  res: torch.Tensor | None = None) -> torch.Tensor:
     """RMSNorm(x) * weight as model.RMSNorm computes it under autocast (fp32), cast to dtype, bit for bit."""
     D = x.shape[-1]
     n = x.numel()
     rows = n // D
+    has_res = res is not None
+    if os.environ.get("FSL_NORM_ONEPASS", "1") != "0":
+        if D in _ONEPASS_1ROW_WIDTHS and rows == 1 and (
+                not has_res or (res.shape == x.shape and res.dtype == x.dtype and res.is_contiguous())):
+            out = torch.empty(x.shape, device=x.device, dtype=dtype)
+            V = 1 if D == 128 else 4
+            _rms_1row_kernel[(1,)](x, res if has_res else x, weight, out, float(eps), D=D, T=D // V, V=V,
+                                   HAS_RES=has_res, num_warps=1, enable_fp_fusion=False)
+            return out
+    if has_res:
+        x.add_(res)
     if os.environ.get("FSL_NORM_ONEPASS", "1") != "0":
         if D in _ONEPASS_WIDTHS and rows >= 16:
             out = torch.empty(x.shape, device=x.device, dtype=dtype)
             _rms_fused_kernel[(rows,)](x, weight, out, float(eps), J=D // 128, num_warps=1, enable_fp_fusion=False)
-            return out
-        if D in _ONEPASS_1ROW_WIDTHS and rows == 1:
-            out = torch.empty(x.shape, device=x.device, dtype=dtype)
-            V = 1 if D == 128 else 4
-            _rms_1row_kernel[(1,)](x, weight, out, float(eps), D=D, T=D // V, V=V, num_warps=1, enable_fp_fusion=False)
             return out
     sq = torch.empty(x.shape, device=x.device, dtype=torch.float32)
     BLK = 4096
@@ -909,11 +961,12 @@ def sr_decode_fused(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, kbuf: tor
     scores = torch.einsum("bhd,bhld->bhl", Qrot, Kw)
     w = torch.empty(B, H, Lw, device=Q.device, dtype=Vw.dtype)
     log2_l = max(5, (Lw - 1).bit_length())
+    valid_it = triton.cdiv(Lw, 32)
     _sr_softmax_cast_kernel[(B * H,)](
         scores, pos_t, win_pos, sigma, w,
         float(scale), int(window_size), Lw,
-        H=H, UNIFORM=bool(fs_uniform_sr), LOG2_L=log2_l,
-        num_warps=1, enable_fp_fusion=False,
+        H=H, UNIFORM=bool(fs_uniform_sr), LOG2_L=log2_l, VALID_IT=valid_it,
+        num_warps=2 if fs_uniform_sr else 4, enable_fp_fusion=False,
     )
     return torch.einsum("bhl,bhld->bhd", w, Vw).unsqueeze(2)
 

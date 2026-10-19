@@ -1371,9 +1371,29 @@ class ForestCache:
         self._zero_e = None
         self._emp_buf = None
         self._emp_k0_ptr = None
+        self._mc_buf = None
+        self._mc_nn = None
+        self._pend_mc = None
+        self._jbase_buf = None
+        self._task_buf = None
+        self._tau_src = None
+        self._tau32 = None
+
+    def _get_tau32(self, tau):
+        key = (tau.data_ptr(), int(tau._version), tuple(tau.shape), tau.dtype)
+        if self._tau_src != key or self._tau32 is None:
+            from .fsb_build_cuda import _tau32
+            self._tau32 = _tau32(tau).reshape(self.T).contiguous()
+            self._tau_src = key
+        return self._tau32
 
     @torch.no_grad()
     def _append_admitted(self, ceil_all, M_vis, tau):
+        if self.fast and ceil_all.is_cuda and not torch.cuda.is_current_stream_capturing():
+            from .fsb_build_fast import append_admitted_fast
+            ret = append_admitted_fast(self, ceil_all, M_vis, self._get_tau32(tau))
+            if ret is not None:
+                return ret
         T = self.T
         nn = M_vis - self.n_seen
         rkey = ("arange_1d", nn, str(self.dev))
@@ -1399,9 +1419,11 @@ class ForestCache:
         self.adm = grown; self.m_tot.add_(n_new); self.n_seen = M_vis
         return n_new
 
-    def _pack_lean(self, F, dirty):
+    def _ensure_lean_arena(self, Kmax):
         T, Dh, dev = self.T, self.Dh, self.dev
-        Kmax = F["Kmax"]
+        cap_tasks = max(256, 16 * T) + 4
+        if self._task_buf is None or self._task_buf.shape[0] < cap_tasks:
+            self._task_buf = torch.empty((cap_tasks, 10), dtype=torch.int32, device=dev)
         if Kmax > self._arena_k:
             old_k = self._arena_k
             ncap = (1 << (Kmax + 2)) - Kmax - 3
@@ -1422,6 +1444,45 @@ class ForestCache:
                 dst[..., Dh + 3] = st["cnt"]
                 dst[..., Dh + 4:] = st["static"]
             self._node_arena, self._leaf_arena, self._arena_k = node, leaf, Kmax
+
+    def _get_emp_buf(self, Kbar_all):
+        T, Dh, dev = self.T, self.Dh, self.dev
+        emp = self._emp_buf
+        k0_ptr = Kbar_all.data_ptr()
+        if emp is None or self._emp_k0_ptr != k0_ptr or emp.shape != (T, 1, Dh + 3):
+            emp = torch.zeros(T, 1, Dh + 3, device=dev)
+            emp[..., :Dh] = torch.copysign(emp[..., :Dh], Kbar_all[:, :, 0].reshape(T, 1, Dh).float())
+            emp[..., Dh + 2] = float(1 << 30)
+            self._emp_buf = emp
+            self._emp_k0_ptr = k0_ptr
+        return emp
+
+    def _pack_lean_cuda(self, F_cuda, Kbar_all, Kmax, ks):
+        self._ensure_lean_arena(Kmax)
+        emp = self._get_emp_buf(Kbar_all)
+        ks_t = tuple(ks)
+        ckey = ("pack_lean_fast", F_cuda["Ntot"], F_cuda["Ltot"], ks_t, str(self.dev))
+        idx_c = _STATIC_CACHE.get(ckey)
+        if idx_c is None:
+            dev = self.dev
+            k_n = torch.cat([torch.full((2 * (1 << k) - 1,), k, dtype=torch.int32, device=dev) for k in ks_t])
+            base_n = torch.cat([torch.full((2 * (1 << k) - 1,), F_cuda["bases"][k], dtype=torch.int32, device=dev) for k in ks_t])
+            str_n = torch.cat([torch.full((2 * (1 << k) - 1,), 2 * (1 << k) - 1, dtype=torch.int32, device=dev) for k in ks_t])
+            u_n = torch.cat([torch.arange(2 * (1 << k) - 1, dtype=torch.int32, device=dev) for k in ks_t])
+            dst_n = torch.cat([torch.arange(2 * (1 << k) - k - 2, 2 * (1 << k) - k - 2 + 2 * (1 << k) - 1, dtype=torch.int32, device=dev) for k in ks_t])
+            k_l = torch.cat([torch.full((1 << k,), k, dtype=torch.int32, device=dev) for k in ks_t])
+            base_l = torch.cat([torch.full((1 << k,), F_cuda["leafbases"][k], dtype=torch.int32, device=dev) for k in ks_t])
+            str_l = torch.cat([torch.full((1 << k,), 1 << k, dtype=torch.int32, device=dev) for k in ks_t])
+            u_l = torch.cat([torch.arange(1 << k, dtype=torch.int32, device=dev) for k in ks_t])
+            dst_l = torch.cat([torch.arange((1 << k) - 1, (1 << k) - 1 + (1 << k), dtype=torch.int32, device=dev) for k in ks_t])
+            idx_c = (k_n, base_n, str_n, u_n, dst_n, k_l, base_l, str_l, u_l, dst_l)
+            _STATIC_CACHE[ckey] = idx_c
+        from .fsb_build_fast import pack_lean_chunks_fast
+        return pack_lean_chunks_fast(self, F_cuda, emp, Kmax, idx_c)
+
+    def _pack_lean(self, F, dirty):
+        Dh = self.Dh
+        self._ensure_lean_arena(F["Kmax"])
         ks_t = tuple(F["ks"])
         lkey = ("lean_lay", ks_t)
         lay = _STATIC_CACHE.get(lkey)
@@ -1464,8 +1525,8 @@ class ForestCache:
                 self._leaf_arena[:, lbase:lbase + size] = C["leaf"][:, 0]
         F.update(node=self._node_arena, leaf=self._leaf_arena,
                  Ntot=self._node_arena.shape[1], Ltot=self._leaf_arena.shape[1],
-                 bases=dict(bases), leafbases=dict(leafbases), nodes_per=dict(nodes_per),
-                 Cmaxs=dict(Cmaxs))
+                 bases=bases, leafbases=leafbases, nodes_per=nodes_per,
+                 Cmaxs=Cmaxs)
 
     def _t_idx_rows(self):
         # the spine builder's row sequence on one persistent tensor (a decode graph reads its pointer)
@@ -1477,6 +1538,8 @@ class ForestCache:
         # build_spines with the outputs written into the previous build's tensors when their shapes match: a
         # whole-step decode graph captured over the previous block's spines reads the same memory at the new values
         old = self._sp_stable
+        if self.lean and (not getattr(self, "_grew", True) or getattr(self, "_sp_built", False)) and old is not None and self.SP is old:
+            return self.SP
         try:
             sp = build_spines(self.F, self.m_tot, self._t_idx_rows(), out=old)
         except TypeError:
@@ -1499,15 +1562,23 @@ class ForestCache:
         # keeps its exact M_vis-sized contract; this buffer never replaces it outside the fused decode calls.
         T, dev = self.T, self.dev
         slot = self._cellA_g
+        c_ptr = ceil_all.data_ptr()
         if slot is None or slot.shape[1] < M_vis:
             need = max(M_vis, self.m_cap)
             cap = max(64, 1 << (need - 1).bit_length()) if need > 0 else 64
             slot = torch.zeros(T, cap, dtype=torch.float32, device=dev)
             self._cellA_g = slot
             self._cells_seen = 0
+        elif getattr(self, "_cellA_src_ptr", None) != c_ptr or M_vis < self._cells_seen:
+            self._cells_seen = 0
+        self._cellA_src_ptr = c_ptr
         if M_vis > self._cells_seen:
-            slot[:, self._cells_seen:M_vis].copy_(
-                ceil_all[:, :, self._cells_seen:M_vis].reshape(T, M_vis - self._cells_seen).float())
+            n = M_vis - self._cells_seen
+            if ceil_all.stride(0) == ceil_all.shape[1] * ceil_all.stride(1):
+                c_src = ceil_all.reshape(T, -1)[:, self._cells_seen:M_vis]
+            else:
+                c_src = ceil_all[:, :, self._cells_seen:M_vis].reshape(T, n)
+            slot[:, self._cells_seen:M_vis].copy_(c_src)
             self._cells_seen = M_vis
         return slot
 
@@ -1520,23 +1591,37 @@ class ForestCache:
         buf = owner._pad_buf
         has_sp = spread_all is not None
         if buf is None or buf[0].shape[1] != M_pad or (has_sp and buf[2] is None) or buf[3] > M_vis:
-            Kp = Kbar_all.new_zeros((T, M_pad, Dh), dtype=torch.float32)
-            cp = ceil_all.new_full((T, M_pad), float("-inf"), dtype=torch.float32)
-            sp = spread_all.new_zeros((T, M_pad), dtype=torch.float32) if has_sp else None
+            Kp = Kbar_all.new_empty((T, M_pad, Dh), dtype=torch.float32)
+            cp = ceil_all.new_empty((T, M_pad), dtype=torch.float32)
+            if M_pad > M_vis:
+                cp[:, M_vis:].fill_(float("-inf"))
+            sp = spread_all.new_empty((T, M_pad), dtype=torch.float32) if has_sp else None
             seen = 0
         else:
             Kp, cp, sp, seen = buf
         if M_vis > seen:
             n = M_vis - seen
-            Kp[:, seen:M_vis].copy_(Kbar_all[:, :, seen:M_vis].reshape(T, n, Dh))
-            cp[:, seen:M_vis].copy_(ceil_all[:, :, seen:M_vis].reshape(T, n))
+            if Kbar_all.stride(0) == Kbar_all.shape[1] * Kbar_all.stride(1):
+                k_src = Kbar_all.reshape(T, -1, Dh)[:, seen:M_vis]
+            else:
+                k_src = Kbar_all[:, :, seen:M_vis].reshape(T, n, Dh)
+            Kp[:, seen:M_vis].copy_(k_src)
+            if ceil_all.stride(0) == ceil_all.shape[1] * ceil_all.stride(1):
+                c_src = ceil_all.reshape(T, -1)[:, seen:M_vis]
+            else:
+                c_src = ceil_all[:, :, seen:M_vis].reshape(T, n)
+            cp[:, seen:M_vis].copy_(c_src)
             if has_sp:
-                sp[:, seen:M_vis].copy_(spread_all[:, :, seen:M_vis].reshape(T, n))
+                if spread_all.stride(0) == spread_all.shape[1] * spread_all.stride(1):
+                    s_src = spread_all.reshape(T, -1)[:, seen:M_vis]
+                else:
+                    s_src = spread_all[:, :, seen:M_vis].reshape(T, n)
+                sp[:, seen:M_vis].copy_(s_src)
             seen = M_vis
         owner._pad_buf = (Kp, cp, sp, seen)
         return Kp, cp, (sp if has_sp else None)
 
-    def _cuda_forest(self, Kbar_all, ceil_all, M_vis, spread_all, taus, sel=None):
+    def _cuda_forest(self, Kbar_all, ceil_all, M_vis, spread_all, taus, sel=None, lean=None):
         # the CUDA build of one ingest: the visible cells padded with never-admitted cells (ceilings -inf) to a
         # power-of-two M. sel = [(k, [j per head or None])] restricts the build to those chunks (a decode ingest's
         # dirty aligned chunks: the only rows _cuda_chunk_all reads); without it, or when the chunk build is not
@@ -1544,7 +1629,17 @@ class ForestCache:
         T, Dh, dev = self.T, self.Dh, self.dev
         if not Kbar_all.is_cuda or torch.cuda.is_current_stream_capturing():
             return None
-        if self.fast and self.lean:
+        if (lean is not None and Kbar_all.dtype == torch.float32 and ceil_all.dtype == torch.float32
+                and Kbar_all.stride(0) == Kbar_all.shape[1] * Kbar_all.stride(1)
+                and Kbar_all.stride(2) == Dh and Kbar_all.stride(3) == 1 and Kbar_all.stride(1) % Dh == 0
+                and ceil_all.stride(0) == ceil_all.shape[1] * ceil_all.stride(1) and ceil_all.stride(2) == 1
+                and (spread_all is None or (spread_all.dtype == torch.float32
+                     and spread_all.stride(0) == spread_all.shape[1] * spread_all.stride(1)
+                     and spread_all.stride(2) == 1))):
+            Kbar = Kbar_all.reshape(T, -1, Dh)[:, :M_vis]
+            ceil_c = ceil_all.reshape(T, -1)[:, :M_vis]
+            spread_c = spread_all.reshape(T, -1)[:, :M_vis] if spread_all is not None else None
+        elif self.fast and self.lean:
             Kbar, ceil_c, spread_c = self._pad_cells(Kbar_all, ceil_all, M_vis, spread_all)
         else:
             M_pad = max(512, 1 << (M_vis - 1).bit_length())
@@ -1562,7 +1657,8 @@ class ForestCache:
         if self._zero_e is None:
             self._zero_e = torch.zeros(1, dtype=torch.long, device=dev)
         from .fsb_build_cuda import forests_cuda
-        got = forests_cuda(Kbar, ceil_c, spread_c, taus, self._zero_e, sel=sel)
+        kw = {"sel": sel, "lean": lean} if lean is not None else {"sel": sel}
+        got = forests_cuda(Kbar, ceil_c, spread_c, taus, self._zero_e, **kw)
         return None if got is None else got[0][0]
 
     def _cuda_chunk_all(self, F_cuda, Kbar_all, jbase, bits, ks):
@@ -1594,14 +1690,7 @@ class ForestCache:
         hml = bits[:, k_l]
         row = node.gather(1, nrs[..., None].expand(-1, -1, Dh + 3))
         lf = F_cuda["leaf"].gather(1, lrs)
-        emp = self._emp_buf
-        k0_ptr = Kbar_all.data_ptr()
-        if emp is None or self._emp_k0_ptr != k0_ptr or emp.shape != (T, 1, Dh + 3):
-            emp = torch.zeros(T, 1, Dh + 3, device=dev)
-            emp[..., :Dh] = torch.copysign(emp[..., :Dh], Kbar_all[:, :, 0].reshape(T, 1, Dh).float())
-            emp[..., Dh + 2] = float(1 << 30)
-            self._emp_buf = emp
-            self._emp_k0_ptr = k0_ptr
+        emp = self._get_emp_buf(Kbar_all)
         row = torch.where(hms[..., None], row, emp)
         lf = torch.where(hml, lf, -1)
         if ks[-1] - ks[0] + 1 == len(ks):
@@ -1617,20 +1706,35 @@ class ForestCache:
     @torch.no_grad()
     def _ingest_lean(self, Kbar_all, ceil_all, M_vis, tau, spread_all=None):
         T, Dh, dev = self.T, self.Dh, self.dev
-        nn = self._append_admitted(ceil_all, M_vis, tau) if M_vis > self.n_seen else None
-        if self.F is not None and nn is None:
-            return
-        # one host read per ingest: the admitted counts and m_tot together give grew, Kmax, the level bits, the
-        # aligned chunk indices and the reuse comparison, so the levels below never sync again
-        mc = (torch.stack([nn, self.m_tot]) if nn is not None else self.m_tot[None]).cpu()
+        pend_mc = self._pend_mc
+        self._pend_mc = None
+        if pend_mc is not None:
+            nn_h, m_h = pend_mc
+            nn = True
+        else:
+            nn = self._append_admitted(ceil_all, M_vis, tau) if M_vis > self.n_seen else None
+            if self.F is not None and nn is None:
+                self._grew = False
+                return
+            # one host read per ingest: the admitted counts and m_tot together give grew, Kmax, the level bits, the
+            # aligned chunk indices and the reuse comparison, so the levels below never sync again
+            if nn is not None and self._mc_buf is not None and nn is self._mc_nn:
+                mc_l = self._mc_buf.cpu().tolist()
+                nn_h, m_h = mc_l[0], mc_l[1]
+            else:
+                mc = (torch.stack([nn, self.m_tot]) if nn is not None else self.m_tot[None]).cpu()
+                m_h = mc[-1].tolist()
+                nn_h = mc[0].tolist() if nn is not None else None
         m = self.m_tot
-        m_h = mc[-1].tolist()
         m_max = max(m_h)
         self._m_max_h = m_max
         self._height_h = tuple((mi - 1).bit_length() if mi > 1 else 0 for mi in m_h)
-        grew = nn is not None and any(mc[0].tolist())
+        grew = nn is not None and any(nn_h)
         if self.F is not None and not grew:
+            self._grew = False
             return
+        self._grew = True
+        self._sp_built = False
         m_upper = m_max + max(0, self.m_cap - M_vis) if self.k_cap > 0 else m_max
         prev_k = self.F["Kmax"] if self.F is not None else 0
         Kmax = max(int(math.floor(math.log2(m_upper))), prev_k) if m_upper > 0 else prev_k
@@ -1641,9 +1745,8 @@ class ForestCache:
         chunks, meta, dirty = {}, {}, set()
         Kbar = ceil_c = spread_c = None
         reuse, F_cuda = {}, None
+        packed_cuda = False
         if self.fast:
-            jb_bits = torch.tensor([jb_h, bits_h], dtype=torch.long, device=dev)
-            jbase, bits = jb_bits[0], jb_bits[1].bool()
             ks_n = [k for k in range(Kmax + 1) if need[k]]
             for k in ks_n:
                 meta[k] = (tuple(row[k] for row in jb_h), tuple(bool(row[k]) for row in bits_h))
@@ -1654,13 +1757,50 @@ class ForestCache:
                 # one partial build of this forest's own dirty chunks (the pair latch joined both taus' whole-forest
                 # builds; the chunk build is cheap enough to run per forest, and each forest's aligned chunks differ
                 # with its admission, so a shared selection would need both forests' post-ingest state up front)
+                self._ensure_lean_arena(Kmax)
+                if self._jbase_buf is None or self._jbase_buf.shape != (T, Kmax + 1):
+                    self._jbase_buf = torch.empty((T, Kmax + 1), dtype=torch.long, device=dev)
+                S_sp = Kmax + 1
+                NC_sp = Dh + _NA
+                sp_out = self._sp_stable
+                if sp_out is None or sp_out["node"].shape != (T, S_sp, NC_sp):
+                    sp_out = {
+                        "node": torch.empty((T, S_sp, NC_sp), dtype=torch.float32, device=dev),
+                        "root": torch.empty((T,), dtype=torch.long, device=dev),
+                        "height": torch.empty((T,), dtype=torch.long, device=dev),
+                        "m_b": self.m_tot,
+                        "t_idx": self._t_idx_rows(),
+                    }
+                    self._sp_stable = sp_out
+                else:
+                    sp_out["m_b"] = self.m_tot
+                    sp_out["t_idx"] = self._t_idx_rows()
+                M_pad = max(512, 1 << (M_vis - 1).bit_length())
+                lean_arg = (self._node_arena, self._leaf_arena, self.adm, self.m_tot, self._jbase_buf, Kmax, M_pad,
+                            sp_out["node"], sp_out["root"], sp_out["height"], self._task_buf)
                 sel = [(k, [row[k] if bts[k] else None for row, bts in zip(jb_h, bits_h)]) for k in dset]
-                F_cuda = self._cuda_forest(Kbar_all, ceil_all, M_vis, spread_all, [tau], sel=sel)
+                F_cuda = self._cuda_forest(Kbar_all, ceil_all, M_vis, spread_all, [self._get_tau32(tau)], sel=sel,
+                                           lean=lean_arg)
             if dset and F_cuda is not None:
-                chunks.update(self._cuda_chunk_all(F_cuda, Kbar_all, jbase, bits, dset))
-                F_cuda = None
-                dirty.update(dset)
-                dset = []
+                if F_cuda.get("_lean_direct"):
+                    jbase = F_cuda["jbase"]
+                    if F_cuda.get("_sp_built"):
+                        self.SP = self._sp_stable
+                        self._sp_built = True
+                else:
+                    jbase = self._pack_lean_cuda(F_cuda, Kbar_all, Kmax, dset)
+                if jbase is not None:
+                    F_cuda = None
+                    dset = []
+                    packed_cuda = True
+            if not packed_cuda:
+                jb_bits = torch.tensor([jb_h, bits_h], dtype=torch.long, device=dev)
+                jbase, bits = jb_bits[0], jb_bits[1].bool()
+                if dset and F_cuda is not None:
+                    chunks.update(self._cuda_chunk_all(F_cuda, Kbar_all, jbase, bits, dset))
+                    F_cuda = None
+                    dirty.update(dset)
+                    dset = []
             ks_loop = dset
         else:
             jbase = torch.tensor(jb_h, dtype=torch.long, device=dev)
@@ -1718,11 +1858,17 @@ class ForestCache:
             self._ingest_lean(Kbar_all, ceil_all, M_vis, tau, spread_all)
             if keep_cells:
                 T, Dh = self.T, self.Dh
-                self.F["cellK"] = Kbar_all[:, :, :M_vis].reshape(T, M_vis, Dh).float()
-                self.F["cellA"] = ceil_all[:, :, :M_vis].reshape(T, M_vis).float()
+                if self.fast and Kbar_all.stride(0) == Kbar_all.shape[1] * Kbar_all.stride(1) and Kbar_all.dtype == torch.float32:
+                    self.F["cellK"] = Kbar_all.reshape(T, -1, Dh)[:, :M_vis]
+                else:
+                    self.F["cellK"] = Kbar_all[:, :, :M_vis].reshape(T, M_vis, Dh).float()
                 if self.fast:
-                    self._cellA_stable(ceil_all, M_vis)
+                    slot = self._cellA_stable(ceil_all, M_vis)
+                    self.F["cellA"] = slot[:, :M_vis]
+                else:
+                    self.F["cellA"] = ceil_all[:, :, :M_vis].reshape(T, M_vis).float()
             return
+
         T, Dh = self.T, self.Dh
         if M_vis > self.n_seen:
             self._append_admitted(ceil_all, M_vis, tau)
@@ -2384,15 +2530,24 @@ def _capture_decode_graph(g, fn):
     if os.environ.get("FSB_DECODE_CAPTURE_GC", "0") == "1":
         with torch.cuda.graph(g):
             return fn()
+    import gc
     if torch.cuda.graph.default_capture_stream is None:
         torch.cuda.graph.default_capture_stream = torch.cuda.Stream()
-    torch.cuda.synchronize()
-    with torch.cuda.stream(torch.cuda.graph.default_capture_stream):
-        g.capture_begin()
-        try:
-            out = fn()
-        finally:
-            g.capture_end()
+    # a collected CUDA-object destructor (an old graph, stream or event) mid-capture invalidates it;
+    # flush the collector up front and hold it off across the capture
+    if os.environ.get("FSB_DECODE_CAPTURE_GC") != "0":
+        gc.collect()
+        torch.cuda.synchronize()
+    gc.disable()
+    try:
+        with torch.cuda.stream(torch.cuda.graph.default_capture_stream):
+            g.capture_begin()
+            try:
+                out = fn()
+            finally:
+                g.capture_end()
+    finally:
+        gc.enable()
     return out
 
 
@@ -2402,9 +2557,8 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
     s = attn.cell_stride
     dev = q_t.device
     T = B * H
-    q = q_t[:, :, 0, :].float().reshape(T, 1, Dh)
     from .fsb_route import fsb_route_q, route_on, radius_rows
-    qr = fsb_route_q(attn, q_t.float()).reshape(T, 1, Dh) if route_on(attn) else q
+    ro = route_on(attn)
     pos_t = pos if torch.is_tensor(pos) else torch.full((), float(pos), device=dev)
     qpos = (pos_f if pos_f is not None else pos_t.float()).view(1, 1).expand(T, 1)
     utau = getattr(fc, "utau", None)
@@ -2414,9 +2568,12 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
            attn.log_sigma._version, attn.log_sigma.data_ptr(), attn.fsb_width,
            attn.fsb_delta, int(getattr(attn, "fsb_union_width", 0) or 0))
     tk = getattr(fc, "_tok", None)
+    q = qr = None
     if attn.fsb_policy_mode == "fixed" and tk is not None and tk["key"] == key:
         head_id, lam, W, delta, ukw = tk["head_id"], tk["lam"], tk["W"], tk["delta"], tk["ukw"]
     else:
+        q = q_t[:, :, 0, :].float().reshape(T, 1, Dh)
+        qr = fsb_route_q(attn, q_t.float()).reshape(T, 1, Dh) if ro else q
         head_id = torch.arange(H, device=dev)[None, :].expand(B, H).reshape(T)
         lam = attn.sel_scale.float()[head_id].view(T, 1, 1)
         W, D, _ = choose_actions(attn, q, head_id, fc.m_tot, fc.SP["height"], fc.F["Kmax"] + 1, training=False)
@@ -2430,7 +2587,6 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
             fc._tok = tk = {"key": key, "head_id": head_id, "lam": lam, "W": W, "delta": delta, "ukw": ukw}
     sigv = tk["sigv"] if (tk is not None and sigma is tk.get("sigma") and "sigv" in tk) else sigma.float()[head_id].view(T, 1, 1)
     rr = getattr(attn, "fsb_rerank_score", "leaf") if getattr(attn, "fsb_read_top", 0) > 0 else "leaf"
-    rq = q if (getattr(attn, "fsb_read_top", 0) > 0 and getattr(attn, "fsb_rerank_query", "route") == "raw" and qr is not q) else None
     tokK = None
     if rr != "leaf":
         tokK = cache._k_buf if getattr(cache, "_k_buf", None) is not None else cache.lr_tokens()[0]
@@ -2442,11 +2598,24 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
     prov = [] if (hkw or bkw or ukw or uqkw) else None
     d_eff = beam_delta_eff(attn)
     sel = None
-    if (attn.fsb_policy_mode == "fixed" and tk is not None and tk["key"] == key and rr != "leaf" and qr.is_cuda
+    if (attn.fsb_policy_mode == "fixed" and tk is not None and tk["key"] == key and rr != "leaf" and q_t.is_cuda
             and not (hkw or bkw or uqkw or upkw or rr_kw(attn) or margin_kw(attn))):
+        if qr is None:
+            if ro:
+                q = q_t[:, :, 0, :].float().reshape(T, 1, Dh)
+                qr = fsb_route_q(attn, q_t.float()).reshape(T, 1, Dh)
+            elif q_t.dtype in (torch.float32, torch.bfloat16) and q_t.is_contiguous():
+                q = qr = q_t.view(T, 1, Dh)
+            else:
+                q = qr = q_t[:, :, 0, :].float().reshape(T, 1, Dh)
+        rq = q if (getattr(attn, "fsb_read_top", 0) > 0 and getattr(attn, "fsb_rerank_query", "route") == "raw" and qr is not q) else None
         sel = _forest_token_plain(attn, fc, tk, qr, qr if rq is None else rq, qpos, lam, sigv, rc, rr, tokK, ukw, prov,
                                   d_eff=d_eff)
     if sel is None:
+        if qr is None or q.dtype != torch.float32:
+            q = q_t[:, :, 0, :].float().reshape(T, 1, Dh)
+            qr = fsb_route_q(attn, q_t.float()).reshape(T, 1, Dh) if ro else q
+        rq = q if (getattr(attn, "fsb_read_top", 0) > 0 and getattr(attn, "fsb_rerank_query", "route") == "raw" and qr is not q) else None
         sel, _, _ = traverse_forest(fc.F, fc.SP, qr, qpos, lam, sigv, attn.scale, s, W, delta,
                                     attn.fsb_W_max, attn.fsb_delta_max, attn.fsb_node_score,
                                     radius_coef=rc, read_top=getattr(attn, "fsb_read_top", 0),
@@ -2519,8 +2688,8 @@ def _forest_token_plain(attn, fc, tk, q, rq, qpos, lam, sigv, rc, rr, tokK, ukw,
     if fast_rerank_ok(sel, rq, tokK, s, K, rr):
         sel = rerank_top_fast(sel, rq, qpos, lam, sigv, F["cellA"], SP["t_idx"], attn.scale, s, K, rr, tokK)
     else:
-        sel = rerank_top(sel, rq, qpos, lam, sigv, F["cellK"], F["cellA"], SP["t_idx"], attn.scale, s, K, score=rr,
-                         tokK=tokK)
+        sel = rerank_top(sel, rq.float(), qpos, lam, sigv, F["cellK"], F["cellA"], SP["t_idx"], attn.scale, s, K,
+                         score=rr, tokK=tokK)
     if ukw and prov is not None:
         utau_prov_add(prov, sel, sel_unew)
     return sel
@@ -2562,13 +2731,52 @@ def _forest_budgets(attn, fc, B, H, dev):
     h_main = getattr(fc, "_height_h", None) if getattr(fc, "lean", False) else None
     h_utau = (getattr(utau, "_height_h", None) if getattr(utau, "lean", False) else None) if utau is not None else ()
     cfg_key = key[1:] + (union_tau_on(attn),)
-    if (tk is not None and h_main is not None and h_utau is not None
-            and tk.get("_cfg_key") == cfg_key and tk.get("_h_key") == (h_main, h_utau)):
+    if h_main is not None and h_utau is not None:
+        d_cfg = int(attn.fsb_delta)
+        w_cfg = int(attn.fsb_width)
+        uw_cfg = int(getattr(attn, "fsb_union_width", 0) or 0)
+        eff_main = tuple((min(w_cfg, 1 << max(0, h - d_cfg)), min(h, d_cfg), min(uw_cfg, 1 << max(0, h - d_cfg))) for h in h_main)
+        eff_utau = tuple((min(uw_cfg, 1 << max(0, h - d_cfg)), min(h, d_cfg)) for h in h_utau)
+        h_key = (eff_main, eff_utau)
+    else:
+        h_key = None
+    if tk is not None and h_key is not None and tk.get("_cfg_key") == cfg_key:
         ukw = tk.get("ukw")
         if ukw and utau is not None:
             ukw["union_F"] = utau.F
             ukw["union_SP"] = utau.SP
+        if tk.get("_h_key") == h_key:
+            tk["key"] = key
+            return tk
+        if tk.get("_eff_main") != eff_main:
+            tk["W"].copy_(torch.tensor([[w_t] for w_t, _, _ in eff_main], dtype=torch.long))
+            tk["delta"].copy_(torch.tensor([[d_t] for _, d_t, _ in eff_main], dtype=torch.long))
+            tk["bud"].copy_(torch.tensor([[1 << d_t] for _, d_t, _ in eff_main], dtype=torch.long))
+        if uw_cfg > 0:
+            if utau is not None and union_tau_on(attn):
+                if ukw is None:
+                    ukw = {"union_F": utau.F, "union_SP": utau.SP}
+                if tk.get("_eff_utau") != eff_utau or "union_delta" not in ukw or "union_W" not in ukw:
+                    du_c = torch.tensor([[du_t] for _, du_t in eff_utau], dtype=torch.long)
+                    uw_c = torch.tensor([[uw_t] for uw_t, _ in eff_utau], dtype=torch.long)
+                    bu_c = torch.tensor([[1 << du_t] for _, du_t in eff_utau], dtype=torch.long)
+                    if "union_delta" in ukw:
+                        ukw["union_delta"].copy_(du_c)
+                    else:
+                        ukw["union_delta"] = du_c.to(dev)
+                    if "union_W" in ukw:
+                        ukw["union_W"].copy_(uw_c)
+                    else:
+                        ukw["union_W"] = uw_c.to(dev)
+                    tk["bud_u"].copy_(bu_c)
+                tk["ukw"] = ukw
+            elif tk.get("_eff_main") != eff_main and tk.get("union_W") is not None:
+                tk["union_W"].copy_(torch.tensor([[uw_t] for _, _, uw_t in eff_main], dtype=torch.long))
+                tk["bud_u"].copy_(torch.tensor([[1 << d_t] for _, d_t, _ in eff_main], dtype=torch.long))
         tk["key"] = key
+        tk["_h_key"] = h_key
+        tk["_eff_main"] = eff_main
+        tk["_eff_utau"] = eff_utau
         return tk
     head_id = torch.arange(H, device=dev)[None, :].expand(B, H).reshape(T)
     lam = attn.sel_scale.float()[head_id].view(T, 1, 1)
@@ -2618,9 +2826,12 @@ def _forest_budgets(attn, fc, B, H, dev):
     tk["ukw"] = ukw
     tk["key"] = key
     tk["_cfg_key"] = cfg_key
-    tk["_h_key"] = (h_main, h_utau) if (h_main is not None and h_utau is not None) else None
+    tk["_h_key"] = h_key
+    tk["_eff_main"] = h_key[0] if h_key is not None else None
+    tk["_eff_utau"] = h_key[1] if h_key is not None else None
     fc._tok = tk
     return tk
+
 
 
 def _plain_consumption(attn, fc) -> bool:
@@ -2696,6 +2907,55 @@ def fsb_graph_registry(attn, cache):
         if uSP is not None:
             reg += [sig(uSP["node"]), sig(uSP["root"]), sig(uSP["t_idx"]), sig(uSP["height"])]
     return tuple(reg)
+
+
+@torch.no_grad()
+def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
+    T = B * H
+    staged = []
+    for attn, cache in zip(attns, caches):
+        s = attn.cell_stride
+        Bq = attn._cell_block
+        blk_start = (pos // Bq) * Bq
+        fc = getattr(cache, "_fsb_forest", None)
+        if fc is None:
+            fc = ForestCache(T, Dh, dev, lean=os.environ.get("FSB_DECODE_LEAN", "1") == "1")
+            cache._fsb_forest = fc
+        if fc.fast and fc.lean and getattr(cache, "_k_buf", None) is not None:
+            fc.m_cap = max(fc.m_cap, cache._k_buf.shape[2] // s)
+        g_cap = getattr(cache, "_fsb_graph_m_cap", 0)
+        if fc.fast and fc.lean and g_cap > 0:
+            fc.m_cap = max(fc.m_cap, g_cap)
+            fc.k_cap = max(fc.k_cap, int(math.floor(math.log2(max(g_cap, 1)))))
+        if fc.fast and fc.lean and fc.blk_start != blk_start:
+            _, ceil_all, ncell = cache.completed_cells()
+            M_vis = min(blk_start // s, ncell) if ncell > 0 else 0
+            if M_vis > 0 and ceil_all.is_cuda and not torch.cuda.is_current_stream_capturing():
+                if M_vis > fc.n_seen:
+                    tau_m = attn.fsb_tau.view(1, H).expand(B, H).reshape(T)
+                    nn = fc._append_admitted(ceil_all, M_vis, tau_m)
+                    if fc._mc_buf is not None and nn is fc._mc_nn:
+                        staged.append(fc)
+                    elif nn is not None:
+                        fc._pend_mc = (nn.cpu().tolist(), fc.m_tot.cpu().tolist())
+                if union_tau_on(attn):
+                    if fc.utau is None:
+                        fc.utau = ForestCache(T, Dh, dev, lean=fc.lean)
+                    fc.utau._pad_src = weakref.ref(fc)
+                    fc.utau.m_cap = fc.m_cap
+                    fc.utau.k_cap = fc.k_cap
+                    if M_vis > fc.utau.n_seen:
+                        tau_u = attn.fsb_tau_union.view(1, H).expand(B, H).reshape(T)
+                        nnu = fc.utau._append_admitted(ceil_all, M_vis, tau_u)
+                        if fc.utau._mc_buf is not None and nnu is fc.utau._mc_nn:
+                            staged.append(fc.utau)
+                        elif nnu is not None:
+                            fc.utau._pend_mc = (nnu.cpu().tolist(), fc.utau.m_tot.cpu().tolist())
+    if staged:
+        all_mc = torch.stack([f._mc_buf for f in staged]).cpu().tolist()
+        for f, mc_val in zip(staged, all_mc):
+            f._pend_mc = mc_val
+    return [fsb_decode_prepare(a, c, B, H, Dh, dev, pos) for a, c in zip(attns, caches)]
 
 
 @torch.no_grad()

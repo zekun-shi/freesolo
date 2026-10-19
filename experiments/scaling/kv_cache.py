@@ -129,9 +129,15 @@ class FSKVCache:
         self.pos = N
 
     def _finish_cell(self, cell):
-        kbar = cell.mean(dim=2, keepdim=True).float()
-        ceil = cell.float().norm(dim=-1).amax(dim=-1, keepdim=True)
-        sp = self._cell_spread(cell[:, :, None], kbar) if self.fsb_leaf_radius else None
+        st = None if self.fsb_leaf_radius else _fast_cell_stats(cell, 1, self.s)
+        if st is not None:
+            kbar, ceil = st
+            sp = None
+        else:
+            cell = cell.contiguous()
+            kbar = cell.mean(dim=2, keepdim=True).float()
+            ceil = cell.float().norm(dim=-1).amax(dim=-1, keepdim=True)
+            sp = self._cell_spread(cell[:, :, None], kbar) if self.fsb_leaf_radius else None
         idx = 0 if self._kbar is None else self._kbar.shape[2]
         if (self._kbar_buf is not None and self._ceil_buf is not None
                 and idx < self._kbar_buf.shape[2] and sp is None):
@@ -157,7 +163,7 @@ class FSKVCache:
         if rem != 0:
             self._cell_k = self._k_buf[:, :, n - rem:n]
         else:
-            self._finish_cell(self._k_buf[:, :, n - self.s:n].contiguous())
+            self._finish_cell(self._k_buf[:, :, n - self.s:n])
         self.pos += 1
 
     def advance_in_place(self):
@@ -167,7 +173,7 @@ class FSKVCache:
         if n % self.s == 0:
             self._k_hist = self._k_buf[:, :, :n]
             self._v_hist = self._v_buf[:, :, :n]
-            self._finish_cell(self._k_buf[:, :, n - self.s:n].contiguous())
+            self._finish_cell(self._k_buf[:, :, n - self.s:n])
 
     def sr_window(self, at=None):
         if self._k_hist is not None and self._k_hist.shape[2] != self._len:

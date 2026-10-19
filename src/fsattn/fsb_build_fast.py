@@ -312,6 +312,96 @@ if _HAVE_TRITON:
         tl.store(ROOT + p, tl.where(m > 0, r_ref, -1))
         tl.store(HGT + p, tl.where(m > 1, hb + (pop >= 2).to(tl.int64), 0))
 
+    @triton.jit
+    def _append_adm_kernel(CE, TAU, ADM, MTOT, MC,
+                           sB_e, sH_e, sM_e, adm_s0_e, H_e, T_e, n_seen_e, nn_e,
+                           BLOCK_N: tl.constexpr):
+        sB = (sB_e >> 2).to(tl.int64)
+        sH = (sH_e >> 2).to(tl.int64)
+        sM = (sM_e >> 2).to(tl.int64)
+        adm_s0 = (adm_s0_e >> 2).to(tl.int64)
+        H = (H_e >> 2).to(tl.int64)
+        T = (T_e >> 2).to(tl.int64)
+        n_seen = (n_seen_e >> 2).to(tl.int64)
+        nn = (nn_e >> 2).to(tl.int64)
+        t = tl.program_id(0).to(tl.int64)
+        b = t // H
+        h = t - b * H
+        tau_t = tl.load(TAU + t)
+        m0 = tl.load(MTOT + t)
+        ce_row = CE + b * sB + h * sH
+        adm_row = ADM + t * adm_s0
+        j = tl.arange(0, BLOCK_N).to(tl.int64)
+        tot_new = tl.zeros((), dtype=tl.int64)
+        for off in range(0, nn, BLOCK_N):
+            idx = off + j
+            mask = idx < nn
+            cid = n_seen + idx
+            ce = tl.load(ce_row + cid * sM, mask=mask, other=-float("inf")).to(tl.float32)
+            adm = (ce >= tau_t) & mask
+            ai = adm.to(tl.int64)
+            n_c = tl.sum(ai, axis=0)
+            pref = tl.cumsum(ai, axis=0) - ai
+            tl.store(adm_row + m0 + tot_new + pref, cid, mask=adm)
+            tot_new += n_c
+        for off in range(0, nn, BLOCK_N):
+            idx = off + j
+            tl.store(adm_row + m0 + tot_new + idx, -1, mask=idx < (nn - tot_new))
+        m1 = m0 + tot_new
+        tl.store(MTOT + t, m1)
+        tl.store(MC + t, tot_new)
+        tl.store(MC + T + t, m1)
+
+    @triton.jit
+    def _pack_lean_chunks_kernel(MTOT, JBASE, SRC_NODE, SRC_LEAF, EMP, DST_NODE, DST_LEAF,
+                                 K_N, BASE_N, STR_N, U_N, DST_N,
+                                 K_L, BASE_L, STR_L, U_L, DST_L,
+                                 jb_s0_e, Kmax_e, Ntot_e, Ltot_e, ncap_e, lcap_e, U_tot_e, V_tot_e, n_leaf_blks_e,
+                                 DH3: tl.constexpr, DHP: tl.constexpr, NC: tl.constexpr):
+        jb_s0 = (jb_s0_e >> 2).to(tl.int64)
+        Kmax = (Kmax_e >> 2).to(tl.int64)
+        Ntot = (Ntot_e >> 2).to(tl.int64)
+        Ltot = (Ltot_e >> 2).to(tl.int64)
+        ncap = (ncap_e >> 2).to(tl.int64)
+        lcap = (lcap_e >> 2).to(tl.int64)
+        U_tot = (U_tot_e >> 2).to(tl.int64)
+        V_tot = (V_tot_e >> 2).to(tl.int64)
+        n_leaf_blks = (n_leaf_blks_e >> 2).to(tl.int64)
+        p = tl.program_id(0).to(tl.int64)
+        t = tl.program_id(1).to(tl.int64)
+        mi = tl.load(MTOT + t)
+        if p == 0:
+            kk = tl.arange(0, 32).to(tl.int64)
+            km = kk <= Kmax
+            bit = ((mi >> kk) & 1) != 0
+            jb = tl.where(bit, (mi >> (kk + 1)) << 1, 0)
+            tl.store(JBASE + t * jb_s0 + kk, jb, mask=km)
+        if p < U_tot:
+            k = tl.load(K_N + p).to(tl.int64)
+            has = ((mi >> k) & 1) != 0
+            j = tl.where(has, (mi >> (k + 1)) << 1, 0)
+            sn = (tl.load(BASE_N + p).to(tl.int64)
+                  + j * tl.load(STR_N + p).to(tl.int64)
+                  + tl.load(U_N + p).to(tl.int64))
+            dn = tl.load(DST_N + p).to(tl.int64)
+            d = tl.arange(0, DHP).to(tl.int64)
+            dm = d < DH3
+            val = tl.load(SRC_NODE + (t * Ntot + sn) * NC + d, mask=dm & has, other=0.0)
+            emp_v = tl.load(EMP + t * DH3 + d, mask=dm & (~has), other=0.0)
+            tl.store(DST_NODE + (t * ncap + dn) * NC + d, tl.where(has, val, emp_v), mask=dm)
+        if p < n_leaf_blks:
+            q = p * 64 + tl.arange(0, 64).to(tl.int64)
+            qm = q < V_tot
+            kl = tl.load(K_L + q, mask=qm, other=0).to(tl.int64)
+            has_l = (((mi >> kl) & 1) != 0) & qm
+            jl = (mi >> (kl + 1)) << 1
+            sl = (tl.load(BASE_L + q, mask=qm, other=0).to(tl.int64)
+                  + jl * tl.load(STR_L + q, mask=qm, other=0).to(tl.int64)
+                  + tl.load(U_L + q, mask=qm, other=0).to(tl.int64))
+            dl = tl.load(DST_L + q, mask=qm, other=0).to(tl.int64)
+            lf = tl.load(SRC_LEAF + t * Ltot + sl, mask=has_l, other=-1)
+            tl.store(DST_LEAF + t * lcap + dl, lf, mask=qm)
+
 
 def fast_build_on() -> bool:
     return _HAVE_TRITON and os.environ.get("FSB_FAST_BUILD", "1") == "1"
@@ -437,4 +527,63 @@ def build_spines_fast(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, consts, o
         out["t_idx"] = t_idx
         return out
     return {"node": sp, "root": root, "height": height, "m_b": m_b, "t_idx": t_idx}
+
+
+def _enc_i(x: int) -> int:
+    return (int(x) << 2) | 3
+
+
+@torch.no_grad()
+def append_admitted_fast(fc, ceil_all: torch.Tensor, M_vis: int, tau32: torch.Tensor) -> torch.Tensor | None:
+    T = fc.T
+    nn = M_vis - fc.n_seen
+    if not (fast_build_on() and ceil_all.is_cuda and tau32.is_cuda and nn >= 1
+            and ceil_all.dim() == 3 and ceil_all.shape[0] * ceil_all.shape[1] == T
+            and ceil_all.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and tau32.numel() == T):
+        return None
+    cap = fc.adm.shape[1]
+    if not (fc.fast and M_vis <= cap):
+        capacity = max(M_vis, fc.m_cap, 2 * cap, 1) if fc.fast else cap + nn
+        grown = torch.full((T, capacity), -1, dtype=torch.long, device=fc.dev)
+        if cap > 0:
+            grown[:, :cap] = fc.adm
+        fc.adm = grown
+    if fc._mc_buf is None or fc._mc_buf.shape != (2, T):
+        fc._mc_buf = torch.empty((2, T), dtype=torch.long, device=fc.dev)
+        fc._mc_nn = fc._mc_buf[0]
+    H = ceil_all.shape[1]
+    _append_adm_kernel[(T,)](ceil_all, tau32, fc.adm, fc.m_tot, fc._mc_buf,
+                             _enc_i(ceil_all.stride(0)), _enc_i(ceil_all.stride(1)), _enc_i(ceil_all.stride(2)),
+                             _enc_i(fc.adm.stride(0)), _enc_i(H), _enc_i(T), _enc_i(fc.n_seen), _enc_i(nn),
+                             BLOCK_N=32, num_warps=1)
+    fc.n_seen = M_vis
+    return fc._mc_nn
+
+
+@torch.no_grad()
+def pack_lean_chunks_fast(fc, F_cuda: dict, emp: torch.Tensor, Kmax: int, idx_c: tuple) -> torch.Tensor:
+    T, Dh, dev = fc.T, fc.Dh, fc.dev
+    if fc._jbase_buf is None or fc._jbase_buf.shape != (T, Kmax + 1):
+        fc._jbase_buf = torch.empty((T, Kmax + 1), dtype=torch.long, device=dev)
+    jb = fc._jbase_buf
+    k_n, base_n, str_n, u_n, dst_n, k_l, base_l, str_l, u_l, dst_l = idx_c
+    U_tot = k_n.shape[0]
+    V_tot = k_l.shape[0]
+    n_leaf_blks = (V_tot + 63) // 64
+    grid_p = max(U_tot, n_leaf_blks, 1)
+    node_src = F_cuda["node"]
+    leaf_src = F_cuda["leaf"]
+    NC = node_src.shape[-1]
+    DH3 = Dh + 3
+    DHP = _pow2(DH3)
+    _pack_lean_chunks_kernel[(grid_p, T)](
+        fc.m_tot, jb, node_src, leaf_src, emp, fc._node_arena, fc._leaf_arena,
+        k_n, base_n, str_n, u_n, dst_n,
+        k_l, base_l, str_l, u_l, dst_l,
+        _enc_i(jb.stride(0)), _enc_i(Kmax), _enc_i(F_cuda["Ntot"]), _enc_i(F_cuda["Ltot"]),
+        _enc_i(fc._node_arena.shape[1]), _enc_i(fc._leaf_arena.shape[1]),
+        _enc_i(U_tot), _enc_i(V_tot), _enc_i(n_leaf_blks),
+        DH3=DH3, DHP=DHP, NC=NC, num_warps=2)
+    return jb
 

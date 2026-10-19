@@ -8,15 +8,19 @@ from longctx_infer import _autocast_ctx, _lm_head_fp32, extend_rope_cache
 from src.utils import trunk_triton as _tt
 
 
-def _norm_cast(ln, x):
+def _norm_cast(ln, x, res=None):
     if _tt.rms_norm_ok(x, ln.weight):
-        return _tt.rms_norm_cast(x, ln.weight, ln.eps, _tt.autocast_dtype())
+        return _tt.rms_norm_cast(x, ln.weight, ln.eps, _tt.autocast_dtype(), res=res)
+    if res is not None:
+        x.add_(res)
     return ln(x)
 
 
-def _norm_fp32(ln, x):
+def _norm_fp32(ln, x, res=None):
     if _tt.rms_norm_ok(x, ln.weight):
-        return _tt.rms_norm_cast(x, ln.weight, ln.eps, torch.float32)
+        return _tt.rms_norm_cast(x, ln.weight, ln.eps, torch.float32, res=res)
+    if res is not None:
+        x.add_(res)
     return ln(x)
 
 
@@ -158,11 +162,12 @@ class GraphedDecoder:
         self.win_pos.copy_(idx)
         m = self.m
         x = m.drop(m.tok_emb(self.tok_static))
+        res = None
         for i, block in enumerate(self.blocks):
             attn = self.attn[i]; buf = self.layer_bufs[i]
-            x = x + attn.graph_decode_layer(_norm_cast(block.ln1, x), buf)
-            x = x + block.ffn(_norm_cast(block.ln2, x))
-        x = _norm_fp32(m.ln_final, x)
+            res = attn.graph_decode_layer(_norm_cast(block.ln1, x, res), buf)
+            res = block.ffn(_norm_cast(block.ln2, x, res))
+        x = _norm_fp32(m.ln_final, x, res)
         logits = _lm_head_fp32(m, x, 4096)         # the cached_generate head, as in FSBGraphedDecoder
         self.static_next = logits[:, 0, :].float().argmax(dim=-1)
         return logits
@@ -305,19 +310,19 @@ class FSBGraphedDecoder:
         self.win_pos.copy_(idx)
         m = self.m
         x = m.drop(m.tok_emb(self.tok_static))
+        res = None
         for i, blk in enumerate(self.blocks):
-            x = x + self.attn[i].graph_decode_layer_fsb(_norm_cast(blk.ln1, x), self.cache[i], self.buf)
-            x = x + blk.ffn(_norm_cast(blk.ln2, x))
-        x = _norm_fp32(m.ln_final, x)
+            res = self.attn[i].graph_decode_layer_fsb(_norm_cast(blk.ln1, x, res), self.cache[i], self.buf)
+            res = blk.ffn(_norm_cast(blk.ln2, x, res))
+        x = _norm_fp32(m.ln_final, x, res)
         logits = _lm_head_fp32(m, x, 4096)[:, 0, :]
         self.static_next = logits.argmax(dim=-1)
         return logits
 
     @torch.no_grad()
     def _capture(self):
-        from src.fsattn.fsb_tree import fsb_decode_prepare
-        for a, c in zip(self.attn, self.cache):
-            fsb_decode_prepare(a, c, 1, self.H, self.D, self.dev, self.pos)
+        from src.fsattn.fsb_tree import fsb_decode_prepare_all
+        fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, self.pos)
         accs = [getattr(a, "_fsb_read_acc", None) for a in self.attn]
         for a in self.attn:                     # the warm-up step must not add to the read statistics
             a._fsb_read_acc = None
@@ -352,9 +357,8 @@ class FSBGraphedDecoder:
         if self.graph is None:
             self._capture()                     # warms up (writes this token's K / V) and captures; same values
         elif p // self.Bq != self._blk:
-            from src.fsattn.fsb_tree import fsb_decode_prepare
-            for a, c in zip(self.attn, self.cache):
-                fsb_decode_prepare(a, c, 1, self.H, self.D, self.dev, p)
+            from src.fsattn.fsb_tree import fsb_decode_prepare_all
+            fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, p)
             if self._registry() != self._reg:
                 self._capture()                 # the tensors the graph reads moved: re-capture over the new state
             else:
