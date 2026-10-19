@@ -3,6 +3,7 @@ import os
 import torch
 
 from longctx_infer import _as_2d_long, _resolve_device, _autocast_ctx, _lm_head_fp32
+from src.fsattn import kv_int8 as _kvi
 
 
 def _fast_cell_stats(K, ncell, s):
@@ -37,9 +38,54 @@ class FSKVCache:
         self.fsb_leaf_radius = bool(getattr(attn, "fsb_leaf_radius", False))
         self._spread = None
         self._prefill_cell_stats = None     # the attention's prefill hand-off, consumed by prefill()
+        self._int8_ok = False               # FSBGraphedDecoder flips this on via enable_int8 (FS_KV_INT8=1)
+        self.use_int8 = False
+        self._qk_buf = None; self._qv_buf = None     # int8 (B,H,cap,D), completed cells
+        self._ks_buf = None; self._vs_buf = None     # bf16 scales (B,H,cap//s)
+        self._k_hot = None; self._v_hot = None       # bf16 (B,H,s,D), the open cell
+        self._n_q = 0                                # quantized rows ([0, _n_q) is the int8 region)
+        self._nq_t = None                            # device int64 scalar holding _n_q, read inside decode graphs
+        self._deq = None                             # eager materialization scratch (built lazily)
+
+    def enable_int8(self):
+        self._int8_ok = True
+
+    def row_capacity(self) -> int:
+        if self.use_int8:
+            return 0 if self._qk_buf is None else self._qk_buf.shape[2]
+        return 0 if self._k_buf is None else self._k_buf.shape[2]
+
+    def graph_kv(self):
+        # the read state a captured decode step gathers KV through: (mode, args); mode "bf16" gives (K, V)
+        if self.use_int8:
+            return ("int8", (self._qk_buf, self._qv_buf, self._ks_buf, self._vs_buf,
+                             self._k_hot, self._v_hot, self._nq_t, self.s))
+        if self._k_buf is not None:
+            return ("bf16", (self._k_buf, self._v_buf))
+        return (None, None)
+
+    def rerank_keys(self):
+        # the tokK the rerank scores read token keys from: the int8 read state in int8 mode, else the bf16 history
+        if self.use_int8:
+            return _kvi.Int8Keys(self._qk_buf, self._ks_buf, self._k_hot, self._nq_t, self.s)
+        return self._k_buf if self._k_buf is not None else self.lr_tokens()[0]
+
+    def read_full_kv(self):
+        # bf16 (K, V) over the whole stored history: the buffers themselves, or materialized in int8 mode
+        if self.use_int8:
+            return self.lr_tokens()
+        if self._k_buf is not None:
+            return self._k_buf, self._v_buf
+        return self.lr_tokens()
 
     def _grow(self, k_t, v_t):
         B, H, _, D = k_t.shape
+        if self.use_int8:
+            off = self._len - self._n_q
+            self._k_hot[:, :, off:off + 1] = k_t
+            self._v_hot[:, :, off:off + 1] = v_t
+            self._len += 1
+            return
         if self._k_hist is None:
             cap = 1024
             self._k_buf = k_t.new_zeros(B, H, cap, D)
@@ -64,11 +110,21 @@ class FSKVCache:
         if cap < N or (cap == N and not keep):
             return
         H, D = self.attn.n_heads, self.attn.head_dim
-        kb = torch.zeros(B, H, cap, D, dtype=dtype, device=device)
-        vb = torch.zeros(B, H, cap, D, dtype=dtype, device=device)
         max_cells = cap // self.s
         kbar = torch.empty(B, H, max_cells, D, dtype=torch.float32, device=device) if max_cells > 0 else None
         ceil = torch.empty(B, H, max_cells, dtype=torch.float32, device=device) if max_cells > 0 else None
+        if self._int8_ok and _kvi.int8_supported(dtype, device):
+            qk = torch.zeros(B, H, cap, D, dtype=torch.int8, device=device)
+            qv = torch.zeros(B, H, cap, D, dtype=torch.int8, device=device)
+            sk = torch.empty(B, H, max_cells, dtype=torch.bfloat16, device=device) if max_cells > 0 else None
+            sv = torch.empty(B, H, max_cells, dtype=torch.bfloat16, device=device) if max_cells > 0 else None
+            kh = torch.zeros(B, H, self.s, D, dtype=dtype, device=device)
+            vh = torch.zeros(B, H, self.s, D, dtype=dtype, device=device)
+            self._prealloc = (B, N, (qk, qv, sk, sv, kh, vh), kbar, ceil)
+            self._keep_prealloc = bool(keep)
+            return
+        kb = torch.zeros(B, H, cap, D, dtype=dtype, device=device)
+        vb = torch.zeros(B, H, cap, D, dtype=dtype, device=device)
         self._prealloc = (B, N, kb, vb, kbar, ceil)
         self._keep_prealloc = bool(keep)
 
@@ -89,10 +145,43 @@ class FSKVCache:
         pre = self._prealloc
         if not getattr(self, "_keep_prealloc", False):
             self._prealloc = None
-        if pre is not None and not (pre[0] == B and pre[1] == N and tuple(pre[2].shape) == (B, H, cap, D)
-                                    and pre[2].dtype == K.dtype and pre[2].device == K.device):
+        self.use_int8 = bool(self._int8_ok and _kvi.int8_supported(K.dtype, K.device)
+                             and K.stride(-1) == 1 and V.stride(-1) == 1)
+        pre_i8 = isinstance(pre[2], tuple) if pre is not None else False
+        if pre is not None and pre_i8 != self.use_int8:
+            pre, pre_i8 = None, False
+        if pre_i8 and not (pre[0] == B and pre[1] == N and tuple(pre[2][0].shape) == (B, H, cap, D)
+                           and pre[2][0].device == K.device):
+            pre, pre_i8 = None, False
+        if pre is not None and not pre_i8 and not (pre[0] == B and pre[1] == N and tuple(pre[2].shape) == (B, H, cap, D)
+                                                   and pre[2].dtype == K.dtype and pre[2].device == K.device):
             pre = None
-        if cap > N or pre is not None:
+        ncell = N // self.s
+        if self.use_int8:
+            if pre is not None:
+                (self._qk_buf, self._qv_buf, self._ks_buf, self._vs_buf, self._k_hot, self._v_hot) = pre[2]
+            else:
+                self._qk_buf = K.new_zeros((B, H, cap, D), dtype=torch.int8)
+                self._qv_buf = K.new_zeros((B, H, cap, D), dtype=torch.int8)
+                mc = cap // self.s
+                self._ks_buf = torch.empty(B, H, mc, dtype=torch.bfloat16, device=K.device) if mc > 0 else None
+                self._vs_buf = torch.empty(B, H, mc, dtype=torch.bfloat16, device=K.device) if mc > 0 else None
+                self._k_hot = K.new_zeros(B, H, self.s, D)
+                self._v_hot = V.new_zeros(B, H, self.s, D)
+            n_q = ncell * self.s
+            if n_q > 0:
+                _kvi.quantize_cells_fast(K[:, :, :n_q], self.s, self._qk_buf[:, :, :n_q],
+                                         self._ks_buf[:, :, :ncell])
+                _kvi.quantize_cells_fast(V[:, :, :n_q], self.s, self._qv_buf[:, :, :n_q],
+                                         self._vs_buf[:, :, :ncell])
+            self._n_q = n_q
+            self._nq_t = torch.full((), n_q, dtype=torch.int64, device=K.device)
+            self._len = N
+            self._k_buf = None; self._v_buf = None
+            self._k_hist = None; self._v_hist = None
+            self._kbar_buf = pre[3] if pre is not None else None
+            self._ceil_buf = pre[4] if pre is not None else None
+        elif cap > N or pre is not None:
             if pre is not None:
                 self._k_buf, self._v_buf = pre[2], pre[3]
             else:
@@ -101,13 +190,16 @@ class FSKVCache:
                 self._k_buf[:, :, :N] = K
             if self._v_buf.data_ptr() != V.data_ptr():
                 self._v_buf[:, :, :N] = V
+            self._len = N
+            self._k_hist = self._k_buf[:, :, :N]; self._v_hist = self._v_buf[:, :, :N]
+            self._kbar_buf = pre[4] if pre is not None else None
+            self._ceil_buf = pre[5] if pre is not None else None
         else:
             self._k_buf = K.contiguous(); self._v_buf = V.contiguous()
-        self._len = N
-        self._k_hist = self._k_buf[:, :, :N]; self._v_hist = self._v_buf[:, :, :N]
-        ncell = N // self.s
-        self._kbar_buf = pre[4] if pre is not None else None
-        self._ceil_buf = pre[5] if pre is not None else None
+            self._len = N
+            self._k_hist = self._k_buf[:, :, :N]; self._v_hist = self._v_buf[:, :, :N]
+            self._kbar_buf = pre[4] if pre is not None else None
+            self._ceil_buf = pre[5] if pre is not None else None
         if ncell > 0:
             Kc = K[:, :, :ncell * self.s, :].reshape(B, H, ncell, self.s, D)
             # same bits three ways, cheapest first: the statistics the layer's long-range prefill handed over, one
@@ -132,11 +224,30 @@ class FSKVCache:
                 self._spread = self._cell_spread(Kc, self._kbar)
         r = N - ncell * self.s
         if r > 0:
-            self._cell_k = K[:, :, ncell * self.s:N, :].contiguous()
+            if self.use_int8:
+                self._k_hot[:, :, :r].copy_(K[:, :, ncell * self.s:N, :])
+                self._v_hot[:, :, :r].copy_(V[:, :, ncell * self.s:N, :])
+                self._cell_k = self._k_hot[:, :, :r]
+            else:
+                self._cell_k = K[:, :, ncell * self.s:N, :].contiguous()
         self.pos = N
 
-    def _finish_cell(self, cell):
-        st = None if self.fsb_leaf_radius else _fast_cell_stats(cell, 1, self.s)
+    def _finish_cell(self, cell, v_cell=None):
+        if self.use_int8:
+            k_cell, v_cell = self._k_hot, self._v_hot
+            st = None if self.fsb_leaf_radius else _fast_cell_stats(k_cell, 1, self.s)
+            if st is None:
+                cell = k_cell
+            idx = self._n_q // self.s
+            c0 = self._n_q
+            _kvi.quantize_cells_fast(k_cell, self.s, self._qk_buf[:, :, c0:c0 + self.s],
+                                     self._ks_buf[:, :, idx:idx + 1])
+            _kvi.quantize_cells_fast(v_cell, self.s, self._qv_buf[:, :, c0:c0 + self.s],
+                                     self._vs_buf[:, :, idx:idx + 1])
+            self._n_q = c0 + self.s
+            self._nq_t.fill_(self._n_q)
+        else:
+            st = None if self.fsb_leaf_radius else _fast_cell_stats(cell, 1, self.s)
         if st is not None:
             kbar, ceil = st
             sp = None
@@ -168,9 +279,9 @@ class FSKVCache:
         n = self._len
         rem = n % self.s
         if rem != 0:
-            self._cell_k = self._k_buf[:, :, n - rem:n]
+            self._cell_k = self._k_hot[:, :, self._n_q:n] if self.use_int8 else self._k_buf[:, :, n - rem:n]
         else:
-            self._finish_cell(self._k_buf[:, :, n - self.s:n])
+            self._finish_cell(self._k_hot if self.use_int8 else self._k_buf[:, :, n - self.s:n])
         self.pos += 1
 
     def advance_in_place(self):
@@ -178,18 +289,44 @@ class FSKVCache:
         self._len = n
         self.pos = n
         if n % self.s == 0:
-            self._k_hist = self._k_buf[:, :, :n]
-            self._v_hist = self._v_buf[:, :, :n]
-            self._finish_cell(self._k_buf[:, :, n - self.s:n])
+            if self.use_int8:
+                self._finish_cell(self._k_hot)
+            else:
+                self._k_hist = self._k_buf[:, :, :n]
+                self._v_hist = self._v_buf[:, :, :n]
+                self._finish_cell(self._k_buf[:, :, n - self.s:n])
+
+    def _materialize(self):
+        # int8 mode: dequantize the completed cells and append the open cell, into a persistent bf16 scratch
+        n = self._len
+        n_q = self._n_q
+        if self._deq is None or self._deq[0].shape[2] < n:
+            B, H, _, D = self._qk_buf.shape
+            cap = max(n, self._qk_buf.shape[2])
+            dt, dev = self._k_hot.dtype, self._qk_buf.device
+            self._deq = (torch.empty(B, H, cap, D, dtype=dt, device=dev),
+                         torch.empty(B, H, cap, D, dtype=dt, device=dev))
+        dk, dv = self._deq
+        if n_q > 0:
+            _kvi.dequant_cells(self._qk_buf[:, :, :n_q], self._ks_buf, self.s, out=dk)
+            _kvi.dequant_cells(self._qv_buf[:, :, :n_q], self._vs_buf, self.s, out=dv)
+        if n > n_q:
+            dk[:, :, n_q:n] = self._k_hot[:, :, :n - n_q]
+            dv[:, :, n_q:n] = self._v_hot[:, :, :n - n_q]
+        return dk[:, :, :n], dv[:, :, :n]
 
     def sr_window(self, at=None):
-        if self._k_hist is not None and self._k_hist.shape[2] != self._len:
-            self._k_hist = self._k_buf[:, :, :self._len]
-            self._v_hist = self._v_buf[:, :, :self._len]
+        if self.use_int8:
+            kh, vh = self._materialize()
+        else:
+            if self._k_hist is not None and self._k_hist.shape[2] != self._len:
+                self._k_hist = self._k_buf[:, :, :self._len]
+                self._v_hist = self._v_buf[:, :, :self._len]
+            kh, vh = self._k_hist, self._v_hist
         end = (self.pos if at is None else at + 1)
         L = min(self.W + 1, end)
-        k = self._k_hist[:, :, end - L:end, :]
-        v = self._v_hist[:, :, end - L:end, :]
+        k = kh[:, :, end - L:end, :]
+        v = vh[:, :, end - L:end, :]
         p = torch.arange(end - L, end, device=k.device)
         return k, v, p
 
@@ -208,6 +345,8 @@ class FSKVCache:
         return _det_sum(d * d, -1).amax(dim=-1).sqrt()
 
     def lr_tokens(self):
+        if self.use_int8:
+            return self._materialize()
         if self._k_hist is not None and self._k_hist.shape[2] != self._len:
             self._k_hist = self._k_buf[:, :, :self._len]
             self._v_hist = self._v_buf[:, :, :self._len]

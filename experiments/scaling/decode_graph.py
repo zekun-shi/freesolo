@@ -79,6 +79,11 @@ class GraphedDecoder:
                     a._ensure_qkv_cache()
         self._alloc(P)
         self.cache = make_caches(m, linear=False, reserve=max(0, self.Lmax - P))
+        if os.environ.get("FS_KV_INT8", "1") == "1":
+            from src.fsattn.kv_int8 import int8_on
+            if int8_on():
+                for c in self.cache:
+                    c.enable_int8()             # int8 long-range KV; the window kernel writes the hot open cell
         kv_dt = self.dt if self.dt != torch.float32 else next(m.parameters()).dtype
         if os.environ.get("KV_PREALLOC", "1") == "1":       # as cached_generate: buffers before the prefill peak
             for c in self.cache:
@@ -90,7 +95,9 @@ class GraphedDecoder:
         for i in range(self.nL):
             c = self.cache[i]
             buf = self.layer_bufs[i]
-            if (c._k_buf is not None and c._k_buf.shape[2] >= self.Lmax and c._k_buf.dtype == self.dt
+            if c.use_int8:
+                buf["cache"] = c                # the int8 state is the decode store; no bf16 graph buffers
+            elif (c._k_buf is not None and c._k_buf.shape[2] >= self.Lmax and c._k_buf.dtype == self.dt
                     and c._k_buf.shape[3] == self.D):
                 buf["kbuf"], buf["vbuf"] = c._k_buf, c._v_buf
             else:
@@ -230,7 +237,9 @@ class GraphedDecoder:
         for i in range(self.nL):
             c = self.cache[i]
             buf = self.layer_bufs[i]
-            if buf["kbuf"] is c._k_buf and buf["vbuf"] is c._v_buf:
+            if buf.get("cache") is c:           # int8 store: the window kernel wrote the hot row at replay
+                c.advance_in_place()
+            elif buf["kbuf"] is c._k_buf and buf["vbuf"] is c._v_buf:
                 c.advance_in_place()
             else:
                 k_t = buf["kbuf"][:, :, p:p + 1, :]
@@ -285,6 +294,11 @@ class FSBGraphedDecoder:
                 if hasattr(a, "_ensure_qkv_cache") and a.W_q.bias is None and a.W_k.bias is None and a.W_v.bias is None:
                     a._ensure_qkv_cache()
         self.cache = make_caches(m, lean_prefill=self.lean_prefill, reserve=self.max_new + 8, linear=False)
+        if os.environ.get("FS_KV_INT8", "1") == "1":
+            from src.fsattn.kv_int8 import int8_on
+            if int8_on():
+                for c in self.cache:
+                    c.enable_int8()                 # int8 long-range KV (completed cells); bf16 hot open cell
         for c in self.cache:
             c._fsb_graph_m_cap = (P + self.max_new + 8) // c.attn.cell_stride
         if os.environ.get("KV_PREALLOC", "1") == "1":       # as cached_generate: buffers before the prefill peak

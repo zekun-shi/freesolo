@@ -131,7 +131,9 @@ def test_whole_step_decode_matches_cached_generate(monkeypatch):
     # the paper's FS-B serve config on a tiny random model, with 4-wide beams (narrower than the ~20 cells of the
     # context, so the filtered second forest - each head's threshold at the median cell ceiling of the prompt - adds
     # reads of its own): whole-step graph decode across query-block boundaries and past the model's initial RoPE
-    # table gives the tokens and read statistics of the per-layer decode loop
+    # table gives the tokens and read statistics of the per-layer decode loop.
+    # Bit identity between the graph and the loop holds only on identical KV storage: pin the
+    # bf16 store (FS_KV_INT8=0); the int8 store has its own parity coverage in tests/test_kv_int8.py
     from experiments.scaling.model import FreeSoloLM
     from kv_cache import cached_generate, make_caches, _trunk_cached
     kw = dict(window_size=64, long_range_variant="cell_topk", cell_stride=32, cell_topk=4, cell_select="score",
@@ -144,6 +146,7 @@ def test_whole_step_decode_matches_cached_generate(monkeypatch):
                    attn_type="fsattn", **kw).cuda().eval()
     layers = [mod for mod in m.modules() if getattr(mod, "fsb_enabled", False)]
     prompt = torch.randint(0, 256, (1, 300), generator=torch.Generator().manual_seed(1))
+    monkeypatch.setenv("FS_KV_INT8", "0")
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         caches = make_caches(m)
         _trunk_cached(m, prompt.cuda(), caches)

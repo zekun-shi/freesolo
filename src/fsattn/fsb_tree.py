@@ -2517,12 +2517,18 @@ def fsb_decode_step(attn, q_t, cache, sigma, pos):
 
 
 def _fsb_decode_readout(attn, q_t, cache, sel, pos, full_buffer=False):
+    if (getattr(cache, "use_int8", False) and q_t.is_cuda and torch.cuda.is_current_stream_capturing()):
+        raise RuntimeError("the int8 FS-B reference readout must not be captured: it gathers from a "
+                           "length-sliced materialization whose baked shape goes stale at replay; "
+                           "decode_readout_fast must cover this configuration instead")
     B, H, _, Dh = q_t.shape
     s = attn.cell_stride
     dev = q_t.device
     kk = sel.shape[-1]
     sel = sel.view(B, H, kk)
-    if full_buffer and getattr(cache, "_k_buf", None) is not None:
+    if full_buffer and getattr(cache, "read_full_kv", None) is not None:
+        Kp, Vp = cache.read_full_kv()
+    elif full_buffer and getattr(cache, "_k_buf", None) is not None:
         Kp, Vp = cache._k_buf, cache._v_buf
     else:
         Kp, Vp = cache.lr_tokens()
@@ -2603,7 +2609,10 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
     rr = getattr(attn, "fsb_rerank_score", "leaf") if getattr(attn, "fsb_read_top", 0) > 0 else "leaf"
     tokK = None
     if rr != "leaf":
-        tokK = cache._k_buf if getattr(cache, "_k_buf", None) is not None else cache.lr_tokens()[0]
+        if getattr(cache, "use_int8", False):
+            tokK = cache.rerank_keys()          # the int8 read state for the fused kernels
+        else:
+            tokK = cache._k_buf if getattr(cache, "_k_buf", None) is not None else cache.lr_tokens()[0]
     hkw = hybrid_kw(attn, fc.pool)
     bkw = beam_kw(attn)
     uqkw = union_quota_kw(attn)
@@ -2633,7 +2642,9 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
         sel, _, _ = traverse_forest(fc.F, fc.SP, qr, qpos, lam, sigv, attn.scale, s, W, delta,
                                     attn.fsb_W_max, attn.fsb_delta_max, attn.fsb_node_score,
                                     radius_coef=rc, read_top=getattr(attn, "fsb_read_top", 0),
-                                    rerank_score=rr, tokK=tokK, rq=rq, delta_eff=d_eff, **union_kw(attn), **hkw,
+                                    rerank_score=rr, tokK=(cache.lr_tokens()[0] if getattr(cache, "use_int8", False)
+                                                           else tokK),
+                                    rq=rq, delta_eff=d_eff, **union_kw(attn), **hkw,
                                     **rr_kw(attn), **margin_kw(attn), **bkw, **ukw, **uqkw, **upkw,
                                     **({"prov_out": prov} if prov is not None else {}))
     fc._last_sel = sel
@@ -2895,7 +2906,10 @@ def fsb_graph_registry(attn, cache):
     F, SP, tk = fc.F, fc.SP, getattr(fc, "_tok", None)
     plain = _plain_consumption(attn, fc)
     reg = [bool(getattr(fc, "_live", False)), F is None, SP is None, getattr(fc, "pool", None) is None, plain,
-           sig(getattr(cache, "_k_buf", None)), sig(getattr(cache, "_v_buf", None))]
+           sig(getattr(cache, "_k_buf", None)), sig(getattr(cache, "_v_buf", None)),
+           sig(getattr(cache, "_qk_buf", None)), sig(getattr(cache, "_qv_buf", None)),
+           sig(getattr(cache, "_k_hot", None)), sig(getattr(cache, "_v_hot", None)),
+           sig(getattr(cache, "_nq_t", None))]
     if F is not None:
         reg += [sig(F.get("node")), sig(F.get("leaf")), sig(F.get("adm")), F.get("Kmax"), F.get("M"),
                 F.get("Ltot")]
@@ -2937,6 +2951,8 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
             cache._fsb_forest = fc
         if fc.fast and fc.lean and getattr(cache, "_k_buf", None) is not None:
             fc.m_cap = max(fc.m_cap, cache._k_buf.shape[2] // s)
+        if fc.fast and fc.lean and getattr(cache, "_qk_buf", None) is not None:
+            fc.m_cap = max(fc.m_cap, cache._qk_buf.shape[2] // s)
         g_cap = getattr(cache, "_fsb_graph_m_cap", 0)
         if fc.fast and fc.lean and g_cap > 0:
             fc.m_cap = max(fc.m_cap, g_cap)
@@ -2985,6 +3001,8 @@ def fsb_decode_prepare(attn, cache, B, H, Dh, dev, pos):
         fc = ForestCache(T, Dh, dev, lean=os.environ.get("FSB_DECODE_LEAN", "1") == "1"); cache._fsb_forest = fc
     if fc.fast and fc.lean and getattr(cache, "_k_buf", None) is not None:
         fc.m_cap = max(fc.m_cap, cache._k_buf.shape[2] // s)
+    if fc.fast and fc.lean and getattr(cache, "_qk_buf", None) is not None:
+        fc.m_cap = max(fc.m_cap, cache._qk_buf.shape[2] // s)
     g_cap = getattr(cache, "_fsb_graph_m_cap", 0)
     if fc.fast and fc.lean and g_cap > 0:
         fc.m_cap = max(fc.m_cap, g_cap)

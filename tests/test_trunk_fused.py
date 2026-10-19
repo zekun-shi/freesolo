@@ -380,6 +380,9 @@ def test_fsl_graphed_decoder_matches_cached_generate(monkeypatch):
     from decode_graph import GraphedDecoder
     from experiments.scaling.model import FreeSoloLM
     from kv_cache import cached_generate
+    # Bit identity with the eager cached_generate loop holds only on identical KV storage: pin the bf16
+    # store (FS_KV_INT8=0); the int8 store has its own parity coverage in tests/test_kv_int8.py
+    monkeypatch.setenv("FS_KV_INT8", "0")
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
     monkeypatch.setenv("FS_STRICT_CAUSAL", "1")
     monkeypatch.setenv("FS_PRUNE_KERNEL", "1")
@@ -414,6 +417,9 @@ def test_dense_graphed_decoder_matches_cached_generate(monkeypatch):
     from decode_graph import GraphedDecoder
     from experiments.scaling.model import FreeSoloLM
     from kv_cache import cached_generate
+    # Bit identity with the eager cached_generate loop holds only on identical KV storage: pin the bf16
+    # store (FS_KV_INT8=0); the int8 store has its own parity coverage in tests/test_kv_int8.py
+    monkeypatch.setenv("FS_KV_INT8", "0")
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
     monkeypatch.setenv("FS_FUSED_SELECT", "1")
     monkeypatch.setenv("FS_STRICT_CAUSAL", "1")

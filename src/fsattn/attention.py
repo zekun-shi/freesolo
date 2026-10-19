@@ -841,8 +841,8 @@ class FSAttn(nn.Module):
         pre = getattr(cache, "_prealloc", None) if (is_std_prefill and not torch.is_grad_enabled()
                                                     and pre_ok and not compiling()) else None
         cap = N + max(0, int(getattr(cache, "reserve", 0))) if pre is not None else 0
-        if (pre is not None and pre[0] == B and pre[1] == N and tuple(pre[2].shape) == (B, H, cap, D)
-                and pre[2].device == x.device):
+        if (pre is not None and torch.is_tensor(pre[2]) and pre[0] == B and pre[1] == N
+                and tuple(pre[2].shape) == (B, H, cap, D) and pre[2].device == x.device):
             wk = self.W_k(x).view(B, N, H, D).transpose(1, 2)
             if wk.dtype == pre[2].dtype:
                 K = pre[2][:, :, :N]
@@ -1283,13 +1283,25 @@ class FSAttn(nn.Module):
                 self.W_k(x).view(B, N, H, D).transpose(1, 2),
                 self.W_v(x).view(B, N, H, D).transpose(1, 2))
 
-    def _sr_kv_and_decode(self, Q, K, V, kbuf, vbuf, buf, sigma):
+    def _sr_kv_and_decode(self, Q, K, V, kbuf, vbuf, buf, sigma, cache=None):
         from ..utils import trunk_triton as _tt
         pos_t = buf["pos_t"]
         win_idx = buf["win_idx"]
         win_pos = buf["win_pos"]
         cos = self.rope.cos_cached if self.use_rope else None
         sin = self.rope.sin_cached if self.use_rope else None
+        if cache is not None and getattr(cache, "use_int8", False):
+            qk, qv, sk, sv, khot, vhot, nq_t, s = (cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf,
+                                                   cache._k_hot, cache._v_hot, cache._nq_t, cache.s)
+            if _tt.sr_decode_int8_ok(Q, K, V, qk, sk, khot, qv, sv, vhot, nq_t, win_idx, win_pos, cos):
+                return _tt.sr_decode_fused_int8(Q, K, V, qk, sk, khot, qv, sv, vhot, nq_t, s,
+                                                pos_t, win_idx, win_pos, sigma, self.scale, self.window_size,
+                                                self.fs_uniform_sr, self.use_rope, cos, sin)
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the int8 FS-B SR decode fallback must not be captured: it reads a "
+                                   "length-sliced materialization whose baked shape goes stale at replay; "
+                                   "sr_decode_int8_ok must cover this configuration")
+            kbuf, vbuf = cache.lr_tokens()
         if _tt.sr_decode_ok(Q, K, V, kbuf, vbuf, win_idx, win_pos, cos):
             return _tt.sr_decode_fused(Q, K, V, kbuf, vbuf, pos_t, win_idx, win_pos, sigma,
                                        self.scale, self.window_size, self.fs_uniform_sr, self.use_rope, cos, sin)
@@ -1311,7 +1323,7 @@ class FSAttn(nn.Module):
         fc = getattr(cache, "_fsb_forest", None)
         tk = getattr(fc, "_tok", None)
         sig = tk.get("sigma") if tk is not None and tk.get("sigma") is not None else self.sigma
-        out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig)
+        out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
         win_pos = buf.get("win_pos")
         pos_f = win_pos[-1:] if win_pos is not None else None
         out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f, sr=out_short)
@@ -1325,15 +1337,39 @@ class FSAttn(nn.Module):
         B, N, _ = x.shape
         H, D = self.n_heads, self.head_dim
         Q, K, V = self._qkv_decode(x, B, N, H, D)
-        kbuf = buf["kbuf"]; vbuf = buf["vbuf"]
+        cache = buf.get("cache")
+        int8 = cache is not None and getattr(cache, "use_int8", False)
+        kbuf = buf.get("kbuf"); vbuf = buf.get("vbuf")
         pos_t = buf["pos_t"]
         sigma = buf.get("sigma")
         if sigma is None:
             sigma = self.sigma
-        out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma)
+        if int8 and kbuf is None and not (
+                _tt.sr_decode_int8_ok(Q, K, V, cache._qk_buf, cache._ks_buf, cache._k_hot,
+                                      cache._qv_buf, cache._vs_buf, cache._v_hot, cache._nq_t,
+                                      buf["win_idx"], buf["win_pos"],
+                                      self.rope.cos_cached if self.use_rope else None)):
+            # an exotic int8 configuration the fused window kernel does not cover: fall back through the
+            # materialized bf16 history (eager only; captures must be covered by the fused kernels)
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the int8 long-range decode fallback must not be captured: it reads a "
+                                   "materialized history whose baked shape goes stale at replay")
+            kbuf, vbuf = cache.read_full_kv()
+        out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
         pool = buf["pool"]
         if pool.get("empty", False):
             out_long = Q.new_zeros(B, H, 1, D)
+        elif int8:
+            st = (cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf,
+                  cache._k_hot, cache._v_hot, cache._nq_t, cache.s)
+            out = _tt.lr_comb_int8(self, Q, out_short, pool, pos_t, sigma, st)
+            if out is not None:
+                return self.W_o(out)
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("the int8 long-range decode fallback must not be captured: "
+                                   "lr_comb_int8 must cover this configuration")
+            kbuf, vbuf = cache.read_full_kv()
+            out_long = self._lr_decode_from_pool_buf(Q, kbuf, vbuf, pool, pos_t, sigma)
         elif _tt.fsl_lr_decode_combine_ok(self, Q, kbuf, vbuf, out_short, pool, pos_t, sigma):
             return self.W_o(_tt.fsl_lr_decode_combine(self, Q, kbuf, vbuf, out_short, pool, pos_t, sigma))
         else:

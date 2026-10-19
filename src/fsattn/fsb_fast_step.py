@@ -358,7 +358,8 @@ if _HAVE_TRITON:
         w = (e / den).to(VAL.dtype.element_ty).to(tl.float32)            # softmax stored, cast to the value dtype
         vt = tl.load(VAL + bi * svb + hi * svh + tok[:, :, None] * svn + d[None, None, :],
                      mask=ok[:, :, None] & (d[None, None, :] < DH), other=0.0)
-        acc = tl.sum(tl.sum(w[:, :, None] * vt.to(tl.float32), axis=0), axis=0)  # (DHP,)
+        acc = tl.sum(tl.sum(w[:, :, None] * vt.to(tl.float32), axis=1), axis=0)  # (DHP,); axis1 first: nested
+        # axis-0 reductions miscompile on some register layouts (wrong second reduction, no error)
         x = tl.where(tl.sum(ok.to(tl.int32)) > 0, acc, 0.0).to(Q.dtype.element_ty)   # the readout store; empty row 0
         xf = x.to(tl.float32)
         sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)             # attn.lr_norm in torch's order and dtypes
@@ -376,6 +377,180 @@ if _HAVE_TRITON:
                 scaled_lr = lrs * yf
             y = (sr + scaled_lr).to(OUT.dtype.element_ty)
         tl.store(OUT + bi * sob + hi * soh + d, y, mask=d < DH)
+
+    @triton.jit
+    def _fsb_decread_int8_kernel(Q, SEL, QK, SK, HOTK, QV, SV, HOTV, NQ, POS, W, SR, LRS, OUT,
+                                 sqb, sqh,
+                                 sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
+                                 sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
+                                 srb, srh, sob, soh,
+                                 scale, eps, Hh, K, S,
+                                 DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr, KK: tl.constexpr,
+                                 HAS_SR: tl.constexpr, LRS_BF16: tl.constexpr, W_BF16: tl.constexpr):
+        # _fsb_decread_kernel (one decode query per (batch, head) row) on the int8-mode cache: token rows below
+        # n_q are int8 * bf16 cell scale, the open cell's rows are the bf16 hot rows; same math as the reference
+        # modulo the cell dequantization (selection statistics stay pre-quantization, so the read set matches).
+        r = tl.program_id(0)                                           # = b * H + h (sel.view(B, H, K) rows)
+        bi = r // Hh
+        hi = r - bi * Hh
+        d = tl.arange(0, DHP)
+        kk = tl.arange(0, KK)
+        j = tl.arange(0, SP)
+        q = tl.load(Q + bi * sqb + hi * sqh + d, mask=d < DH, other=0.0) # fp32 view of the stored query
+        sel = tl.load(SEL + r * K + kk, mask=kk < K, other=-1)           # (KK,)
+        cellc = tl.where(sel >= 0, sel, 0).to(tl.int64)
+        tok = cellc[:, None] * S + j[None, :].to(tl.int64)               # (KK, SP) clamped like the reference
+        posv = tl.load(POS)
+        ok = (sel[:, None] >= 0) & (j[None, :] < S) & (tok < posv)
+        nq = tl.load(NQ)
+        is_hot = tok >= nq
+        hot_i = tok - nq
+        inq = ok & (tok < nq)                        # the int8 region; scale tables only cover these cells
+        kq = tl.load(QK + bi * sqkb + hi * sqkh + tok[:, :, None] * sqkn + d[None, None, :],
+                     mask=inq[:, :, None] & (d[None, None, :] < DH), other=0).to(tl.float32)
+        ksc = tl.load(SK + bi * sskb + hi * sskh + tok // S, mask=inq, other=0.0).to(tl.float32)
+        kh = tl.load(HOTK + bi * shkb + hi * shkh + hot_i[:, :, None] * shkn + d[None, None, :],
+                     mask=(ok & is_hot)[:, :, None] & (d[None, None, :] < DH), other=0.0).to(tl.float32)
+        kt = tl.where(is_hot[:, :, None], kh, kq * ksc[:, :, None])
+        sc = tl.reshape(_halve_rows(tl.reshape(kt * q.to(tl.float32)[None, None, :],
+                                               (KK * SP, DHP)), DHP), (KK, SP))
+        sc = sc.to(Q.dtype.element_ty).to(tl.float32) * scale      # the score einsum's store, then * scale
+        sc = tl.where(ok, sc, -1e9)
+        m = tl.max(tl.max(sc, axis=1), axis=0)
+        e = _ld.exp(sc - m)
+        den = tl.sum(tl.sum(e, axis=1), axis=0)
+        w = (e / den).to(HOTV.dtype.element_ty).to(tl.float32)           # softmax stored, cast to the value dtype
+        vq = tl.load(QV + bi * sqvb + hi * sqvh + tok[:, :, None] * sqvn + d[None, None, :],
+                     mask=inq[:, :, None] & (d[None, None, :] < DH), other=0).to(tl.float32)
+        vsc = tl.load(SV + bi * ssvb + hi * ssvh + tok // S, mask=inq, other=0.0).to(tl.float32)
+        vh = tl.load(HOTV + bi * shvb + hi * shvh + hot_i[:, :, None] * shvn + d[None, None, :],
+                     mask=(ok & is_hot)[:, :, None] & (d[None, None, :] < DH), other=0.0).to(tl.float32)
+        vt = tl.where(is_hot[:, :, None], vh, vq * vsc[:, :, None])
+        acc = tl.sum(tl.sum(w[:, :, None] * vt, axis=1), axis=0)         # (DHP,); axis1 first (see above)
+        x = tl.where(tl.sum(ok.to(tl.int32)) > 0, acc, 0.0).to(Q.dtype.element_ty)   # the readout store; empty row 0
+        xf = x.to(tl.float32)
+        sq_ = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)            # attn.lr_norm in torch's order and dtypes
+        ms = (tl.sum(sq_, axis=0) * (1.0 / DH)).to(Q.dtype.element_ty).to(tl.float32)
+        rms = tl.math.rsqrt((ms + eps).to(Q.dtype.element_ty).to(tl.float32)).to(Q.dtype.element_ty).to(tl.float32)
+        wq = tl.load(W + d, mask=d < DH, other=0.0).to(tl.float32)
+        if W_BF16:
+            y = ((xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq).to(Q.dtype.element_ty)
+        else:
+            # an fp32 lr_norm.scale promotes RMSNorm's last multiply to fp32: no store rounding on the
+            # normalized output before the value leaves the kernel (eval checkpoints keep norms fp32)
+            y = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
+        if HAS_SR:
+            sr = tl.load(SR + bi * srb + hi * srh + d, mask=d < DH, other=0.0).to(tl.float32)
+            lrs = tl.load(LRS + hi).to(tl.float32)
+            yf = y.to(tl.float32)
+            if LRS_BF16 and W_BF16:
+                scaled_lr = (lrs * yf).to(Q.dtype.element_ty).to(tl.float32)
+            else:
+                scaled_lr = lrs * yf
+            y = (sr + scaled_lr).to(OUT.dtype.element_ty)
+        tl.store(OUT + bi * sob + hi * soh + d, y.to(OUT.dtype.element_ty), mask=d < DH)
+
+    @triton.jit
+    def _fsb_upar_int8_kernel(Q, SELA, SELB, TIDX, QK, SK, HOTK, NQ, QPOS, sq0, sq1, SIG, ss0, ss1,
+                              CELLA, ca0, ca1, LAM, ls0, ls1, U,
+                              Ca, Cb, C, Bq, Hh, sq_b, sq_h, sq_n, sshb, sshh, sh_b, sh_h, sh_n,
+                              scale, S, Mc,
+                              DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr, FULL_S: tl.constexpr,
+                              HAS_B: tl.constexpr, LSE: tl.constexpr, POS: tl.constexpr):
+        # _fsb_upar_kernel on the int8-mode cache (one u score per (row, candidate); the candidate's cell rows
+        # below n_q dequantize int8 * scale, its hot rows read bf16); identical score/position-term math after.
+        pid = tl.program_id(0)
+        r = pid // C
+        cand = pid - r * C
+        if HAS_B:
+            if cand < Ca:
+                cell = tl.load(SELA + r * Ca + cand)
+            else:
+                cell = tl.load(SELB + r * Cb + (cand - Ca))
+        else:
+            cell = tl.load(SELA + pid)
+        if cell >= 0:
+            t = r // Bq
+            b = r - t * Bq
+            seq = tl.load(TIDX + t)
+            bi = seq // Hh
+            hi = seq - bi * Hh
+            d = tl.arange(0, DHP)
+            j = tl.arange(0, SP)
+            if DH == DHP:
+                q = tl.load(Q + r * DH + d).to(tl.float32)
+            else:
+                q = tl.load(Q + r * DH + d, mask=d < DH, other=0.0).to(tl.float32)
+            tok = cell * S + j
+            nq = tl.load(NQ)
+            is_hot = tok >= nq
+            hot_i = tok - nq
+            kq = tl.load(QK + bi * sq_b + hi * sq_h + tok[:, None] * sq_n + d[None, :],
+                         mask=(j[:, None] < S) & (d[None, :] < DH), other=0).to(tl.float32)
+            ksc = tl.load(SK + bi * sshb + hi * sshh + tl.minimum(cell, Mc - 1)).to(tl.float32)
+            kh = tl.load(HOTK + bi * sh_b + hi * sh_h + hot_i[:, None] * sh_n + d[None, :],
+                         mask=(is_hot & (j < S))[:, None] & (d[None, :] < DH), other=0.0).to(tl.float32)
+            k = tl.where(is_hot[:, None], kh, kq * ksc)
+            sc = _halve_rows(k * q[None, :], DHP) * scale                # (SP,) fp32 product, halving dot, * scale
+            if not FULL_S:
+                sc = tl.where(j < S, sc, float("-inf"))
+            m = tl.max(sc, axis=0)
+            if LSE:
+                e = _ld.exp(sc - m) if FULL_S else tl.where(j < S, _ld.exp(sc - m), 0.0)
+                res = m + _ld.log(tl.sum(_halve_rows(tl.reshape(e, (1, SP)), SP), axis=0))
+            else:
+                res = m
+            if POS:
+                qp = tl.load(QPOS + t * sq0 + b * sq1)
+                den = 2.0 * tl.load(SIG + t * ss0 + b * ss1)
+                x = tl.math.div_rn(tl.abs(qp - (cell.to(tl.float32) + 0.5) * S), den)
+                lam = tl.load(LAM + t * ls0 + b * ls1)
+                a = tl.load(CELLA + seq * ca0 + tl.minimum(cell, Mc - 1) * ca1)
+                res = res + (lam * a) * _erf_torch_tl(x)
+            tl.store(U + pid, res)
+        else:
+            tl.store(U + pid, float("-inf"))
+
+    @triton.jit
+    def _fsb_u_int8_kernel(Q, SEL, TIDX, QK, SK, HOTK, NQ, U, PT, C, Bq, Hh,
+                           sq_b, sq_h, sq_n, sshb, sshh, sh_b, sh_h, sh_n, scale, S,
+                           DH: tl.constexpr, DHP: tl.constexpr, SP: tl.constexpr,
+                           LSE: tl.constexpr, POS: tl.constexpr):
+        # _fsb_u_kernel on the int8-mode cache (same int8 * scale / hot dequantization as _fsb_upar_int8_kernel)
+        pid = tl.program_id(0)                                           # = (t' * Bq + b) * C + candidate
+        r = pid // C
+        cell = tl.load(SEL + pid)
+        if cell >= 0:
+            seq = tl.load(TIDX + r // Bq)
+            bi = seq // Hh
+            hi = seq - bi * Hh
+            d = tl.arange(0, DHP)
+            j = tl.arange(0, SP)
+            q = tl.load(Q + r * DH + d, mask=d < DH, other=0.0).to(tl.float32)          # (DHP,) fp32, zero-padded
+            tok = cell * S + j
+            nq = tl.load(NQ)
+            is_hot = tok >= nq
+            hot_i = tok - nq
+            kq = tl.load(QK + bi * sq_b + hi * sq_h + tok[:, None] * sq_n + d[None, :],
+                         mask=(j[:, None] < S) & (d[None, :] < DH), other=0).to(tl.float32)
+            ksc = tl.load(SK + bi * sshb + hi * sshh + cell).to(tl.float32)
+            kh = tl.load(HOTK + bi * sh_b + hi * sh_h + hot_i[:, None] * sh_n + d[None, :],
+                         mask=(is_hot & (j < S))[:, None] & (d[None, :] < DH), other=0.0).to(tl.float32)
+            k = tl.where(is_hot[:, None], kh, kq * ksc)
+            sc = _halve_rows(k * q[None, :], DHP) * scale                # (SP,) fp32 product, halving dot, * scale
+            sc = tl.where(j < S, sc, float("-inf"))
+            m = tl.max(sc, axis=0)
+            if LSE:
+                e = tl.where(j < S, _ld.exp(sc - m), 0.0)
+                tot = tl.sum(_halve_rows(tl.reshape(e, (1, SP)), SP), axis=0)
+                res = m + _ld.log(tot)
+            else:
+                res = m
+            if POS:
+                res = res + tl.load(PT + pid)
+            tl.store(U + pid, res)
+        else:
+            tl.store(U + pid, float("-inf"))
 
 
 def fast_beam_on() -> bool:
@@ -488,9 +663,9 @@ def rerank_scores_fast(sel: torch.Tensor, q: torch.Tensor, qpos: torch.Tensor, l
     # rerank_top's u scores (T',Bq,C), -inf on empty slots: token scores in one kernel, plus rerank_top's own
     # torch position term for lse_pos (torch's erf and division round differently from Triton's)
     from .fsb_rerank import _key4
+    from .kv_int8 import Int8Keys
     Tp, Bq, C = sel.shape
     Dh = q.shape[-1]
-    K4 = _key4(tokK)
     u = torch.empty((Tp, Bq, C), dtype=torch.float32, device=q.device)
     pt = u
     if score == "lse_pos":
@@ -499,6 +674,20 @@ def rerank_scores_fast(sel: torch.Tensor, q: torch.Tensor, qpos: torch.Tensor, l
         a = cellA.reshape(-1)[gid.reshape(-1)].view(Tp, Bq, C)
         pos_c = (sel.float() + 0.5) * s
         pt = (lam * a * torch.erf((qpos[..., None] - pos_c).abs() / (2.0 * sigv))).contiguous()
+    if isinstance(tokK, Int8Keys):
+        qk, sk, hot, nq_t = tokK.q, tokK.sc, tokK.hot, tokK.nq_t
+        Mc8 = sk.shape[2]
+        _fsb_u_int8_kernel[(Tp * Bq * C,)](q.reshape(Tp * Bq, Dh).contiguous(), sel, t_idx.contiguous(),
+                                           qk, sk, hot, nq_t, u, pt, C, Bq, qk.shape[1],
+                                           qk.stride(0), qk.stride(1), qk.stride(2),
+                                           sk.stride(0), sk.stride(1),
+                                           hot.stride(0), hot.stride(1), hot.stride(2),
+                                           float(scale), s,
+                                           DH=Dh, DHP=_pow2(Dh), SP=_pow2(s),
+                                           LSE=(score != "max"), POS=(score == "lse_pos"),
+                                           num_warps=4, enable_fp_fusion=False)
+        return u
+    K4 = _key4(tokK)
     _fsb_u_kernel[(Tp * Bq * C,)](q.reshape(Tp * Bq, Dh).contiguous(), sel, t_idx.contiguous(), K4, u, pt,
                                   C, Bq, K4.shape[1], K4.stride(0), K4.stride(1), K4.stride(2), float(scale), s,
                                   DH=Dh, DHP=_pow2(Dh), SP=_pow2(s), LSE=(score != "max"), POS=(score == "lse_pos"),
@@ -539,23 +728,40 @@ def union_rerank_fast(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
     # union deduplication and exact CUDA erff fused) one program per (row, candidate) and the stable top-K /
     # provenance in a second one -> (read cells (T',Bq,K) int64, provenance (T',Bq,K) int8 when prov else None)
     from .fsb_rerank import PROV_UTAU, _key4
+    from .kv_int8 import Int8Keys
     Tp, Bq, Ca = sel_a.shape
     Cb = 0 if sel_b is None else sel_b.shape[-1]
     C, rows, Dh, dev = Ca + Cb, Tp * Bq, q.shape[-1], q.device
     pos = score == "lse_pos"
     qv, sq0, sq1 = _row_view(qpos, Tp, Bq)
     sv, ss0, ss1 = _row_view(sigv, Tp, Bq)
-    K4 = _key4(tokK)
     lv, ls0, ls1 = _row_view(lam, Tp, Bq)
     u = torch.empty((rows, C), dtype=torch.float32, device=dev)
     sb_arg = sel_b if Cb else sel_a
     sp = _pow2(s)
-    _fsb_upar_kernel[(rows * C,)](q.reshape(rows, Dh).contiguous(), sel_a, sb_arg, t_idx.contiguous(), K4, qv, sq0, sq1,
-                                  sv, ss0, ss1, cellA, cellA.stride(0), cellA.stride(1), lv, ls0, ls1, u,
-                                  Ca, Cb, C, Bq, K4.shape[1], K4.stride(0), K4.stride(1), K4.stride(2), float(scale),
-                                  s, cellA.shape[1], DH=Dh, DHP=_pow2(Dh), SP=sp, FULL_S=(s == sp),
-                                  HAS_B=Cb > 0, LSE=(score != "max"), POS=pos,
-                                  num_warps=2, enable_fp_fusion=False)
+    if isinstance(tokK, Int8Keys):
+        qk, sk, hot, nq_t = tokK.q, tokK.sc, tokK.hot, tokK.nq_t
+        _fsb_upar_int8_kernel[(rows * C,)](q.reshape(rows, Dh).contiguous(), sel_a, sb_arg, t_idx.contiguous(),
+                                           qk, sk, hot, nq_t, qv, sq0, sq1, sv, ss0, ss1,
+                                           cellA, cellA.stride(0), cellA.stride(1), lv, ls0, ls1, u,
+                                           Ca, Cb, C, Bq, qk.shape[1],
+                                           qk.stride(0), qk.stride(1), qk.stride(2),
+                                           sk.stride(0), sk.stride(1),
+                                           hot.stride(0), hot.stride(1), hot.stride(2),
+                                           float(scale), s, sk.shape[2],
+                                           DH=Dh, DHP=_pow2(Dh), SP=sp, FULL_S=(s == sp),
+                                           HAS_B=Cb > 0, LSE=(score != "max"), POS=pos,
+                                           num_warps=2, enable_fp_fusion=False)
+    else:
+        K4 = _key4(tokK)
+        _fsb_upar_kernel[(rows * C,)](q.reshape(rows, Dh).contiguous(), sel_a, sb_arg, t_idx.contiguous(), K4,
+                                      qv, sq0, sq1, sv, ss0, ss1, cellA, cellA.stride(0), cellA.stride(1),
+                                      lv, ls0, ls1, u,
+                                      Ca, Cb, C, Bq, K4.shape[1], K4.stride(0), K4.stride(1), K4.stride(2),
+                                      float(scale), s, cellA.shape[1],
+                                      DH=Dh, DHP=_pow2(Dh), SP=sp, FULL_S=(s == sp),
+                                      HAS_B=Cb > 0, LSE=(score != "max"), POS=pos,
+                                      num_warps=2, enable_fp_fusion=False)
     out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
     pv = torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev) if prov else out
     cwp = _pow2(C)
@@ -565,11 +771,13 @@ def union_rerank_fast(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
 
 
 
-def decode_readout_ok(attn, q_t: torch.Tensor, sel, pos_t, Kp, Vp) -> bool:
-    # the fused decode readout's support envelope (callers reach it only while a decode graph is being
-    # captured); anything outside it uses the reference eager readout
+def decode_readout_ok(attn, q_t: torch.Tensor, sel, pos_t, Kp, Vp, must_capture: bool = True,
+                      ln_f32_ok: bool = False) -> bool:
+    # the fused decode readout's support envelope; anything outside it uses the reference eager readout. Capture
+    # is required on the bf16 buffers (on eager tokens their reference chain builds them once); the int8 read
+    # state is complete at every step and runs eagerly too (must_capture=False there).
     if not (_HAVE_TRITON and bool(attn._prune_cfg("fs_fused_attn", "FS_FUSED_ATTN", 0)) and q_t.is_cuda
-            and torch.cuda.is_current_stream_capturing()):
+            and (not must_capture or torch.cuda.is_current_stream_capturing())):
         return False
     if q_t.dim() != 4 or q_t.shape[2] != 1 or not torch.is_tensor(sel) or sel.dim() != 3:
         return False
@@ -587,7 +795,9 @@ def decode_readout_ok(attn, q_t: torch.Tensor, sel, pos_t, Kp, Vp) -> bool:
     dt = q_t.dtype
     if dt not in (torch.bfloat16, torch.float32) or getattr(attn, "dtype", dt) != dt:
         return False
-    if (Kp.dtype != dt or Vp.dtype != dt or attn.lr_norm.scale.dtype != dt):
+    wdt = attn.lr_norm.scale.dtype
+    if (Kp.dtype != dt or Vp.dtype != dt
+            or (wdt != dt and not (ln_f32_ok and wdt == torch.float32))):
         return False
     return _pow2(K) * _pow2(s) * _pow2(Dh) <= 16384
 
@@ -597,8 +807,47 @@ def decode_readout_fast(attn, cache, q_t: torch.Tensor, sel, pos_t, sr=None):
     # _fsb_decode_readout (full_buffer source selection) as one kernel per decode query; None when unsupported.
     # The capture check runs before anything touches the cache: on eager tokens the readout token buffers must
     # stay untouched for the reference chain to build them once.
-    if not (_HAVE_TRITON and q_t.is_cuda and torch.cuda.is_current_stream_capturing()):
-        return None
+    if getattr(cache, "use_int8", False):
+        if not (_HAVE_TRITON and q_t.is_cuda):
+            return None
+        qk, qv, sk, sv = cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf
+        khot, vhot, nq_t, s8 = cache._k_hot, cache._v_hot, cache._nq_t, cache.s
+        if not (decode_readout_ok(attn, q_t, sel, pos_t, khot, vhot, must_capture=False, ln_f32_ok=True)
+                and qk.stride(-1) == 1 and qv.stride(-1) == 1
+                and nq_t.dtype == torch.int64 and cache.s == attn.cell_stride):
+            return None
+        B, H, _, Dh = q_t.shape
+        K, s = sel.shape[-1], attn.cell_stride
+        q3 = q_t[:, :, 0, :]
+        sel2 = sel.contiguous().view(B * H, K)
+        lrs = attn.long_range_scale.view(-1)
+        has_sr = (sr is not None and sr.shape == q_t.shape and sr.dtype == q_t.dtype
+                  and sr.stride(3) == 1 and lrs.is_contiguous() and lrs.dtype in (torch.bfloat16, torch.float32))
+        if has_sr:
+            sr3 = sr[:, :, 0, :]
+            out = torch.empty(B, 1, H * Dh, device=q_t.device, dtype=q_t.dtype)
+            sob, soh = H * Dh, Dh
+            srb, srh = sr3.stride(0), sr3.stride(1)
+        else:
+            sr3 = q3
+            out = torch.empty(B, H, 1, Dh, device=q_t.device, dtype=q_t.dtype)
+            sob, soh = out.stride(0), out.stride(1)
+            srb, srh = 0, 0
+        lrs_bf16 = (q_t.dtype == torch.bfloat16) and (lrs.dtype == torch.bfloat16)
+        w_bf16 = q_t.dtype == torch.bfloat16 and attn.lr_norm.scale.dtype == torch.bfloat16
+        _fsb_decread_int8_kernel[(B * H,)](
+            q3, sel2, qk, sk, khot, qv, sv, vhot, nq_t, pos_t, attn.lr_norm.scale, sr3, lrs, out,
+            q3.stride(0), q3.stride(1),
+            qk.stride(0), qk.stride(1), qk.stride(2), sk.stride(0), sk.stride(1),
+            khot.stride(0), khot.stride(1), khot.stride(2),
+            qv.stride(0), qv.stride(1), qv.stride(2), sv.stride(0), sv.stride(1),
+            vhot.stride(0), vhot.stride(1), vhot.stride(2),
+            srb, srh, sob, soh,
+            float(attn.scale), float(attn.lr_norm.eps), H, K, s,
+            DH=Dh, DHP=_pow2(Dh), SP=_pow2(s), KK=_pow2(K),
+            HAS_SR=has_sr, LRS_BF16=lrs_bf16, W_BF16=w_bf16,
+            num_warps=8, enable_fp_fusion=False)
+        return out
     Kp, Vp = ((cache._k_buf, cache._v_buf) if getattr(cache, "_k_buf", None) is not None
               else cache.lr_tokens())
     if not decode_readout_ok(attn, q_t, sel, pos_t, Kp, Vp):

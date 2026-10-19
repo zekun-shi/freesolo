@@ -275,6 +275,110 @@ if triton is not None:
         tl.store(vw_out_p + HALF, vw2, mask=m[:, None])
 
     @triton.jit
+    def _sr_kv_rope_int8_kernel(
+        Q, K, V, QK, SK, HOTK, QV, SV, HOTV, NQ, Cos, Sin, PosT, WinIdx,
+        Qrot, KwOut, VwOut,
+        Lw, S, H: tl.constexpr, HALF: tl.constexpr,
+        sqb, sqh, skb, skh, svb, svh,
+        sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
+        sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
+        scn, ssn,
+        sqrb, sqrh, skwb, skwh, skwl, svwb, svwh, svwl,
+        BN: tl.constexpr, RND: tl.constexpr, USE_ROPE: tl.constexpr,
+    ):
+        # _sr_kv_rope_kernel on an int8-mode cache: rows below n_q (loaded from NQ) are int8 * bf16 cell scale,
+        # rows at or above it are the open cell's bf16 hot rows; the new token's row goes to the hot buffer.
+        pid_n = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh - b * H
+        cols = tl.arange(0, HALF)
+        pos_t = tl.load(PosT)
+        nq = tl.load(NQ)
+        if pid_n == 0:
+            hi_cur = pos_t - nq
+            kp = K + b * skb + h * skh + cols
+            k1 = tl.load(kp)
+            k2 = tl.load(kp + HALF)
+            kbp = HOTK + b * shkb + h * shkh + hi_cur * shkn + cols
+            tl.store(kbp, k1)
+            tl.store(kbp + HALF, k2)
+
+            vp = V + b * svb + h * svh + cols
+            v1 = tl.load(vp)
+            v2 = tl.load(vp + HALF)
+            vbp = HOTV + b * shvb + h * shvh + hi_cur * shvn + cols
+            tl.store(vbp, v1)
+            tl.store(vbp + HALF, v2)
+
+            qp = Q + b * sqb + h * sqh + cols
+            q1 = tl.load(qp).to(tl.float32)
+            q2 = tl.load(qp + HALF).to(tl.float32)
+            if USE_ROPE:
+                c = tl.load(Cos + pos_t * scn + cols).to(tl.float32)
+                s = tl.load(Sin + pos_t * ssn + cols).to(tl.float32)
+                rq1 = _rnd(_rnd(q1 * c, RND) - _rnd(q2 * s, RND), RND)
+                rq2 = _rnd(_rnd(q2 * c, RND) + _rnd(q1 * s, RND), RND)
+            else:
+                rq1, rq2 = q1, q2
+            qrp = Qrot + b * sqrb + h * sqrh + cols
+            tl.store(qrp, rq1.to(Qrot.dtype.element_ty))
+            tl.store(qrp + HALF, rq2.to(Qrot.dtype.element_ty))
+
+        rows = pid_n * BN + tl.arange(0, BN)
+        m = rows < Lw
+        w_idx = tl.load(WinIdx + rows, mask=m, other=0)
+        is_cur = (w_idx == pos_t)[:, None]
+        is_hot = (w_idx >= nq)[:, None]
+        hot_i = (w_idx - nq)[:, None]
+        cell = w_idx // S
+
+        kq1 = tl.load(QK + b * sqkb + h * sqkh + w_idx[:, None] * sqkn + cols[None, :],
+                      mask=m[:, None], other=0).to(tl.float32)
+        kq2 = tl.load(QK + b * sqkb + h * sqkh + w_idx[:, None] * sqkn + HALF + cols[None, :],
+                      mask=m[:, None], other=0).to(tl.float32)
+        ksc = tl.load(SK + b * sskb + h * sskh + cell, mask=m, other=0.0).to(tl.float32)[:, None]
+        kh1 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + cols[None, :],
+                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+        kh2 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + HALF + cols[None, :],
+                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+        kp0 = K + b * skb + h * skh + cols[None, :]
+        k1_cur = tl.load(kp0).to(tl.float32)
+        k2_cur = tl.load(kp0 + HALF).to(tl.float32)
+        kw1 = tl.where(is_cur, k1_cur, tl.where(is_hot, kh1, kq1 * ksc))
+        kw2 = tl.where(is_cur, k2_cur, tl.where(is_hot, kh2, kq2 * ksc))
+
+        if USE_ROPE:
+            r_idx = (pos_t - (Lw - 1)) + rows
+            c = tl.load(Cos + r_idx[:, None] * scn + cols[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+            s = tl.load(Sin + r_idx[:, None] * ssn + cols[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+            rkw1 = _rnd(_rnd(kw1 * c, RND) - _rnd(kw2 * s, RND), RND)
+            rkw2 = _rnd(_rnd(kw2 * c, RND) + _rnd(kw1 * s, RND), RND)
+        else:
+            rkw1, rkw2 = kw1, kw2
+        kw_out_p = KwOut + b * skwb + h * skwh + rows[:, None] * skwl + cols[None, :]
+        tl.store(kw_out_p, rkw1.to(KwOut.dtype.element_ty), mask=m[:, None])
+        tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=m[:, None])
+
+        vq1 = tl.load(QV + b * sqvb + h * sqvh + w_idx[:, None] * sqvn + cols[None, :],
+                      mask=m[:, None], other=0).to(tl.float32)
+        vq2 = tl.load(QV + b * sqvb + h * sqvh + w_idx[:, None] * sqvn + HALF + cols[None, :],
+                      mask=m[:, None], other=0).to(tl.float32)
+        vsc = tl.load(SV + b * ssvb + h * ssvh + cell, mask=m, other=0.0).to(tl.float32)[:, None]
+        vh1 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + cols[None, :],
+                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+        vh2 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + HALF + cols[None, :],
+                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+        vp0 = V + b * svb + h * svh + cols[None, :]
+        v1_cur = tl.load(vp0).to(tl.float32)
+        v2_cur = tl.load(vp0 + HALF).to(tl.float32)
+        vw1 = tl.where(is_cur, v1_cur, tl.where(is_hot, vh1, vq1 * vsc))
+        vw2 = tl.where(is_cur, v2_cur, tl.where(is_hot, vh2, vq2 * vsc))
+        vw_out_p = VwOut + b * svwb + h * svwh + rows[:, None] * svwl + cols[None, :]
+        tl.store(vw_out_p, vw1.to(VwOut.dtype.element_ty), mask=m[:, None])
+        tl.store(vw_out_p + HALF, vw2.to(VwOut.dtype.element_ty), mask=m[:, None])
+
+    @triton.jit
     def _sr_softmax_cast_kernel(
         Scores, PosT, WinPos, Sigma, WOut,
         scale, W_win, Lw,
@@ -971,6 +1075,82 @@ def sr_decode_fused(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, kbuf: tor
     return torch.einsum("bhl,bhld->bhd", w, Vw).unsqueeze(2)
 
 
+def sr_decode_int8_ok(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: torch.Tensor, sk: torch.Tensor,
+                      hotk: torch.Tensor, qv: torch.Tensor, sv: torch.Tensor, hotv: torch.Tensor,
+                      nq_t: torch.Tensor, win_idx: torch.Tensor, win_pos: torch.Tensor, cos=None) -> bool:
+    if (compiling() or not available() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
+            or os.environ.get("FSL_SR_DECODE_FUSED", "1") == "0"
+            or torch.is_grad_enabled() or not Q.is_cuda):
+        return False
+    B, H, N, D = Q.shape
+    Lw = win_idx.numel()
+    half = D // 2
+    if not (N == 1 and B * H > 0 and 1 <= Lw <= 1024 and D % 2 == 0 and half >= 16 and (half & (half - 1)) == 0):
+        return False
+    if not (Q.stride(-1) == 1 and K.stride(-1) == 1 and V.stride(-1) == 1
+            and qk.stride(-1) == 1 and hotk.stride(-1) == 1 and qv.stride(-1) == 1 and hotv.stride(-1) == 1
+            and win_idx.is_contiguous() and win_pos.is_contiguous()):
+        return False
+    if cos is not None:
+        ct = torch.promote_types(Q.dtype, cos.dtype)
+        if not (cos.dim() == 2 and cos.shape[1] >= half and cos.stride(-1) == 1 and ct in _RND):
+            return False
+    return (Q.dtype in _RND and qk.dtype == torch.int8 and sk.dtype == torch.bfloat16
+            and hotk.dtype == Q.dtype and qv.dtype == torch.int8 and sv.dtype == torch.bfloat16
+            and hotv.dtype == V.dtype and nq_t.dtype == torch.int64)
+
+
+def sr_decode_fused_int8(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: torch.Tensor, sk: torch.Tensor,
+                         hotk: torch.Tensor, qv: torch.Tensor, sv: torch.Tensor, hotv: torch.Tensor,
+                         nq_t: torch.Tensor, s: int, pos_t: torch.Tensor, win_idx: torch.Tensor,
+                         win_pos: torch.Tensor, sigma: torch.Tensor, scale: float, window_size: int,
+                         fs_uniform_sr: bool, use_rope: bool, cos: torch.Tensor | None = None,
+                         sin: torch.Tensor | None = None) -> torch.Tensor:
+    """sr_decode_fused on an int8-mode cache (bit-exact window math modulo the int8 cell dequantization)."""
+    B, H, _, D = Q.shape
+    Lw = win_idx.shape[0]
+    dt_mm = autocast_dtype() or (torch.promote_types(Q.dtype, cos.dtype) if (use_rope and cos is not None) else Q.dtype)
+    ct = torch.promote_types(Q.dtype, cos.dtype) if (use_rope and cos is not None) else Q.dtype
+    Qrot = torch.empty(B, H, D, device=Q.device, dtype=dt_mm)
+    Kw = torch.empty(B, H, Lw, D, device=Q.device, dtype=dt_mm)
+    Vw = torch.empty(B, H, Lw, D, device=Q.device, dtype=V.dtype)
+    cos_t = cos if (use_rope and cos is not None) else Q
+    sin_t = sin if (use_rope and sin is not None) else Q
+    scn = cos_t.stride(0) if (use_rope and cos is not None) else 0
+    ssn = sin_t.stride(0) if (use_rope and sin is not None) else 0
+    BN = 64
+    grid = (triton.cdiv(Lw, BN), B * H)
+    _sr_kv_rope_int8_kernel[grid](
+        Q, K, V, qk, sk, hotk, qv, sv, hotv, nq_t, cos_t, sin_t, pos_t, win_idx,
+        Qrot, Kw, Vw,
+        Lw, s, H=H, HALF=D // 2,
+        sqb=Q.stride(0), sqh=Q.stride(1), skb=K.stride(0), skh=K.stride(1), svb=V.stride(0), svh=V.stride(1),
+        sqkb=qk.stride(0), sqkh=qk.stride(1), sqkn=qk.stride(2),
+        sskb=sk.stride(0), sskh=sk.stride(1),
+        shkb=hotk.stride(0), shkh=hotk.stride(1), shkn=hotk.stride(2),
+        sqvb=qv.stride(0), sqvh=qv.stride(1), sqvn=qv.stride(2),
+        ssvb=sv.stride(0), ssvh=sv.stride(1),
+        shvb=hotv.stride(0), shvh=hotv.stride(1), shvn=hotv.stride(2),
+        scn=scn, ssn=ssn,
+        sqrb=Qrot.stride(0), sqrh=Qrot.stride(1),
+        skwb=Kw.stride(0), skwh=Kw.stride(1), skwl=Kw.stride(2),
+        svwb=Vw.stride(0), svwh=Vw.stride(1), svwl=Vw.stride(2),
+        BN=BN, RND=_RND[ct], USE_ROPE=bool(use_rope),
+        num_warps=4, enable_fp_fusion=False,
+    )
+    scores = torch.einsum("bhd,bhld->bhl", Qrot, Kw)
+    w = torch.empty(B, H, Lw, device=Q.device, dtype=Vw.dtype)
+    log2_l = max(5, (Lw - 1).bit_length())
+    valid_it = triton.cdiv(Lw, 32)
+    _sr_softmax_cast_kernel[(B * H,)](
+        scores, pos_t, win_pos, sigma, w,
+        float(scale), int(window_size), Lw,
+        H=H, UNIFORM=bool(fs_uniform_sr), LOG2_L=log2_l, VALID_IT=valid_it,
+        num_warps=2 if fs_uniform_sr else 4, enable_fp_fusion=False,
+    )
+    return torch.einsum("bhl,bhld->bhd", w, Vw).unsqueeze(2)
+
+
 def fsl_pool_refresh_ok(Kbar_all: torch.Tensor, ceil_all: torch.Tensor, M_vis: int, Pk: int, Wc: int, D: int) -> bool:
     if (compiling() or not available() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
             or os.environ.get("FSL_POOL_REFRESH_FUSED", "1") == "0"
@@ -1188,3 +1368,457 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
     return out
 
 
+
+
+def _int8_state_ok(q_t, st):
+    qk, qv, sk, sv, khot, vhot, nq_t, s = st
+    return (qk.stride(-1) == 1 and qv.stride(-1) == 1 and khot.stride(-1) == 1 and vhot.stride(-1) == 1
+            and nq_t.dtype == torch.int64 and nq_t.dim() == 0 and khot.dtype == q_t.dtype
+            and vhot.dtype == q_t.dtype and q_t.dtype in _RND)
+
+
+@torch.no_grad()
+def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, pos_t: torch.Tensor,
+                 sigma: torch.Tensor, st):
+    """fsl_lr_decode_combine on the int8 long-range KV state st=(qk, qv, sk, sv, khot, vhot, nq_t, s):
+    the K / V gather reads idx < n_q as int8 * bf16 cell scale rounded to bf16 (the same values the
+    bf16 kernel sees on the materialized cache), idx >= n_q as the bf16 hot rows; every other value is
+    computed by the identical operations, so selection statistics and all roundings match. None when
+    the support envelope of the fused kernels is exceeded (the caller's reference path then applies)."""
+    if (compiling() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
+            or os.environ.get("FSL_LR_DECODE_FUSED", "1") == "0" or torch.is_grad_enabled()
+            or not q_t.is_cuda or getattr(attn, "sel_content_only", False) or pool.get("empty", False)):
+        return None
+    B, H, N, D = q_t.shape
+    C = int(pool.get("C", 0))
+    M_vis = int(pool.get("M_vis", 0))
+    k_sel = min(max(1, int(attn.cell_topk)), M_vis, C)
+    s = int(attn.cell_stride)
+    qk, qv, skt, svt, khot, vhot, nq_t, s8 = st
+    if not (N == 1 and B * H > 0 and D == 64 and 1 <= k_sel <= 16 and s in (16, 32, 64) and s8 == s
+            and out_short.shape == q_t.shape and q_t.stride(-1) == 1 and out_short.stride(-1) == 1
+            and _int8_state_ok(q_t, st)
+            and attn.lr_norm.scale.is_contiguous() and attn.long_range_scale.is_contiguous()
+            and attn.sel_scale.is_contiguous() and sigma.is_contiguous()):
+        return None
+    if pool.get("dense", False):
+        part_s = pool.get("part_s"); part_c = pool.get("part_c"); m_vis_t = pool.get("m_vis_t")
+        Kbar_all = pool.get("Kbar_all"); ceil_all = pool.get("ceil_all")
+        if not (part_s is not None and part_c is not None and m_vis_t is not None and C >= 1
+                and Kbar_all is not None and ceil_all is not None
+                and part_s.dtype == torch.float32 and part_c.dtype == torch.int32
+                and m_vis_t.dtype == torch.int32 and part_s.is_contiguous() and part_c.is_contiguous()
+                and Kbar_all.dtype == torch.float32 and ceil_all.dtype == torch.float32
+                and Kbar_all.stride(-1) == 1 and ceil_all.stride(-1) == 1):
+            return None
+        is_dense = True
+    else:
+        Kbar_cand = pool["Kbar_cand"]; ceil_cand = pool["ceil_cand"]; cen_cand = pool["cen_cand"]
+        ok_cell = pool["ok_cell"]; cand_c = pool["cand_c"]
+        if not (1 <= C <= 128 and cand_c is not None
+                and Kbar_cand.dtype == torch.float32 and ceil_cand.dtype == torch.float32
+                and cen_cand.dtype == torch.float32 and ok_cell.dtype == torch.bool
+                and cand_c.dtype in (torch.int64, torch.int32)
+                and Kbar_cand.stride(-1) == 1 and ceil_cand.stride(-1) == 1 and cen_cand.stride(-1) == 1
+                and ok_cell.stride(-1) == 1 and cand_c.stride(-1) == 1):
+            return None
+        is_dense = False
+    w_norm = attn.lr_norm.scale
+    lrs = attn.long_range_scale.view(-1)
+    w_bf16 = (q_t.dtype == torch.bfloat16) and (w_norm.dtype == torch.bfloat16)
+    lrs_bf16 = (q_t.dtype == torch.bfloat16) and (lrs.dtype == torch.bfloat16)
+    adt = autocast_dtype()
+    autocast_bf16 = bool(adt == torch.bfloat16)
+    norm_fp32 = bool(torch.is_autocast_enabled() or q_t.dtype == torch.float32
+                     or w_norm.dtype == torch.float32)
+    out_dt = adt or (
+        torch.float32 if norm_fp32 else torch.promote_types(
+            out_short.dtype, torch.promote_types(lrs.dtype, torch.promote_types(q_t.dtype, w_norm.dtype))
+        )
+    )
+    out = torch.empty((B, 1, H * D), device=q_t.device, dtype=out_dt)
+    block_s = max(16, triton.next_power_of_2(s))
+    if is_dense:
+        k_sel = min(max(1, int(attn.cell_topk)), 16)          # the dense selection's own width,
+        split_m = 16                                           # as in fsl_lr_decode_combine
+        block_c = max(16, triton.next_power_of_2(triton.cdiv(C, split_m)))
+        block_p = max(16, triton.next_power_of_2(split_m * k_sel))
+        used_cuda = False
+        if autocast_bf16:
+            from ..fsattn.fsl_select_cuda import fsl_dense_decode_topk
+            used_cuda = fsl_dense_decode_topk(
+                q_t, Kbar_all, ceil_all, pos_t, m_vis_t, attn.sel_scale.view(-1), sigma.view(-1),
+                part_s, part_c, float(attn.scale), C, s, k_sel, split_m, block_c,
+            )
+        if not used_cuda:
+            _fs_dense_decode_topk_split_kernel[(B * H, split_m)](
+                q_t[:, :, 0, :], Kbar_all, ceil_all, pos_t, m_vis_t, attn.sel_scale, sigma,
+                part_s, part_c,
+                q_t.stride(0), q_t.stride(1),
+                Kbar_all.stride(0), Kbar_all.stride(1), Kbar_all.stride(2),
+                ceil_all.stride(0), ceil_all.stride(1),
+                float(attn.scale), C,
+                H=H, D=D, CELL_SIZE=s, K_SELECT=k_sel, SPLIT_M=split_m, BLOCK_C=block_c,
+                AUTOCAST_BF16=autocast_bf16,
+                num_warps=2 if block_c <= 64 else 4, num_stages=2, enable_fp_fusion=False,
+            )
+        _fsd_comb_int8_kernel[(B * H,)](
+            q_t[:, :, 0, :], part_s, part_c, pos_t, m_vis_t,
+            qk, skt, khot, qv, svt, vhot, nq_t,
+            out_short[:, :, 0, :], w_norm, lrs, out,
+            q_t.stride(0), q_t.stride(1),
+            qk.stride(0), qk.stride(1), qk.stride(2), skt.stride(0), skt.stride(1),
+            khot.stride(0), khot.stride(1), khot.stride(2),
+            qv.stride(0), qv.stride(1), qv.stride(2), svt.stride(0), svt.stride(1),
+            vhot.stride(0), vhot.stride(1), vhot.stride(2),
+            out_short.stride(0), out_short.stride(1),
+            float(attn.lr_norm.eps), qk.shape[2] // s + 1,
+            H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block),
+            K_SELECT=k_sel, BLOCK_P=block_p, BLOCK_D=64, BLOCK_S=block_s,
+            NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16,
+            num_warps=4, num_stages=2, enable_fp_fusion=False,
+        )
+        return out
+    Kbar_cand = pool["Kbar_cand"]
+    Kbar_cand_t = pool.get("Kbar_cand_t")
+    if (Kbar_cand_t is not None and tuple(Kbar_cand_t.shape) == (B, H, D, C)
+            and Kbar_cand_t.dtype == torch.float32 and Kbar_cand_t.is_contiguous()):
+        kb_src = Kbar_cand_t
+        skbc, skbd = 1, Kbar_cand_t.stride(2)
+    else:
+        kb_src = Kbar_cand
+        skbc, skbd = Kbar_cand.stride(2), 1
+    block_c = max(16, triton.next_power_of_2(C))
+    _lrc_comb_int8_kernel[(B * H,)](
+        q_t[:, :, 0, :], kb_src, pool["ceil_cand"], pool["cen_cand"], pool["ok_cell"], pool["cand_c"],
+        pos_t, attn.sel_scale, sigma,
+        qk, skt, khot, qv, svt, vhot, nq_t,
+        out_short[:, :, 0, :], w_norm, lrs, out,
+        q_t.stride(0), q_t.stride(1),
+        kb_src.stride(0), kb_src.stride(1), skbc, skbd,
+        pool["ceil_cand"].stride(0), pool["ceil_cand"].stride(1),
+        qk.stride(0), qk.stride(1), qk.stride(2), skt.stride(0), skt.stride(1),
+        khot.stride(0), khot.stride(1), khot.stride(2),
+        qv.stride(0), qv.stride(1), qv.stride(2), svt.stride(0), svt.stride(1),
+        vhot.stride(0), vhot.stride(1), vhot.stride(2),
+        out_short.stride(0), out_short.stride(1),
+        float(attn.scale), float(attn.lr_norm.eps), C, qk.shape[2] // s + 1,
+        H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block),
+        K_SELECT=k_sel, BLOCK_C=block_c, BLOCK_D=64, BLOCK_S=block_s,
+        NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16,
+        AUTOCAST_BF16=autocast_bf16,
+        num_warps=4, num_stages=2, enable_fp_fusion=False,
+    )
+    return out
+
+
+if triton is not None:
+
+    @triton.jit
+    def _int8_cell_read(Q8, SC, HOTT, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+                        sqb, sqh, sqn, sscb, ssch, shb, shh, shn, safe_cell, cell_ok):
+        # one selected-cell tile of keys or values from the int8 state: rows below n_q dequantized
+        # int8 * cell scale and rounded to bf16 (the materialized-cache value); hot rows read bf16
+        nq8 = tl.load(NQT)
+        q8 = tl.load(Q8 + b * sqb + h * sqh + tok[:, None] * sqn + offs_d[None, :],
+                     mask=row8[:, None] & d_mask[None, :], other=0)
+        tsc = tl.load(SC + b * sscb + h * ssch + safe_cell, mask=cell_ok, other=0.0).to(tl.float32)
+        th = tl.load(HOTT + b * shb + h * shh + (tok - nq8)[:, None] * shn + offs_d[None, :],
+                     mask=rowh[:, None] & d_mask[None, :], other=0.0)
+        tq = (q8.to(tl.float32) * tsc).to(HOTT.dtype.element_ty)
+        return tl.where(tok[:, None] < nq8, tq, th)
+
+    @triton.jit
+    def _lrc_comb_int8_kernel(
+        Q, KBAR, CEIL, CEN, OK, CAND, POS, LAM, SIG,
+        QK, SKC, HOTK, QV, SVC, HOTV, NQT,
+        SR, W_NORM, LRS, O,
+        sqb, sqh, skbb, skbh, skbc, skbd, scb, sch,
+        sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
+        sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
+        srb, srh,
+        sc, eps, C, NCAP,
+        H: tl.constexpr, D: tl.constexpr, SCALE: tl.constexpr,
+        CELL_SIZE: tl.constexpr, QUERY_BLOCK: tl.constexpr, K_SELECT: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
+        NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
+        AUTOCAST_BF16: tl.constexpr,
+    ):
+        # _fsl_lr_decode_combine_kernel with the K / V tile reads on the int8 cache state
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh - b * H
+        c = tl.arange(0, BLOCK_C)
+        cmask = c < C
+
+        q_base = Q + b * sqb + h * sqh
+        kb_base = KBAR + b * skbb + h * skbh + c * skbc
+
+        if AUTOCAST_BF16:
+            dot = tl.zeros((BLOCK_C,), dtype=tl.float32)
+            for tx in tl.static_range(0, 16):
+                q0 = tl.load(q_base + (0 + tx)).to(tl.bfloat16).to(tl.float32)
+                q1 = tl.load(q_base + (16 + tx)).to(tl.bfloat16).to(tl.float32)
+                q2 = tl.load(q_base + (32 + tx)).to(tl.bfloat16).to(tl.float32)
+                q3 = tl.load(q_base + (48 + tx)).to(tl.bfloat16).to(tl.float32)
+
+                k0 = tl.load(kb_base + (0 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k1 = tl.load(kb_base + (16 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k2 = tl.load(kb_base + (32 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+                k3 = tl.load(kb_base + (48 + tx) * skbd, mask=cmask, other=0.0).to(tl.bfloat16).to(tl.float32)
+
+                t_tx = (((q0 * k0) + (q1 * k1)) + (q2 * k2)) + (q3 * k3)
+                dot = dot + t_tx
+            content = (dot.to(tl.bfloat16) * sc.to(tl.bfloat16)).to(tl.float32)
+        else:
+            acc0 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+            acc1 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+            acc2 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+            acc3 = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+            for i in tl.static_range(0, 16):
+                q0 = tl.load(q_base + (4 * i + 0)).to(tl.float32)
+                q1 = tl.load(q_base + (4 * i + 1)).to(tl.float32)
+                q2 = tl.load(q_base + (4 * i + 2)).to(tl.float32)
+                q3 = tl.load(q_base + (4 * i + 3)).to(tl.float32)
+
+                k0 = tl.load(kb_base + (4 * i + 0) * skbd, mask=cmask, other=0.0).to(tl.float32)
+                k1 = tl.load(kb_base + (4 * i + 1) * skbd, mask=cmask, other=0.0).to(tl.float32)
+                k2 = tl.load(kb_base + (4 * i + 2) * skbd, mask=cmask, other=0.0).to(tl.float32)
+                k3 = tl.load(kb_base + (4 * i + 3) * skbd, mask=cmask, other=0.0).to(tl.float32)
+
+                acc0 = tl.math.fma(q0, k0, acc0)
+                acc1 = tl.math.fma(q1, k1, acc1)
+                acc2 = tl.math.fma(q2, k2, acc2)
+                acc3 = tl.math.fma(q3, k3, acc3)
+
+            dot = (acc0 + acc2) + (acc1 + acc3)
+            content = dot * sc
+
+        q_pos = tl.load(POS)
+        pos_f = q_pos.to(tl.float32)
+        cen = tl.load(CEN + b * scb + h * sch + c, mask=cmask, other=0.0).to(tl.float32)
+        ceil_v = tl.load(CEIL + b * scb + h * sch + c, mask=cmask, other=0.0).to(tl.float32)
+        ok = tl.load(OK + b * scb + h * sch + c, mask=cmask, other=False).to(tl.int1)
+        cand = tl.load(CAND + b * scb + h * sch + c, mask=cmask, other=0).to(tl.int32)
+
+        lam = tl.load(LAM + h).to(tl.float32)
+        sig = tl.load(SIG + h).to(tl.float32)
+
+        dist = tl.abs(pos_f - cen)
+        erf_v = _libdevice.erf(dist / (2.0 * sig))
+        score = content + (lam * ceil_v) * erf_v
+        score = tl.where(ok & cmask, score, -1e9)
+        score = tl.where(cmask, score, -float("inf"))
+
+        offs_d = tl.arange(0, BLOCK_D)
+        d_mask = offs_d < D
+        q = tl.load(q_base + offs_d, mask=d_mask, other=0.0)
+
+        block_start = (q_pos // QUERY_BLOCK) * QUERY_BLOCK
+        n_cells_cap = NCAP
+        offs_s = tl.arange(0, BLOCK_S)
+
+        m_i = tl.full((1,), -float("inf"), tl.float32)
+        l_i = tl.zeros((1,), tl.float32)
+        acc = tl.zeros((BLOCK_D,), tl.float32)
+        seen_cells = tl.full((BLOCK_C,), -2, dtype=tl.int32)
+
+        nq8 = tl.load(NQT)
+        for slot in tl.static_range(0, K_SELECT):
+            max_s = tl.max(score, axis=0)
+            is_max = (score == max_s) & cmask
+            best_c = tl.min(tl.where(is_max, c, BLOCK_C), axis=0)
+            picked_ok = tl.sum(tl.where(c == best_c, ok.to(tl.int32), 0), axis=0) != 0
+            picked_cell = tl.sum(tl.where(c == best_c, cand, 0), axis=0)
+            cell = tl.where(picked_ok, picked_cell, -1)
+            score = tl.where(c == best_c, -float("inf"), score)
+
+            cell_ok = (
+                (cell >= 0)
+                & (cell < n_cells_cap)
+                & ((cell + 1) * CELL_SIZE <= block_start)
+            )
+            dup_cell = tl.sum(tl.where((c < slot) & (seen_cells == cell), 1, 0), axis=0) != 0
+            cell_ok = cell_ok & (~dup_cell)
+            seen_cells = tl.where(c == slot, tl.where(cell_ok, cell, -2), seen_cells)
+
+            safe_cell = tl.maximum(cell, 0)
+            tok = safe_cell * CELL_SIZE + offs_s
+            tok_ok = (
+                cell_ok
+                & (offs_s < CELL_SIZE)
+                & (tok < q_pos)
+            )
+
+            in8 = tok < nq8
+            row8 = tok_ok & (tok < nq8)
+            rowh = tok_ok & (tok >= nq8)
+            kval = _int8_cell_read(QK, SKC, HOTK, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+                                   sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn, safe_cell, cell_ok)
+            scores = tl.sum(kval.to(tl.float32) * q[None, :], axis=1) * SCALE
+            scores = tl.where(tok_ok, scores, -float("inf"))
+
+            has_token = tl.sum(tok_ok.to(tl.int32), axis=0) > 0
+            tile_m = tl.max(scores, axis=0)
+            m_new = tl.where(has_token, tl.maximum(m_i, tile_m), m_i)
+            alpha = tl.where(has_token, tl.exp(m_i - m_new), 1.0)
+            p = tl.where(tok_ok, tl.exp(scores - m_new), 0.0)
+
+            vval = _int8_cell_read(QV, SVC, HOTV, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+                                   sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn, safe_cell, cell_ok)
+            acc_new = acc * alpha + tl.sum(p[:, None].to(vval.dtype) * vval, axis=0).to(tl.float32)
+            l_new = l_i * alpha + tl.sum(p, axis=0)
+
+            acc = tl.where(has_token, acc_new, acc)
+            l_i = tl.where(has_token, l_new, l_i)
+            m_i = m_new
+
+        row_ok = l_i > 0.0
+        out = tl.where(row_ok, acc / l_i, 0.0).to(Q.dtype.element_ty)
+
+        xf = out.to(tl.float32)
+        wq = tl.load(W_NORM + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        lrs = tl.load(LRS + h).to(tl.float32)
+        if NORM_FP32:
+            sq = xf * xf
+            ms = tl.sum(sq, axis=0) * (1.0 / D)
+            rms = tl.math.rsqrt(ms + eps)
+            out_long = (xf * rms) * wq
+            y = (sr + lrs * out_long).to(O.dtype.element_ty)
+        else:
+            sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)
+            ms = (tl.sum(sq, axis=0) * (1.0 / D)).to(Q.dtype.element_ty).to(tl.float32)
+            rms = tl.math.rsqrt((ms + eps).to(Q.dtype.element_ty).to(tl.float32)).to(Q.dtype.element_ty).to(tl.float32)
+            if W_BF16:
+                out_long = ((xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq).to(Q.dtype.element_ty).to(tl.float32)
+            else:
+                out_long = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
+            if W_BF16 and LRS_BF16:
+                scaled_lr = (lrs * out_long).to(Q.dtype.element_ty).to(tl.float32)
+                y = (sr + scaled_lr).to(O.dtype.element_ty)
+            else:
+                scaled_lr = lrs * out_long
+                y = (sr + scaled_lr).to(O.dtype.element_ty)
+
+        tl.store(O + b * (H * D) + h * D + offs_d, y, mask=d_mask)
+
+    @triton.jit
+    def _fsd_comb_int8_kernel(
+        Q, PART_S, PART_C, POS, M_VIS_PTR,
+        QK, SKC, HOTK, QV, SVC, HOTV, NQT,
+        SR, W_NORM, LRS, O,
+        sqb, sqh,
+        sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
+        sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
+        srb, srh,
+        eps, NCAP,
+        H: tl.constexpr, D: tl.constexpr, SCALE: tl.constexpr,
+        CELL_SIZE: tl.constexpr, QUERY_BLOCK: tl.constexpr,
+        K_SELECT: tl.constexpr, BLOCK_P: tl.constexpr,
+        BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
+        NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
+    ):
+        # _fs_dense_decode_readout_combine_kernel with the K / V tile reads on the int8 cache state
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh - b * H
+        idx = tl.arange(0, BLOCK_P)
+        score = tl.load(PART_S + bh * BLOCK_P + idx)
+        cand = tl.load(PART_C + bh * BLOCK_P + idx)
+        cmask = cand >= 0
+        score = tl.where(cmask, score, -float("inf"))
+
+        q_pos = tl.load(POS)
+        m_vis = tl.load(M_VIS_PTR).to(tl.int32)
+        nq8 = tl.load(NQT)
+        q_base = Q + b * sqb + h * sqh
+        offs_d = tl.arange(0, BLOCK_D)
+        d_mask = offs_d < D
+        q = tl.load(q_base + offs_d, mask=d_mask, other=0.0)
+
+        block_start = (q_pos // QUERY_BLOCK) * QUERY_BLOCK
+        n_cells_cap = NCAP
+        offs_s = tl.arange(0, BLOCK_S)
+
+        m_i = tl.full((1,), -float("inf"), tl.float32)
+        l_i = tl.zeros((1,), tl.float32)
+        acc = tl.zeros((BLOCK_D,), tl.float32)
+
+        for slot in tl.static_range(0, K_SELECT):
+            max_s = tl.max(score, axis=0)
+            has_valid = (max_s > -float("inf")) & (slot < m_vis)
+            is_max = (score == max_s) & cmask & has_valid
+            best_idx = tl.min(tl.where(is_max, idx, BLOCK_P), axis=0)
+            picked_ok = best_idx < BLOCK_P
+            picked_cell = tl.sum(tl.where(idx == best_idx, cand, 0), axis=0)
+            cell = tl.where(picked_ok, picked_cell, -1)
+            score = tl.where(idx == best_idx, -float("inf"), score)
+            cmask = cmask & (idx != best_idx)
+
+            cell_ok = (
+                (cell >= 0)
+                & (cell < m_vis)
+                & (cell < n_cells_cap)
+                & ((cell + 1) * CELL_SIZE <= block_start)
+            )
+            safe_cell = tl.maximum(cell, 0)
+            tok = safe_cell * CELL_SIZE + offs_s
+            tok_ok = (
+                cell_ok
+                & (offs_s < CELL_SIZE)
+                & (tok < q_pos)
+            )
+
+            row8 = tok_ok & (tok < nq8)
+            rowh = tok_ok & (tok >= nq8)
+            kval = _int8_cell_read(QK, SKC, HOTK, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+                                   sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn, safe_cell, cell_ok)
+            scores = tl.sum(kval.to(tl.float32) * q[None, :], axis=1) * SCALE
+            scores = tl.where(tok_ok, scores, -float("inf"))
+
+            has_token = tl.sum(tok_ok.to(tl.int32), axis=0) > 0
+            tile_m = tl.max(scores, axis=0)
+            m_new = tl.where(has_token, tl.maximum(m_i, tile_m), m_i)
+            alpha = tl.where(has_token, tl.exp(m_i - m_new), 1.0)
+            p = tl.where(tok_ok, tl.exp(scores - m_new), 0.0)
+
+            vval = _int8_cell_read(QV, SVC, HOTV, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+                                   sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn, safe_cell, cell_ok)
+            acc_new = acc * alpha + tl.sum(p[:, None].to(vval.dtype) * vval, axis=0).to(tl.float32)
+            l_new = l_i * alpha + tl.sum(p, axis=0)
+
+            acc = tl.where(has_token, acc_new, acc)
+            l_i = tl.where(has_token, l_new, l_i)
+            m_i = m_new
+
+        row_ok = l_i > 0.0
+        out = tl.where(row_ok, acc / l_i, 0.0).to(Q.dtype.element_ty)
+
+        xf = out.to(tl.float32)
+        wq = tl.load(W_NORM + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        lrs = tl.load(LRS + h).to(tl.float32)
+        if NORM_FP32:
+            sq = xf * xf
+            ms = tl.sum(sq, axis=0) * (1.0 / D)
+            rms = tl.math.rsqrt(ms + eps)
+            out_long = (xf * rms) * wq
+            y = (sr + lrs * out_long).to(O.dtype.element_ty)
+        else:
+            sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)
+            ms = (tl.sum(sq, axis=0) * (1.0 / D)).to(Q.dtype.element_ty).to(tl.float32)
+            rms = tl.math.rsqrt((ms + eps).to(Q.dtype.element_ty).to(tl.float32)).to(Q.dtype.element_ty).to(tl.float32)
+            if W_BF16:
+                out_long = ((xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq).to(Q.dtype.element_ty).to(tl.float32)
+            else:
+                out_long = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
+            if W_BF16 and LRS_BF16:
+                scaled_lr = (lrs * out_long).to(Q.dtype.element_ty).to(tl.float32)
+                y = (sr + scaled_lr).to(O.dtype.element_ty)
+            else:
+                scaled_lr = lrs * out_long
+                y = (sr + scaled_lr).to(O.dtype.element_ty)
+
+        tl.store(O + b * (H * D) + h * D + offs_d, y, mask=d_mask)
