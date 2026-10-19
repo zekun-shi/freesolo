@@ -162,7 +162,7 @@ def bench_prefill(m, L, trunk, n_med=3, warm=8):
     tail = [None]
 
     def one(save_tail=False):
-        cache = make_caches(m)
+        cache = make_caches(m, retain_kv=False)
         with torch.amp.autocast("cuda", dtype=DT):
             h = trunk(m, x, cache)
             if save_tail:
@@ -194,7 +194,7 @@ def bench_prefill_graph(m, L, n_med=3, warm=8, ref_logits=None):
     torch.manual_seed(1234 + L)
     x = torch.randint(0, m.vocab_size, (1, L), device="cuda")
     _reset_mem()
-    gp = GraphedPrefiller(m, L, B=1, device="cuda", dtype=DT, tail_tokens=min(64, L))
+    gp = GraphedPrefiller(m, L, B=1, device="cuda", dtype=DT, tail_tokens=min(64, L), retain_kv=False)
     try:
         gp.capture(x)
         for _ in range(warm):

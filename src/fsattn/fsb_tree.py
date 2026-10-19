@@ -1219,7 +1219,7 @@ def traverse_forest(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, lam:
     if union_quota > 0:
         assert union_width > 0 and read_top > 0 and sel_unew is not None and rr_w is None and not mkw, \
             "fsb_union_quota needs a union beam and read_top, no re-ranker and no read margin (refused at construction)"
-        rqq = q if rq is None else rq
+        rqq = (q if rq is None else rq).float()
         tabs = (F["cellK"], F["cellA"], SP["t_idx"])
         Tu = rerank_top(sel_unew, rqq, qpos, lam, sigv, *tabs, scale, s, read_top, score=rerank_score, tokK=tokK,
                         **({"prior_scale": pskw["prior_scale"][..., Cm:]} if pskw else {}))
@@ -1227,7 +1227,7 @@ def traverse_forest(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, lam:
         ures, urem = Tu[..., :union_quota], Tu[..., union_quota:]
         uqkw = {"tree_rank": union_quota_list(ures, Tm, urem)}
     if hybrid != "off":
-        sel = hybrid_select(sel, pool, q if rq is None else rq, qpos, lam, sigv, F, SP, scale, s, read_top, rerank_score,
+        sel = hybrid_select(sel, pool, (q if rq is None else rq).float(), qpos, lam, sigv, F, SP, scale, s, read_top, rerank_score,
                             tokK, hybrid, pool_short, pool_quota, prov_out, **({"rr_w": rr_w} if rr_w is not None else {}),
                             **mkw, **bkw, **(uqkw or {}), **pskw)
     elif read_top > 0:
@@ -1243,7 +1243,7 @@ def traverse_forest(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, lam:
                 sel = rerank_top_fast(sel, _rq, qpos, lam, sigv, F["cellA"], SP["t_idx"], scale, s, read_top,
                                       rerank_score, tokK)
             else:
-                sel = rerank_top(sel, _rq, qpos, lam, sigv, F["cellK"], F["cellA"], SP["t_idx"], scale, s, read_top,
+                sel = rerank_top(sel, _rq.float(), qpos, lam, sigv, F["cellK"], F["cellA"], SP["t_idx"], scale, s, read_top,
                                  score=rerank_score, tokK=tokK, **({"rr_w": rr_w} if rr_w is not None else {}),
                                  **mkw, **pskw)
             if bres is not None:
@@ -2132,12 +2132,26 @@ def fsb_long_range(attn, Q, K, V, sigma, N, kv_padded=None, _stage_check=False):
         for b0 in range(0, nb, NBCH):
             b1 = min(b0 + NBCH, nb); nbc = b1 - b0; Tc = T * nbc
             with torch.no_grad():
-                qf_c = _qf_rows(Q, b0 * Bq, b1 * Bq, N)
-                qr_c = fsb_route_q(attn, qf_c)
-                q = qr_c.reshape(B, H, nbc, Bq, Dh).reshape(Tc, Bq, Dh)
-                qp = q if qr_c is qf_c else qf_c.reshape(B, H, nbc, Bq, Dh).reshape(Tc, Bq, Dh)
-                rq_bf16 = Q.dtype == torch.bfloat16 and (rr_raw or qr_c is qf_c)     # re-rank query = Q.float()
-                del qf_c, qr_c
+                if Q.dtype == torch.bfloat16 and forest and not route and attn.fsb_policy_mode == "fixed" and not attn.training:
+                    q0, q1 = b0 * Bq, b1 * Bq
+                    nq = min(q1, N) - q0
+                    if nq == nbc * Bq and Q[:, :, q0:q1].is_contiguous():
+                        q = Q[:, :, q0:q1].view(Tc, Bq, Dh)
+                    else:
+                        q = torch.empty((Tc, Bq, Dh), dtype=torch.bfloat16, device=dev)
+                        qv = q.view(B, H, nbc * Bq, Dh)
+                        qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
+                        if nq < nbc * Bq:
+                            qv[:, :, nq:].zero_()
+                    qp = q
+                    rq_bf16 = True
+                else:
+                    qf_c = _qf_rows(Q, b0 * Bq, b1 * Bq, N)
+                    qr_c = fsb_route_q(attn, qf_c)
+                    q = qr_c.reshape(B, H, nbc, Bq, Dh).reshape(Tc, Bq, Dh)
+                    qp = q if qr_c is qf_c else qf_c.reshape(B, H, nbc, Bq, Dh).reshape(Tc, Bq, Dh)
+                    rq_bf16 = Q.dtype == torch.bfloat16 and (rr_raw or qr_c is qf_c)     # re-rank query = Q.float()
+                    del qf_c, qr_c
                 qpos = (blk_start[b0:b1, None] + torch.arange(Bq, device=dev, dtype=torch.float32)[None, :])
                 qpos = qpos[None, None].expand(B, H, nbc, Bq).reshape(Tc, Bq)
                 head_id = torch.arange(H, device=dev)[None, :, None].expand(B, H, nbc).reshape(Tc)

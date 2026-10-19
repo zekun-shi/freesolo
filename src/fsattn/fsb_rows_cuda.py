@@ -95,3 +95,80 @@ def rows_union_cuda(sel_a: torch.Tensor, sel_b, Mc: int, ud: int, scratch: dict 
             P(pos.data_ptr()), P(dup.data_ptr()), P(ovf.data_ptr())]
     launch(fn, Tp, _NT, dev, args)
     return cells, cnt, pos, (dup if Cb else None), ovf
+
+
+_fused_fns: dict = {}
+_fused_failed: list = []
+
+
+def _fused_source(CA: int, CB: int, KK: int, lse_mode: bool, pos_mode: bool, prov_on: bool, prov_bit: int,
+                  out_i32: bool) -> str:
+    defs = dict(CA=CA, CB=CB, NT=_NT, MCW=MC_MAX // 32, KK=KK, LSE_MODE=int(lse_mode), POS_MODE=int(pos_mode),
+                PROV_ON=int(prov_on), PROV_BIT=int(prov_bit), OUT_I32=int(out_i32), UTILE=16, MIN_BLOCKS=3)
+    return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _SRC
+
+
+def rows_fused_ok(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tensor, Mc: int, s: int, K: int,
+                  score: str, prov: bool, prov_bit: int, out: torch.Tensor) -> bool:
+    if not (rows_cuda_on() and not _fused_failed and os.environ.get("FSB_ROWS_FUSED", "1") == "1"):
+        return False
+    Tp, Bq, Ca = sel_a.shape
+    Cb = 0 if sel_b is None else sel_b.shape[-1]
+    if not (Bq == 128 and q.shape[-1] == 64 and s == 32 and 1 <= K <= 16 and Mc <= MC_MAX
+            and Ca % 2 == 0 and 2 <= Ca <= 32 and Cb % 2 == 0 and 0 <= Cb <= 32 and Ca + Cb <= 32
+            and score in ("lse_pos", "lse", "max") and out.dtype in (torch.int64, torch.int32)
+            and q.is_cuda and q.dtype == torch.bfloat16 and K4.is_cuda and K4.dtype == torch.bfloat16
+            and K4.shape[-1] == 64 and K4.shape[1] >= 8 and K4.stride(-1) == 1
+            and sel_a.is_cuda and sel_a.dtype == torch.int64
+            and (sel_b is None or (sel_b.dtype == torch.int64 and sel_b.device == sel_a.device))):
+        return False
+    cfg = (sel_a.device.index, Ca, Cb, K, score != "max", score == "lse_pos", bool(prov), int(prov_bit),
+           out.dtype == torch.int32)
+    return not torch.cuda.is_current_stream_capturing() or cfg in _fused_fns
+
+
+@torch.no_grad()
+def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tensor, cellA: torch.Tensor,
+                    t_idx: torch.Tensor, qv: torch.Tensor, sq0: int, sq1: int, lv: torch.Tensor, ls0: int,
+                    sv: torch.Tensor, ss0: int, out: torch.Tensor, pv: torch.Tensor, Mc: int, ucap: int,
+                    scale: float, K: int, score: str, prov: bool, prov_bit: int):
+    from .fsb_beam_cuda import _sm80, launch, load_function
+    dev = sel_a.device
+    if not _sm80(dev):
+        return None
+    Tp, Bq, Ca = sel_a.shape
+    Cb = 0 if sel_b is None else sel_b.shape[-1]
+    cfg = (dev.index, Ca, Cb, K, score != "max", score == "lse_pos", bool(prov), int(prov_bit),
+           out.dtype == torch.int32)
+    fn = _fused_fns.get(cfg)
+    if fn is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        try:
+            fn = _fused_fns[cfg] = load_function(dev, _fused_source(*cfg[1:]), "fsb_rows_fused2")
+        except Exception as e:
+            if not _fused_failed:
+                _fused_failed.append(repr(e))
+            return None
+    sa = sel_a.contiguous()
+    sb = sel_b.contiguous() if Cb else sa
+    if sa.data_ptr() % 16 or sb.data_ptr() % 16:
+        sa, sb = sa.clone(), (sb.clone() if Cb else sa)
+    qc = q.reshape(Tp, Bq, 64).contiguous()
+    if qc.data_ptr() % 16:
+        qc = qc.clone()
+    tc = t_idx.contiguous()
+    ovf = (torch.zeros if Mc > ucap else torch.empty)((), dtype=torch.bool, device=dev)
+    if Tp == 0:
+        return ovf
+    P, I32, I64, F32 = ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong, ctypes.c_float
+    args = [P(sa.data_ptr()), P(sb.data_ptr()), P(qc.data_ptr()), P(K4.data_ptr()),
+            P(cellA.data_ptr()), I64(cellA.stride(0)), I64(cellA.stride(1)),
+            P(tc.data_ptr()), P(qv.data_ptr()), I64(sq0), I64(sq1),
+            P(lv.data_ptr()), I64(ls0), P(sv.data_ptr()), I64(ss0),
+            P(out.data_ptr()), P(pv.data_ptr()), P(ovf.data_ptr()),
+            I32(Mc), I32(ucap), I32(K4.shape[1]), I64(K4.stride(0)), I64(K4.stride(1)), I64(K4.stride(2)),
+            F32(float(scale))]
+    launch(fn, Tp, _NT, dev, args)
+    return ovf
+

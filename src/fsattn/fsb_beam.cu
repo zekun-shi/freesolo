@@ -473,6 +473,134 @@ __device__ __forceinline__ void half_dot2(const float* qr, const unsigned ba, co
     sb = halve8(xb);
 }
 
+#if Q_BF16 && QB == 128 && CAP == 64 && UMAX == 128
+__device__ __forceinline__ unsigned pack_bf16x2(float x, float y) {
+    unsigned short rx, ry;
+    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(rx) : "f"(x));
+    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(ry) : "f"(y));
+    return (unsigned)rx | ((unsigned)ry << 16);
+}
+__device__ __forceinline__ float bf2f_s(unsigned short h) {
+    return __uint_as_float(((unsigned)h) << 16);
+}
+__device__ __forceinline__ void mma16816_tc(float (&d)[4], const unsigned (&a)[4], const unsigned b0, const unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void stage_meta_only(const int nt, const int b, const int tid,
+                                                float4* s_umeta, const float* cbase, const float* sbase) {
+    for (int u = tid; u < nt; u += NT) {
+        const int ref = __float_as_int(s_umeta[b * UMAX + u].x);
+        if (ref != -1) {
+            const float* p = node_at(cbase, sbase, ref);
+            s_umeta[b * UMAX + u] = make_float4(__int_as_float(ref), __ldg(p + DH + 3), __ldg(p + DH + 4), __ldg(p + DH + 5));
+        }
+    }
+}
+__device__ __forceinline__ void stage_tile_tc2(const int u0, const int nt, const int b, const int lane, const int wid,
+                                               float4* s_umeta, float4* s_um2, unsigned* s_mu_u32, const float* cbase,
+                                               const float* sbase, const float qpos_blk, const float cell_size,
+                                               const float lam, const float sig2, const float scale) {
+    for (int ul = wid; ul < nt; ul += NWARP_R) {
+        const int u = u0 + ul;
+        const int ref = __float_as_int(s_umeta[b * UMAX + u].x);
+        if (ref != -1) {
+            const float* p = node_at(cbase, sbase, ref);
+            const float x = __ldg(p + 2 * lane);
+            const float y = __ldg(p + 2 * lane + 1);
+            s_mu_u32[ul * 32 + (lane ^ ((ul & 7) << 2))] = pack_bf16x2(x, y);
+            if (lane == 0) {
+                const float rad = __ldg(p + DH), amax = __ldg(p + DH + 1), pmin = __ldg(p + DH + 2);
+                const float pmin_pos = f_mul(f_add(pmin, 0.5f), cell_size);
+                const float dx = __int_as_float(__float_as_int(f_sub(qpos_blk, pmin_pos)) & 0x7fffffff);
+                const float pos_b = f_mul(f_mul(lam, amax), erf_tl(f_div_full(dx, sig2)));
+                *reinterpret_cast<float2*>(s_um2 + u) = make_float2(f_mul(rad, scale), pos_b);
+            } else if (lane == 1) {
+                s_umeta[b * UMAX + u] = make_float4(__int_as_float(ref), __ldg(p + DH + 3), __ldg(p + DH + 4), __ldg(p + DH + 5));
+            }
+        } else {
+            s_mu_u32[ul * 32 + (lane ^ ((ul & 7) << 2))] = 0u;
+        }
+    }
+}
+template <int NB>
+__device__ __forceinline__ void rw_direct_bf16(const unsigned short* q_dots, const float4* s_um2, const float qn,
+                                               const short* curow, int* frow, const int n, const int h,
+                                               const int ncar, const i64 wbeam, const int swz_q) {
+    constexpr int H = NB / 2;
+    const unsigned pmask = 3u << ((threadIdx.x) & 30);
+    float my[H];
+#pragma unroll
+    for (int k = 0; k < H; k++) {
+        const int c = 2 * k + h;
+        if (c < n) {
+            const int u = curow[c];
+            const float2 tm = *reinterpret_cast<const float2*>(s_um2 + u);
+#if BOUND
+            my[k] = no_nan(f_add(f_add(bf2f_s(q_dots[u ^ swz_q]), f_mul(qn, tm.x)), tm.y));
+#else
+            my[k] = no_nan(f_add(bf2f_s(q_dots[u ^ swz_q]), tm.y));
+#endif
+        } else {
+            my[k] = NEG_INF;
+        }
+    }
+    int r[H];
+#pragma unroll
+    for (int k = 0; k < H; k++) {
+        const float ok = __shfl_xor_sync(pmask, my[k], 1);
+        r[k] = h ? (int)(ok >= my[k]) : (int)(ok > my[k]);
+    }
+#pragma unroll
+    for (int j = 0; j < H; j++) {
+        const float oj = __shfl_xor_sync(pmask, my[j], 1);
+        int rj_p = 0;
+#pragma unroll
+        for (int k = j + 1; k < H; k++) {
+            add_pair(r[j], r[k], my[j], my[k]);
+            add_pair(rj_p, r[k], oj, my[k]);
+        }
+        r[j] += __shfl_xor_sync(pmask, rj_p, 1);
+    }
+#pragma unroll
+    for (int k = 0; k < H; k++) {
+        const int c = 2 * k + h;
+        const int crank = ncar + r[k];
+        if (c < n && my[k] > -5e8f && crank < wbeam && crank < WM) frow[crank] = (int)curow[c];
+    }
+}
+template <int NB>
+__device__ __forceinline__ void rw_reg(const float* my, const short* curow, int* frow, const int n, const int h,
+                                       const int ncar, const i64 wbeam) {
+    constexpr int H = NB / 2;
+    const unsigned pmask = 3u << ((threadIdx.x) & 30);
+    int r[H];
+#pragma unroll
+    for (int k = 0; k < H; k++) {
+        const float ok = __shfl_xor_sync(pmask, my[k], 1);
+        r[k] = h ? (int)(ok >= my[k]) : (int)(ok > my[k]);
+    }
+#pragma unroll
+    for (int j = 0; j < H; j++) {
+        const float oj = __shfl_xor_sync(pmask, my[j], 1);
+        int rj_p = 0;
+#pragma unroll
+        for (int k = j + 1; k < H; k++) {
+            add_pair(r[j], r[k], my[j], my[k]);
+            add_pair(rj_p, r[k], oj, my[k]);
+        }
+        r[j] += __shfl_xor_sync(pmask, rj_p, 1);
+    }
+#pragma unroll
+    for (int k = 0; k < H; k++) {
+        const int c = 2 * k + h;
+        const int crank = ncar + r[k];
+        if (c < n && my[k] > -5e8f && crank < wbeam && crank < WM) frow[crank] = (int)curow[c];
+    }
+}
+#endif
+
 // stage union slots [u0, u0 + nt) of buffer b, one warp per node: mu split into even / odd columns (the tile), rad /
 // amax / pmin, and cnt / children for the next level (cp.async, 4 bytes each; slots without a node are skipped: no
 // query has them as a child)
@@ -616,6 +744,50 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
     const int root = (int)ROOT[t];
     const bool qok = q0 + qi < Bq;
     const i64 pid = t * Bq + (qok ? q0 + qi : 0);
+#if Q_BF16 && QB == 128 && CAP == 64 && UMAX == 128
+    float qn;
+    {
+        const unsigned short* qp = reinterpret_cast<const unsigned short*>(Q) + pid * DH;
+        float qs = 0.0f;
+        if (qok) {
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                const uint4 a = __ldg(reinterpret_cast<const uint4*>(qp + 32 * h + 8 * m));
+                const float f0 = __uint_as_float(a.x << 16), f1 = __uint_as_float(a.x & 0xffff0000u);
+                const float f2 = __uint_as_float(a.y << 16), f3 = __uint_as_float(a.y & 0xffff0000u);
+                const float f4 = __uint_as_float(a.z << 16), f5 = __uint_as_float(a.z & 0xffff0000u);
+                const float f6 = __uint_as_float(a.w << 16), f7 = __uint_as_float(a.w & 0xffff0000u);
+                qs = f_add(qs, f_add(f_add(f_mul(f0, f0), f_mul(f1, f1)), f_add(f_mul(f2, f2), f_mul(f3, f3))));
+                qs = f_add(qs, f_add(f_add(f_mul(f4, f4), f_mul(f5, f5)), f_add(f_mul(f6, f6), f_mul(f7, f7))));
+            }
+        }
+        qn = f_mul(f_sqrt_ftz(f_add(qs, __shfl_xor_sync(FULL, qs, 1))), rcq);
+    }
+    const int g_tc = lane >> 2, t4_tc = lane & 3;
+    unsigned qa[4][4];
+    {
+        const unsigned short* qbase_bf = reinterpret_cast<const unsigned short*>(Q) + (t * Bq + q0) * DH;
+        const int r0 = 16 * wid + g_tc, r1 = r0 + 8;
+        const bool ok0 = q0 + r0 < Bq, ok1 = q0 + r1 < Bq;
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            const int c0 = 16 * ks + 2 * t4_tc, c1 = c0 + 8;
+            qa[ks][0] = ok0 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r0 * DH + c0)) : 0u;
+            qa[ks][1] = ok1 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r1 * DH + c0)) : 0u;
+            qa[ks][2] = ok0 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r0 * DH + c1)) : 0u;
+            qa[ks][3] = ok1 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r1 * DH + c1)) : 0u;
+        }
+    }
+    const float qpos_blk = QPOS[t * Bq + q0 + min(QB / 2, Bq - q0 - 1)];
+    const float qpos = qok ? QPOS[pid] : 0.0f;
+    const float bud = qok ? (float)BUDGET[pid] : 0.0f;
+    const i64 wbeam = qok ? WBEAM[pid] : 0;
+    int* frow = s_front + qi * 16;
+    short* curow = s_cu + qi * CUS;
+    float* srow = reinterpret_cast<float*>(s_cu) + 2 * qi;
+    (void)s_sc;
+    (void)rot;
+#else
     // this lane's half of the query (chunk blocks in its rotated order) and the radius-scaled norm (same halving tree)
     float qr[32];
 #if Q_BF16
@@ -654,6 +826,7 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
     int* frow = s_front + qi * 16;
     short* curow = s_cu + qi * CUS;
     float* srow = s_sc + qi * SCS;
+#endif
     // the union before level 0 is the root (buffer 1); every query starts from it
     if (tid == 0 && root != -1) {
         const float* p = node_at(cbase, sbase, root);
@@ -744,6 +917,173 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
         if (tid < UMAX) mk_w[tid] = 0;                                // every warp has read the marks
         PMARK(3);
         if (Pc > UMAX) { coop = false; fb_lev = lev; break; }
+#if Q_BF16 && QB == 128 && CAP == 64 && UMAX == 128
+        const int npass = (Pc + CAP - 1) / CAP;
+        const int nq = n > 16 ? 32 : (n > 8 ? 16 : (n > 4 ? 8 : (n > 0 ? 4 : 0)));
+        const bool ff = __syncthreads_and(done || (ncar + n <= wbeam && ncar + n <= WM));
+        if (ff) {
+            stage_meta_only(Pc, cb, tid, s_umeta, cbase, sbase);
+        } else {
+            stage_tile_tc2(0, min(CAP, Pc), cb, lane, wid, s_umeta, s_um2, reinterpret_cast<unsigned*>(s_mu),
+                           cbase, sbase, qpos_blk, cell_size, lam, sig2, scale);
+        }
+        if (CM == FULL) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int r2 = 2 * s_rank[e[j]];
+                reinterpret_cast<int*>(curow)[8 * h + j] = (r2 & 0xffff) | ((r2 + 1) << 16);
+            }
+        } else if (n > 0) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int w = 8 * h + j;
+                if ((E >> w) & 1u) {
+                    const unsigned two = (CM >> (2 * w)) & 3u;
+                    const int c0 = __popc(CM & ((1u << (2 * w)) - 1u));
+                    const int r2 = 2 * s_rank[e[j]];
+                    if (two & 1u) curow[c0] = (short)r2;
+                    if (two & 2u) curow[c0 + (two & 1u)] = (short)(r2 + 1);
+                }
+            }
+        }
+        __syncthreads();
+        if (ff) {
+            if (!done) {
+                const int4 emp4 = make_int4(EMPTY_E, EMPTY_E, EMPTY_E, EMPTY_E);
+                *reinterpret_cast<int4*>(frow + 8 * h) = emp4;
+                *reinterpret_cast<int4*>(frow + 8 * h + 4) = emp4;
+                __syncwarp(pmask);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const int w = 8 * h + j;
+                    if ((C >> w) & 1u) frow[__popc(C & ((1u << w) - 1u))] = e[j];
+                }
+                for (int c = h; c < n; c += 2) frow[ncar + c] = (int)curow[c];
+                __syncwarp(pmask);
+                nvis += n;
+            }
+        } else {
+            unsigned* s_mu_u32 = reinterpret_cast<unsigned*>(s_mu);
+            unsigned* s_dot_u32 = s_mu_u32 + (CAP * DH) / 2;
+            const unsigned short* s_dot_bf = reinterpret_cast<const unsigned short*>(s_dot_u32);
+            const int r0_tc = 16 * wid + g_tc, r1_tc = r0_tc + 8;
+            const int swz_r0 = (g_tc & 7) << 1, swz_r1 = ((g_tc + 8) & 7) << 1;
+            const int swz_q = (qi & 7) << 2;
+            if (npass == 1) {
+                const int nt_cur = min(CAP, Pc);
+                const int ntiles = (nt_cur + 7) >> 3;
+                for (int nt = 0; nt < ntiles; nt++) {
+                    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    const int u_row = min(8 * nt + g_tc, nt_cur - 1);
+                    const int swz = (u_row & 7) << 2;
+                    const unsigned* mp = s_mu_u32 + u_row * 32;
+#pragma unroll
+                    for (int ks = 0; ks < 4; ks++) {
+                        const int col0 = (8 * ks + t4_tc) ^ swz;
+                        const int col1 = (8 * ks + 4 + t4_tc) ^ swz;
+                        mma16816_tc(acc, qa[ks], mp[col0], mp[col1]);
+                    }
+                    const int u_pair = 4 * nt + t4_tc;
+                    s_dot_u32[r0_tc * (CAP / 2) + (u_pair ^ swz_r0)] = pack_bf16x2(f_mul(acc[0], scale), f_mul(acc[1], scale));
+                    s_dot_u32[r1_tc * (CAP / 2) + (u_pair ^ swz_r1)] = pack_bf16x2(f_mul(acc[2], scale), f_mul(acc[3], scale));
+                }
+                __syncwarp();
+                if (!done) {
+                    const int4 emp4 = make_int4(EMPTY_E, EMPTY_E, EMPTY_E, EMPTY_E);
+                    *reinterpret_cast<int4*>(frow + 8 * h) = emp4;
+                    *reinterpret_cast<int4*>(frow + 8 * h + 4) = emp4;
+                    __syncwarp(pmask);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const int w = 8 * h + j;
+                        if ((C >> w) & 1u) {
+                            const int ncb = __popc(C & ((1u << w) - 1u));
+                            if (ncb < wbeam && ncb < WM) frow[ncb] = e[j];
+                        }
+                    }
+                    if (ncar < wbeam && ncar < WM) {
+                        const unsigned short* q_dots = s_dot_bf + qi * CAP;
+                        if (nq == 32)      rw_direct_bf16<32>(q_dots, s_um2, qn, curow, frow, n, h, ncar, wbeam, swz_q);
+                        else if (nq == 16) rw_direct_bf16<16>(q_dots, s_um2, qn, curow, frow, n, h, ncar, wbeam, swz_q);
+                        else if (nq == 8)  rw_direct_bf16<8>(q_dots, s_um2, qn, curow, frow, n, h, ncar, wbeam, swz_q);
+                        else if (nq == 4)  rw_direct_bf16<4>(q_dots, s_um2, qn, curow, frow, n, h, ncar, wbeam, swz_q);
+                    }
+                    __syncwarp(pmask);
+                    nvis += n;
+                }
+            } else {
+                float my_multi[16];
+#pragma unroll
+                for (int k = 0; k < 16; k++) my_multi[k] = NEG_INF;
+                for (int p = 0; p < npass; p++) {
+                    const int t0_p = p * CAP, t1_p = min(t0_p + CAP, Pc), nt_cur = t1_p - t0_p;
+                    if (p > 0) {
+                        __syncthreads();
+                        stage_tile_tc2(t0_p, nt_cur, cb, lane, wid, s_umeta, s_um2, s_mu_u32,
+                                       cbase, sbase, qpos_blk, cell_size, lam, sig2, scale);
+                        __syncthreads();
+                    }
+                    const int ntiles = (nt_cur + 7) >> 3;
+                    for (int nt = 0; nt < ntiles; nt++) {
+                        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        const int u_row = min(8 * nt + g_tc, nt_cur - 1);
+                        const int swz = (u_row & 7) << 2;
+                        const unsigned* mp = s_mu_u32 + u_row * 32;
+#pragma unroll
+                        for (int ks = 0; ks < 4; ks++) {
+                            const int col0 = (8 * ks + t4_tc) ^ swz;
+                            const int col1 = (8 * ks + 4 + t4_tc) ^ swz;
+                            mma16816_tc(acc, qa[ks], mp[col0], mp[col1]);
+                        }
+                        const int u_pair = 4 * nt + t4_tc;
+                        s_dot_u32[r0_tc * (CAP / 2) + (u_pair ^ swz_r0)] = pack_bf16x2(f_mul(acc[0], scale), f_mul(acc[1], scale));
+                        s_dot_u32[r1_tc * (CAP / 2) + (u_pair ^ swz_r1)] = pack_bf16x2(f_mul(acc[2], scale), f_mul(acc[3], scale));
+                    }
+                    __syncwarp();
+                    if (!done && n > 0) {
+                        const unsigned short* q_dots = s_dot_bf + qi * CAP;
+#pragma unroll
+                        for (int k = 0; k < 16; k++) {
+                            const int c = 2 * k + h;
+                            if (c < n) {
+                                const int u = curow[c];
+                                if (u >= t0_p && u < t1_p) {
+                                    const float2 tm = *reinterpret_cast<const float2*>(s_um2 + u);
+#if BOUND
+                                    my_multi[k] = no_nan(f_add(f_add(bf2f_s(q_dots[(u - t0_p) ^ swz_q]), f_mul(qn, tm.x)), tm.y));
+#else
+                                    my_multi[k] = no_nan(f_add(bf2f_s(q_dots[(u - t0_p) ^ swz_q]), tm.y));
+#endif
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!done) {
+                    const int4 emp4 = make_int4(EMPTY_E, EMPTY_E, EMPTY_E, EMPTY_E);
+                    *reinterpret_cast<int4*>(frow + 8 * h) = emp4;
+                    *reinterpret_cast<int4*>(frow + 8 * h + 4) = emp4;
+                    __syncwarp(pmask);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const int w = 8 * h + j;
+                        if ((C >> w) & 1u) {
+                            const int ncb = __popc(C & ((1u << w) - 1u));
+                            if (ncb < wbeam && ncb < WM) frow[ncb] = e[j];
+                        }
+                    }
+                    if (ncar < wbeam && ncar < WM) {
+                        if (nq == 32)      rw_reg<32>(my_multi, curow, frow, n, h, ncar, wbeam);
+                        else if (nq == 16) rw_reg<16>(my_multi, curow, frow, n, h, ncar, wbeam);
+                        else if (nq == 8)  rw_reg<8>(my_multi, curow, frow, n, h, ncar, wbeam);
+                        else if (nq == 4)  rw_reg<4>(my_multi, curow, frow, n, h, ncar, wbeam);
+                    }
+                    __syncwarp(pmask);
+                    nvis += n;
+                }
+            }
+        }
+#else
         // ---- C: stage the first tile of the union (cp.async) while this query lists its children (slot order) as union
         // slots and fills -inf past n; then prefetch the next level's candidates
         const int npass = (Pc + CAP - 1) / CAP;
@@ -874,6 +1214,7 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
             __syncwarp(pmask);
             nvis += n;
         }
+#endif
         lastbuf = cb;
         PMARK(6);
     }
@@ -964,7 +1305,11 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
             const int ql = wid * (QB / NWARP_R) + k;
             if (q0 + ql >= Bq) break;
             const i64 p2 = t * Bq + q0 + ql;
+#if Q_BF16 && QB == 128 && CAP == 64 && UMAX == 128
+            const float* sq = reinterpret_cast<const float*>(s_cu) + 2 * ql;
+#else
             const float* sq = s_sc + ql * SCS;
+#endif
 #if Q_BF16
             const float* qrow_p = reinterpret_cast<const float*>(reinterpret_cast<const unsigned short*>(Q) + p2 * DH);
 #else

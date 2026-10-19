@@ -16,13 +16,14 @@ def _fast_cell_stats(K, ncell, s):
 
 
 class FSKVCache:
-    def __init__(self, attn, lean_prefill=False):
+    def __init__(self, attn, lean_prefill=False, retain_kv: bool = True):
         attn._assert_cacheable(phase="prefill")
         self.attn = attn
         self.s = attn.cell_stride
         self.W = attn.window_size
         self.pos = 0
         self.lean_prefill = lean_prefill
+        self.retain_kv = bool(retain_kv)
         self.reserve = 0
         self._prealloc = None
         self._k_buf = None; self._v_buf = None; self._len = 0
@@ -76,6 +77,12 @@ class FSKVCache:
         # long-range prefill, computed by the same ops on this K view. (A plain attribute, reset here: torch.compile
         # traces this method, and dynamo cannot trace a pop from __dict__.)
         handed, self._prefill_cell_stats = getattr(self, "_prefill_cell_stats", None), None
+        if not getattr(self, "retain_kv", True):
+            if not getattr(self, "_keep_prealloc", False):
+                self._prealloc = None
+            self._len = K.shape[2]
+            self.pos = K.shape[2]
+            return
         cell_stats = handed if cell_stats is None else cell_stats
         B, H, N, D = K.shape
         cap = N + max(0, int(self.reserve))
@@ -207,7 +214,7 @@ class FSKVCache:
         return self._k_hist, self._v_hist
 
 
-def make_caches(model, *, lean_prefill=False, reserve=0, linear=None) -> list:
+def make_caches(model, *, lean_prefill=False, reserve=0, linear=None, retain_kv: bool = True) -> list:
     linear = os.environ.get("FSL_LINEAR_CACHE", "0") == "1" if linear is None else linear
     caches = []
     for blk in model.blocks:
@@ -218,7 +225,7 @@ def make_caches(model, *, lean_prefill=False, reserve=0, linear=None) -> list:
             from src.fsattn.linear_cache import LinearFSCache
             c = LinearFSCache(blk.attn.fsattn)
         else:
-            c = FSKVCache(blk.attn.fsattn, lean_prefill=lean_prefill)
+            c = FSKVCache(blk.attn.fsattn, lean_prefill=lean_prefill, retain_kv=retain_kv)
             c.reserve = reserve
         caches.append(c)
     return caches

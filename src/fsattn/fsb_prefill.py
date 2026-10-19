@@ -322,8 +322,17 @@ def _reference_stage(attn, Q, F: dict, m_b_all, sigma, N: int, b0: int, b1: int,
     Tc = T * nbc
     s = attn.cell_stride
     with torch.no_grad():
-        qf_c = _qf_rows(Q, b0 * Bq, b1 * Bq, N)
-        q = qf_c.reshape(B, H, nbc, Bq, Dh).reshape(Tc, Bq, Dh)
+        if Q.dtype == torch.bfloat16:
+            q0, q1 = b0 * Bq, b1 * Bq
+            nq = min(q1, N) - q0
+            q = torch.empty((Tc, Bq, Dh), dtype=torch.bfloat16, device=dev)
+            qv = q.view(B, H, nbc * Bq, Dh)
+            qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
+            if nq < nbc * Bq:
+                qv[:, :, nq:].zero_()
+        else:
+            qf_c = _qf_rows(Q, b0 * Bq, b1 * Bq, N)
+            q = qf_c.reshape(B, H, nbc, Bq, Dh).reshape(Tc, Bq, Dh)
         qpos = (blk_start[b0:b1, None] + torch.arange(Bq, device=dev, dtype=torch.float32)[None, :])
         qpos = qpos[None, None].expand(B, H, nbc, Bq).reshape(Tc, Bq)
         head_id = torch.arange(H, device=dev)[None, :, None].expand(B, H, nbc).reshape(Tc)

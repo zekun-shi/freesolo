@@ -882,7 +882,7 @@ class FSAttn(nn.Module):
             sigma = self.sigma
             used_chunk_rope = False
             if (_rope and not _rope_lr and self.fs_uniform_sr and self.causal
-                    and N > 16384 and Q.is_cuda and not torch.is_grad_enabled() and not compiling()
+                    and N >= self.window_size and Q.is_cuda and not torch.is_grad_enabled() and not compiling()
                     and os.environ.get("FSL_SLIDING_MODE", "chunked").lower() != "flex"
                     and os.environ.get("FSL_WINDOW_STREAM", "0") != "1"):
                 end = cache.pos + N
@@ -926,7 +926,8 @@ class FSAttn(nn.Module):
             else:
                 # FSL_PREFILL_CELL_REUSE=0: FSKVCache.prefill recomputes the cell means / ceilings itself
                 self._begin_lr(out_short, want_cell_stats=(os.environ.get("FSL_PREFILL_CELL_REUSE", "1") != "0"
-                                                           and not torch.is_grad_enabled()),
+                                                           and not torch.is_grad_enabled()
+                                                           and getattr(cache, "retain_kv", True)),
                                sr_event=ev, inplace_sr=(ev is None and not torch.is_grad_enabled()))
                 try:
                     out_long = self._long_range(Q_lr, K_lr, V, sigma, N)

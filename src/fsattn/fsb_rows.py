@@ -335,9 +335,31 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
     Cb = 0 if sel_b is None else sel_b.shape[-1]
     C, rows, Dh, dev = Ca + Cb, Tp * Bq, q.shape[-1], q.device
     Mc = cellA.shape[1]
+    K4 = _key4(tokK)
+    qv, sq0, sq1 = _row_view(qpos, Tp, Bq)
+    lv, ls0, _ = _row_view(lam, Tp, 1)
+    sv, ss0, _ = _row_view(sigv, Tp, 1)
+    if out is None:
+        out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
+    pv = (pv_out if pv_out is not None else torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev)) if prov else out
+    capturing = torch.cuda.is_current_stream_capturing()
+    if rows_impl() == "cuda":
+        from .fsb_rows_cuda import rows_fused_cuda, rows_fused_ok, rows_union_cuda, rows_union_ok
+        if rows_fused_ok(sel_a, sel_b, q, K4, Mc, s, K, score, prov, PROV_UTAU, out):
+            ovf = rows_fused_cuda(sel_a, sel_b, q, K4, cellA, t_idx, qv, sq0, sq1, lv, ls0, sv, ss0, out, pv,
+                                  Mc, UCAP, scale, K, score, prov, PROV_UTAU)
+            if ovf is not None:
+                if not rows_defer_on():
+                    if not capturing and Mc > UCAP and bool(ovf):
+                        return None
+                elif Mc > UCAP:
+                    if ovf_out is not None:
+                        ovf_out.append(ovf)
+                    elif not capturing and bool(ovf):
+                        return None
+                return out, (pv if prov else None)
     un = ovf = None
     if rows_impl() == "cuda":
-        from .fsb_rows_cuda import rows_union_cuda, rows_union_ok
         if rows_union_ok(sel_a, sel_b, Mc):
             un = rows_union_cuda(sel_a, sel_b, Mc, UCAP, scratch=scratch)
     if un is not None:
@@ -347,7 +369,6 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
         _rows_union_kernel[(rows,)](sel_a.contiguous(), sel_b.contiguous() if Cb else sel_a, sel, Ca, Cb, C,
                                     CAP=_pow2(Ca), CBP=_pow2(max(Cb, 1)), HAS_B=Cb > 0)
         cells, cnt, pos = _row_union(sel, Mc, UCAP)
-    capturing = torch.cuda.is_current_stream_capturing()
     if not rows_defer_on():
         if not capturing and int(cnt.max()) > UCAP:   # the host check of every stage (one stream sync)
             return None
@@ -358,15 +379,8 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
             ovf_out.append(ovf)
         elif not capturing and bool(ovf):
             return None
-    K4 = _key4(tokK)
     BQ = max(16, _pow2(Bq))
     DHP = max(16, _pow2(Dh))
-    qv, sq0, sq1 = _row_view(qpos, Tp, Bq)
-    lv, ls0, _ = _row_view(lam, Tp, 1)
-    sv, ss0, _ = _row_view(sigv, Tp, 1)
-    if out is None:
-        out = torch.empty((Tp, Bq, K), dtype=torch.long, device=dev)
-    pv = (pv_out if pv_out is not None else torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev)) if prov else out
     if un is not None and not rows_tile_ok(Bq, C):
         # a tile too large for one program: the per-query select on union_candidates' slots (the CUDA union's
         # positions equal _row_union's for every present cell, the only ones the select reads; same cells bitwise)

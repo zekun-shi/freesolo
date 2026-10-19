@@ -387,10 +387,13 @@ def beam_rows_on() -> bool:
     return rows_flag() and beam_cuda_on() and not _rows_failed
 
 
-def _rows_layout(CAP: int, UMAX: int, QB: int):
+def _rows_layout(CAP: int, UMAX: int, QB: int, q_bf16: bool = False):
     # byte offsets of the rows kernel's dynamic shared memory regions (16-byte aligned) and the total
-    sizes = (("MU", max(CAP * 256, QB // 16 * _WARPS_BYTES)), ("UM", 32 * UMAX), ("UM2", 16 * UMAX),
-             ("MARK", 2 * UMAX), ("RANK", 2 * UMAX), ("FRONT", QB * 64), ("SC", QB * 36 * 4), ("CU", QB * 34 * 2))
+    tc = q_bf16 and QB == 128 and CAP == 64 and UMAX == 128
+    mu_bytes = max(CAP * 256, CAP * 128 + QB * CAP * 2, QB // 16 * _WARPS_BYTES) if tc else max(CAP * 256, QB // 16 * _WARPS_BYTES)
+    sc_bytes = 0 if tc else (QB * 36 * 4)
+    sizes = (("MU", mu_bytes), ("UM", 32 * UMAX), ("UM2", 16 * UMAX),
+             ("MARK", 2 * UMAX), ("RANK", 2 * UMAX), ("FRONT", QB * 64), ("SC", sc_bytes), ("CU", QB * 34 * 2))
     off, o = {}, 0
     for name, size in sizes:
         off[name] = o
@@ -401,9 +404,10 @@ def _rows_layout(CAP: int, UMAX: int, QB: int):
 def rows_source(NC: int, DH: int, WM: int, R: int, BOUND: bool, RC_T: bool, CAP: int = _ROWS_CAP,
                 UMAX: int = _ROWS_UMAX, QB: int = _ROWS_QB, q_bf16: bool = False):
     # -> (source, dynamic shared memory bytes)
-    off, total = _rows_layout(CAP, UMAX, QB)
+    off, total = _rows_layout(CAP, UMAX, QB, q_bf16)
+    tc = q_bf16 and QB == 128 and CAP == 64 and UMAX == 128
     defs = dict(NC=NC, DH=DH, DHP=64, WM=WM, R=R, BOUND=int(BOUND), RC_T=int(RC_T), CAP=CAP, UMAX=UMAX, QB=QB,
-                MINB=max(1, 256 // QB), OSTAGE=int(QB * WM * R * 8 <= total), Q_BF16=int(q_bf16),
+                MINB=3 if tc else max(1, 256 // QB), OSTAGE=int(QB * WM * R * 8 <= total), Q_BF16=int(q_bf16),
                 **{f"OFF_{k}": v for k, v in off.items()})
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _HELPERS + _KERNEL + _ROWS_KERNEL, total
 
@@ -435,7 +439,7 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     # sizes and the queries per block. fallback: test / diagnostic hook, 65 int32 counters on the device to which the
     # launch adds the number of its blocks that left the cooperative descent for the warp-per-query fallback ([0]) and
     # the level at which they did ([1 + level]).
-    cap, umax, qb = cap or _ROWS_CAP, umax or _ROWS_UMAX, qb or _ROWS_QB
+    cap, umax, qb = cap or _ROWS_CAP, umax or _ROWS_UMAX, qb or (128 if q.dtype == torch.bfloat16 else _ROWS_QB)
     Tp, Bq, Dh = q.shape
     R = 1 << delta_max
     WM = beams[0][4]

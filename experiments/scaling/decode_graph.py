@@ -418,7 +418,7 @@ class GraphedPrefiller:
     one eager warm-up pass compiles/caches all kernels and task tables before stream capture."""
 
     def __init__(self, model, L: int, B: int = 1, device="cuda", dtype=torch.bfloat16, reserve: int = 0,
-                 tail_tokens: int = 64):
+                 tail_tokens: int = 64, retain_kv: bool = True):
         self.m = model
         self.dev = torch.device(device)
         self.dt = dtype
@@ -426,6 +426,7 @@ class GraphedPrefiller:
         self.L = int(L)
         self.reserve = int(reserve)
         self.tail_tokens = min(int(tail_tokens), self.L) if tail_tokens > 0 else 1
+        self.retain_kv = bool(retain_kv)
         self.graph = None
         self.x_static = None
         self.static_logits = None
@@ -447,10 +448,19 @@ class GraphedPrefiller:
         self.x_static = torch.zeros((self.B, self.L), dtype=torch.int64, device=self.dev)
         if sample_ids is not None:
             self.x_static.copy_(sample_ids.to(self.dev).view(self.B, self.L))
-        self.cache = make_caches(m, reserve=self.reserve, linear=False)
+        self.cache = make_caches(m, reserve=self.reserve, linear=False, retain_kv=self.retain_kv)
         kv_dt = self.dt if self.dt != torch.float32 else next(m.parameters()).dtype
-        for c in self.cache:
-            c.preallocate(self.B, self.L, kv_dt, self.dev, keep=True)
+        if self.retain_kv:
+            for c in self.cache:
+                c.preallocate(self.B, self.L, kv_dt, self.dev, keep=True)
+        elif self.cache:
+            a0 = self.cache[0].attn
+            cap = self.L + max(0, self.reserve)
+            kb = torch.empty((self.B, a0.n_heads, cap, a0.head_dim), dtype=kv_dt, device=self.dev)
+            vb = torch.empty((self.B, a0.n_heads, cap, a0.head_dim), dtype=kv_dt, device=self.dev)
+            for c in self.cache:
+                c._prealloc = (self.B, self.L, kb, vb, None, None)
+                c._keep_prealloc = True
         accs = [getattr(b.attn.fsattn, "_fsb_read_acc", None) for b in m.blocks]
         for b in m.blocks:
             b.attn.fsattn._fsb_read_acc = None
