@@ -920,6 +920,23 @@ if triton is not None:
         lr = tl.load(LR + b * (H * D) + h * D + offs_d, mask=d_mask, other=0.0)
         tl.store(O + b * (H * D) + h * D + offs_d, (sr + lr).to(O.dtype.element_ty), mask=d_mask)
 
+    @triton.jit
+    def _lr_scale_combine_kernel(SR, LR, LRS, O, srb, srh, lrb, lrh, H: tl.constexpr, D: tl.constexpr,
+                                 BLOCK_D: tl.constexpr, PROD_RND: tl.constexpr):
+        # out_short + long_range_scale * out_long for one (batch, head) row, written at W_o's input position: torch's
+        # two elementwise ops on the same operands (each in fp32, the product rounded to its dtype when that is bf16
+        # or fp16, the sum to O's dtype), so the values are those of the expression bit for bit
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh - b * H
+        offs_d = tl.arange(0, BLOCK_D)
+        d_mask = offs_d < D
+        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        lr = tl.load(LR + b * lrb + h * lrh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        prod = tl.load(LRS + h).to(tl.float32) * lr
+        prod = _rnd(prod, PROD_RND)
+        tl.store(O + b * (H * D) + h * D + offs_d, (sr + prod).to(O.dtype.element_ty), mask=d_mask)
+
 
 def available() -> bool:
     return triton is not None and torch.cuda.is_available()
@@ -1605,6 +1622,43 @@ def lr_combine(out_short: torch.Tensor, lr: torch.Tensor, out: torch.Tensor) -> 
     _lr_combine_kernel[(B * H,)](
         out_short[:, :, 0, :], lr, out, out_short.stride(0), out_short.stride(1),
         H=H, D=D, BLOCK_D=max(16, triton.next_power_of_2(D)), num_warps=1, enable_fp_fusion=False,
+    )
+    return out
+
+
+def _lr_scale_dtypes(out_short: torch.Tensor, lrs: torch.Tensor, out_long: torch.Tensor):
+    # torch's result dtypes of lrs * out_long and of out_short + that product (tensor-tensor promotion)
+    prod = torch.promote_types(lrs.dtype, out_long.dtype)
+    return prod, torch.promote_types(out_short.dtype, prod)
+
+
+def lr_scale_combine_ok(out_short: torch.Tensor, lrs: torch.Tensor, out_long: torch.Tensor) -> bool:
+    # one decode token's (B, H, 1, D) window and long-range outputs with unit stride along D, lrs the (H, 1, 1)
+    # long-range scales, every dtype (and both result dtypes) one the kernel rounds to; anything else keeps torch's ops
+    if compiling() or not available() or torch.is_grad_enabled():
+        return False
+    if not (out_short.is_cuda and out_long.device == out_short.device and lrs.device == out_short.device
+            and out_short.dim() == 4 and out_short.shape[2] == 1 and out_long.shape == out_short.shape):
+        return False
+    H = out_short.shape[1]
+    prod, res = _lr_scale_dtypes(out_short, lrs, out_long)
+    return (all(dt in _RND for dt in (out_short.dtype, out_long.dtype, lrs.dtype, prod, res))
+            and tuple(lrs.shape) == (H, 1, 1) and lrs.is_contiguous()
+            and out_short.stride(-1) == 1 and out_long.stride(-1) == 1)
+
+
+def lr_scale_combine(out_short: torch.Tensor, lrs: torch.Tensor, out_long: torch.Tensor) -> torch.Tensor:
+    """W_o's input (B, 1, H * D) of a decode layer whose long-range read ran beside the window (FSB_DECODE_FORK):
+    out_short + lrs.unsqueeze(0) * out_long followed by the head-major transpose, in one launch, with the values and the
+    dtype of torch's expression bit for bit (lr_scale_combine_ok checks the operands)."""
+    B, H, _, D = out_short.shape
+    prod, res = _lr_scale_dtypes(out_short, lrs, out_long)
+    out = torch.empty(B, 1, H * D, device=out_short.device, dtype=res)
+    _lr_scale_combine_kernel[(B * H,)](
+        out_short[:, :, 0, :], out_long[:, :, 0, :], lrs, out, out_short.stride(0), out_short.stride(1),
+        out_long.stride(0), out_long.stride(1),
+        H=H, D=D, BLOCK_D=max(16, triton.next_power_of_2(D)), PROD_RND=_RND[prod], num_warps=1,
+        enable_fp_fusion=False,
     )
     return out
 

@@ -48,6 +48,18 @@ def _decoder(m, prompt, n_new):
     return gd
 
 
+def _taus(m):
+    # the FS-B thresholds _decoder sets after its prefill: restoring them before the next run keeps that run's prefill
+    # (whose layers above the first read through the union forest) the same as the first run's
+    saved = [(b.attn.fsattn.fsb_tau.clone(), b.attn.fsattn.fsb_tau_union.clone()) for b in m.blocks]
+
+    def restore():
+        for b, (t, tu) in zip(m.blocks, saved):
+            b.attn.fsattn.fsb_tau.copy_(t)
+            b.attn.fsattn.fsb_tau_union.copy_(tu)
+    return restore
+
+
 def _spy(monkeypatch):
     ran = []
     real = dcu.decode_read_fused
@@ -216,3 +228,59 @@ def test_fused_beams_match_pair_kernel(monkeypatch, L):
         want = torch.cat([ca.reshape(T, -1), cb.reshape(T, -1)], dim=1)
         assert torch.equal(cells, want), scale
         assert (want >= 0).any()
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("dts", [(torch.bfloat16, torch.bfloat16), (torch.float32, torch.bfloat16),
+                                 (torch.bfloat16, torch.float32), (torch.float32, torch.float32)])
+def test_scale_combine_matches_torch_ops(dts):
+    # lr_scale_combine (FSB_DECODE_JOIN's join) against torch's out_short + lrs * out_long and the transpose into W_o's
+    # input, bit for bit and in the expression's dtype, for bf16 and fp32 scales and read outputs at the released shape
+    from src.utils import trunk_triton as tt
+    lrs_dt, lr_dt = dts
+    g = torch.Generator(device="cuda").manual_seed(83)
+    for scale in (0.05, 1.0, 30.0):
+        sr = (torch.randn(1, 16, 1, 64, device="cuda", generator=g) * scale).to(torch.bfloat16)
+        out_long = (torch.randn(1, 16, 1, 64, device="cuda", generator=g) * scale).to(lr_dt)
+        lrs = (0.2 * torch.randn(16, 1, 1, device="cuda", generator=g)).to(lrs_dt)
+        ref = (sr + lrs.unsqueeze(0) * out_long).transpose(1, 2).contiguous().view(1, 1, 16 * 64)
+        assert tt.lr_scale_combine_ok(sr, lrs, out_long)
+        got = tt.lr_scale_combine(sr, lrs, out_long)
+        assert got.dtype == ref.dtype and got.shape == ref.shape
+        assert torch.equal(got, ref), scale
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("v2", ["0", "1"])
+def test_forked_join_matches_torch_combine(monkeypatch, v2):
+    # FSB_DECODE_JOIN=1 (with FSB_DECODE_FORK=1): every forked layer joins with the one-kernel combine; teacher-forced
+    # steps across query blocks give the logits and the read cells of the torch combine bit for bit
+    from src.utils import trunk_triton as tt
+    m = _model(monkeypatch, 1024, n_layers=2)
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(89)).cuda()
+    forced = torch.randint(0, 512, (200,), generator=torch.Generator().manual_seed(97)).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", v2)
+    monkeypatch.setenv("FSB_DECODE_FORK", "1")
+    joins, real = [], tt.lr_scale_combine
+    monkeypatch.setattr(tt, "lr_scale_combine", lambda *a: joins.append(1) or real(*a))
+    restore = _taus(m)
+    runs = {}
+    for join in ("0", "1"):
+        monkeypatch.setenv("FSB_DECODE_JOIN", join)
+        joins.clear()
+        restore()
+        gd = _decoder(m, prompt, len(forced))
+        logits, sels = [], []
+        for t in forced:
+            gd.next_tok = t.view(1)
+            gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
+        runs[join] = (torch.stack(logits), torch.stack(sels))
+        assert (len(joins) >= len(m.blocks)) == (join == "1"), (join, len(joins))
+    (l0, s0), (l1, s1) = runs["0"], runs["1"]
+    assert torch.isfinite(l0).all() and (s0 >= 0).float().mean() > 0.9
+    assert torch.equal(s0, s1)
+    assert torch.equal(l0, l1)
