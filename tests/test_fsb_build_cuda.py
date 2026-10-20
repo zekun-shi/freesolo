@@ -725,3 +725,243 @@ def test_prefill_trim_graph_capture():
             ja, jsh, nj = bc.spine_chunks(M, k, mbx)
             for j in range(ja, ja + (nj << jsh), 1 << jsh):
                 assert all(torch.equal(a, b) for a, b in zip(_chunk_rows(G, k, j), _chunk_rows(F, k, j))), (k, j)
+
+
+# ---- FSB_BUILD_SMALL: the chunks of short and mid prefills in fsb_forest_build_small ----
+
+def _small_launch_counter(monkeypatch, bc):
+    # counts the launches of fsb_forest_build_small (the other kernels pass through)
+    seen = []
+    launch = bc._launch
+
+    def counting(fn, *a, **k):
+        if any(fn is v for v in bc._small_fns.values()):
+            seen.append(1)
+        return launch(fn, *a, **k)
+
+    monkeypatch.setattr(bc, "_launch", counting)
+    return seen
+
+
+def _all_outputs(got):
+    # every output of a build as raw bits (adm, m_tot, m_b, bf16 means, fp32 aggregates, leaves), both forests
+    out = []
+    for F, mb in got:
+        out += [F["adm"], F["m_tot"], mb, F["node_mu"].view(torch.int16), F["node_aux"].view(torch.int32), F["leaf"]]
+    return out
+
+
+@pytest.mark.parametrize("T,M,Dh", [(16, 128, 64), (16, 512, 64), (16, 300, 64), (12, 40, 64), (4, 7, 64), (8, 200, 32),
+                                    (2, 511, 64), (16, 64, 64)])
+def test_small_build_matches_build_kernel(monkeypatch, T, M, Dh):
+    # FSB_BUILD_SMALL=1 builds a trimmed prefill table whose chunks are all at most 2^8 cells high in
+    # fsb_forest_build_small: every output, and every row neither build writes, is bit-identical to the build kernel's
+    # (both forests; random, tie-heavy, signed-zero, duplicate, zero and subnormal keys; with and without spreads;
+    # prefill block starts and random ones), and every spine of the layer's prefix counts reads the same rows
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_GROUP", "4")
+    seen = _small_launch_counter(monkeypatch, bc)
+    for kind in ("randn", "ties", "negzero", "dups", "zeros", "subnormal"):
+        g = torch.Generator().manual_seed(29 * M + T + Dh + len(kind))
+        K = _keys(kind, T, M, Dh, g).to(DEV)
+        ce = torch.rand(T, M, generator=g).to(DEV)
+        spread = torch.rand(T, M, generator=g).to(DEV)
+        H = 4 if T % 4 == 0 else T
+        nb = max(1, M * 32 // 128)
+        starts = {"prefill": (torch.arange(nb, device=DEV, dtype=torch.float32) * 128 / 32).floor().long(),
+                  "random": torch.randint(0, M + 1, (29,), generator=g).sort().values.to(DEV)}
+        for ename, E in starts.items():
+            mbx = min(int(E.max()), M)
+            for pair in (("zero", "q50"), ("rand", "none"), ("allbut1", "rand")):
+                taus = [_taus(p, ce, H, g).float().to(DEV) for p in pair]
+                for sp in (None, spread) if kind in ("randn", "ties") else (spread,):
+                    outs = {}
+                    for flag in ("0", "1"):
+                        monkeypatch.setenv("FSB_BUILD_SMALL", flag)
+                        restore = _sentinel_empty(monkeypatch)
+                        try:
+                            n0 = len(seen)
+                            outs[flag] = bc.forests_cuda(K, ce, sp, taus, E, mb_max=mbx)
+                        finally:
+                            restore()
+                        assert outs[flag] is not None
+                        work = any(bc.spine_chunks(M, k, mbx)[2] for k in bc.forest_layout(M)["ks"])
+                        assert (len(seen) > n0) == (flag == "1" and work), (kind, ename, pair)
+                    for a, b in zip(_all_outputs(outs["0"]), _all_outputs(outs["1"])):
+                        assert a.shape == b.shape and torch.equal(a, b), (kind, ename, pair, sp is None)
+                    (F, mb), (G, gb) = outs["0"][0], outs["1"][0]
+                    ti = torch.arange(T, device=DEV).repeat_interleave(mb.shape[1])
+                    S0, S1 = ft.build_spines(F, mb.reshape(-1), ti), ft.build_spines(G, gb.reshape(-1), ti)
+                    for key in ("node", "root", "height"):
+                        assert _same(S0[key], S1[key]), (kind, ename, pair, key)
+
+
+def test_small_build_against_reference_builder(monkeypatch):
+    # the small kernel's chunks at the released shape against build_forest itself (not only the build kernel), both
+    # forests: every chunk a spine reads
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_SMALL", "1")
+    T, M, Dh, H = 16, 128, 64, 16
+    for kind in ("randn", "ties", "negzero"):
+        g = torch.Generator().manual_seed(77 + len(kind))
+        K = _keys(kind, T, M, Dh, g).to(DEV)
+        ce = torch.rand(T, M, generator=g).to(DEV)
+        E = (torch.arange(M * 32 // 128, device=DEV, dtype=torch.float32) * 128 / 32).floor().long()
+        mbx = int(E.max())
+        taus = [_taus("zero", ce, H, g).float().to(DEV), _taus("q50", ce, H, g).float().to(DEV)]
+        got = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+        for tau, (G, gb) in zip(taus, got):
+            F, mb = _reference(K, ce, tau, H, E, None)
+            assert torch.equal(mb, gb) and torch.equal(F["adm"], G["adm"]) and torch.equal(F["m_tot"], G["m_tot"])
+            Dh_ = F["Dh"]
+            for k in F["ks"]:
+                ja, jsh, nj = bc.spine_chunks(M, k, mbx)
+                for j in range(ja, ja + (nj << jsh), 1 << jsh):
+                    nb_, npr, lb = F["bases"][k], F["nodes_per"][k], F["leafbases"][k]
+                    rows = slice(nb_ + j * npr, nb_ + (j + 1) * npr)
+                    mu_ref = F["node"][:, rows, :Dh_].to(torch.bfloat16)
+                    assert torch.equal(_bits(G["node_mu"][:, rows].float()), _bits(mu_ref.float())), (kind, k, j)
+                    assert torch.equal(_bits(F["node"][:, rows, Dh_ + 1:]), _bits(G["node_aux"][:, rows, 1:])), \
+                        (kind, k, j)
+                    assert torch.equal(F["leaf"][:, lb + (j << k):lb + ((j + 1) << k)],
+                                       G["leaf"][:, lb + (j << k):lb + ((j + 1) << k)]), (kind, k, j)
+
+
+def test_small_build_graph_capture(monkeypatch):
+    # the small kernel's unit table is static per shape: a captured FSB_BUILD_SMALL build replays on new inputs with
+    # the build kernel's bits
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_SMALL", "1")
+    T, M, Dh, H = 16, 512, 64, 16
+    g = torch.Generator().manual_seed(41)
+    K = torch.randn(T, M, Dh, generator=g).to(DEV)
+    ce = torch.rand(T, M, generator=g).to(DEV)
+    taus = [torch.zeros(H, device=DEV), torch.full((H,), 0.5, device=DEV)]
+    E = (torch.arange(M // 4, device=DEV) * 4).long()
+    mbx = int(E.max())
+    bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    K.copy_(torch.randn(T, M, Dh, generator=g).to(DEV))
+    ce.copy_(torch.rand(T, M, generator=g).to(DEV))
+    graph.replay()
+    torch.cuda.synchronize()
+    monkeypatch.setenv("FSB_BUILD_SMALL", "0")
+    ref = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    for (F, mb), (G, gb) in zip(ref, out):
+        assert _same(mb, gb)
+        for k in F["ks"]:
+            ja, jsh, nj = bc.spine_chunks(M, k, mbx)
+            for j in range(ja, ja + (nj << jsh), 1 << jsh):
+                assert all(torch.equal(a, b) for a, b in zip(_chunk_rows(G, k, j), _chunk_rows(F, k, j))), (k, j)
+
+
+def test_small_build_leaves_tall_and_untrimmed_builds(monkeypatch):
+    # chunks taller than 2^8 cells in the trimmed table, or a whole build without mb_max (decode, untrimmed prefill):
+    # the build kernel builds everything, the small kernel never runs
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_SMALL", "1")
+    seen = _small_launch_counter(monkeypatch, bc)
+    for T, M, trim in ((4, 2048, True), (16, 512, False), (4, 128, False)):
+        K, ce, taus, E, H = _inputs(T, M, 64, seed=M + T)
+        E = (torch.arange(M // 4, device=DEV) * 4).long()
+        got = bc.forests_cuda(K, ce, None, taus, E, mb_max=int(E.max()) if trim else None)
+        assert got is not None and not seen, (T, M, trim)
+        if not trim:
+            _exact(K, ce, None, taus, E, H, got)
+
+
+def test_small_units_cover_the_spine_chunks():
+    # the unit table holds every spine chunk of every head and forest exactly once: 16-slot runs of chunks of height
+    # <= 4 (one warp), and per taller chunk one A and one B warp on each of its 2^(k - 5) tile slots, which start at a
+    # multiple of their count; every CTA holds one height
+    bc = _bc()
+    dev = torch.device(DEV, torch.cuda.current_device())
+    for T, M in ((16, 128), (16, 512), (3, 300), (16, 40)):
+        nb = M * 32 // 128
+        mbx = int((torch.arange(nb, dtype=torch.float32) * 128 / 32).floor().max())
+        units, ncta = bc._small_units(T, M, 2, dev, mbx, bc._SMALL_KMAX)
+        u = units.cpu().view(-1, 16, 8)[:ncta]
+        want = {(f, t, k, j) for k in bc.forest_layout(M)["ks"] if k <= bc._SMALL_KMAX
+                for ja, jsh, nj in [bc.spine_chunks(M, k, mbx)] for j in range(ja, ja + (nj << jsh), 1 << jsh)
+                for f in range(2) for t in range(T)}
+        got = []
+        for c in range(ncta):
+            ks = {int(r[3]) for r in u[c] if int(r[0])}
+            assert len(ks) == 1, (M, c, ks)
+            tiles = {}
+            for w in range(16):
+                kind, f, t, k, j0, nsub, jsh, aux = (int(x) for x in u[c, w])
+                if kind == 1:
+                    assert nsub << k <= 16
+                    got += [(f, t, k, j0 + (i << jsh)) for i in range(nsub)]
+                elif kind == 2:
+                    s, ti, role = (aux >> 8) & 7, (aux >> 1) & 7, aux & 1
+                    assert w == bc._tile_warp(s, role) and (aux >> 12) & 1
+                    assert (s - ti) % (1 << (k - 5)) == 0
+                    tiles.setdefault((f, t, k, j0), set()).add((ti, role))
+            for (f, t, k, j0), roles in tiles.items():
+                assert roles == {(ti, r) for ti in range(1 << (k - 5)) for r in range(2)}, (M, c, k, j0)
+                got.append((f, t, k, j0))
+        assert len(got) == len(set(got)) and set(got) == want, M
+
+
+@pytest.mark.parametrize("Dh", [32, 64])
+def test_small_smem_covers_its_carve(Dh):
+    # the small kernel's dynamic shared memory covers carve_small, measured on the device code
+    from src.fsattn import fsb_beam_cuda as fb
+    bc = _bc()
+    src = bc._small_source(Dh) + r'''
+extern "C" __global__ void carve_end(int* out) {
+    extern __shared__ float smem[];
+    out[0] = (int)((char*)carve_small(smem).end - (char*)smem);
+}
+'''
+    dev = torch.device(DEV, torch.cuda.current_device())
+    out = torch.zeros(1, dtype=torch.int32, device=DEV)
+    fb.launch(fb.load_function(dev, src, "carve_end"), 1, 1, dev, [ctypes.c_void_p(out.data_ptr())])
+    torch.cuda.synchronize()
+    assert 0 < int(out.item()) <= bc._small_smem_bytes(Dh)
+
+
+def test_small_setup_failure_falls_back_to_the_build_kernel(monkeypatch):
+    # a small kernel that cannot be compiled or loaded turns FSB_BUILD_SMALL off for that variant, with one warning;
+    # its builds run in the build kernel, exactly
+    from src.fsattn import fsb_beam_cuda as fb
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_SMALL", "1")
+    monkeypatch.setattr(bc, "_small_failed", {})
+    T, M = 16, 128
+    K, ce, taus, E, H = _inputs(T, M, 64, seed=90, H=16)
+    E = (torch.arange(M // 4, device=DEV) * 4).long()
+    mbx = int(E.max())
+    restore = _sentinel_empty(monkeypatch)
+    try:
+        ref = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    finally:
+        restore()
+    load = fb.load_function
+    tries = []
+
+    def broken(dev, src, name):
+        if name == "fsb_forest_build_small":
+            tries.append(1)
+            raise RuntimeError("NVRTC compile failed: (test)")
+        return load(dev, src, name)
+
+    with monkeypatch.context() as m:
+        m.setattr(bc, "_small_fns", {})
+        m.setattr(fb, "load_function", broken)
+        restore = _sentinel_empty(monkeypatch)
+        try:
+            with pytest.warns(UserWarning):
+                got = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+            again = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+        finally:
+            restore()
+        assert len(tries) == 1
+    for out in (got, again):
+        for a, b in zip(_all_outputs(ref), _all_outputs(out)):
+            assert torch.equal(a, b)

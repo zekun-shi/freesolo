@@ -14,7 +14,9 @@ tl.math.div_rn / tl.sqrt_rn compile, the mean as mul.rn.ftz by 2^-p, which is
 bit-identical to div.rn.ftz by 2^p for every float), with the same pairwise-halving reduction trees, the padded
 group build's signed zeros (folded once per sum), first-index argmax, and torch's stable sort order (value order with
 -0 == +0, ties by slot). The source is compiled at first use with NVRTC through fsb_beam_cuda's loader; without
-NVRTC, or for shapes it does not cover, the existing builder runs.
+NVRTC, or for shapes it does not cover, the existing builder runs. With FSB_BUILD_SMALL=1 a short or mid prefill's
+trimmed build runs its chunks (all at most 2^8 cells high) in fsb_forest_build_small instead, with the same bits
+(small_on, _small_units).
 """
 from __future__ import annotations
 
@@ -37,7 +39,9 @@ _PROLOGUE = _BUILD_CU["_PROLOGUE"]
 _CPHASE = _BUILD_CU["_CPHASE"]
 _WPHASE = _BUILD_CU["_WPHASE"]
 _GPHASE = _BUILD_CU["_GPHASE"]
+_BHELPERS = _BUILD_CU["_BHELPERS"]
 _BUILD = _BUILD_CU["_BUILD"]
+_SMALL = _BUILD_CU["_SMALL"]
 
 _NC_EXTRA = 9                                            # [mu | rad | amax | pmin | cnt | chl | chr | src | off | len]
 _THREADS = 512
@@ -47,8 +51,31 @@ _TABLES_MAX = 8                                           # task tables kept for
 _tables: OrderedDict = OrderedDict()                      # shape -> task table, least recently used first
 _pinned: dict = {}                                        # shape -> task table a CUDA graph captured (kept for good)
 _failed: dict = {}                                        # kernel variant -> its setup error (that variant falls back)
+_small_fns: dict = {}                                     # kernel variant -> fsb_forest_build_small
+_small_failed: dict = {}                                  # kernel variant -> its setup error (FSB_BUILD_SMALL off)
 _warned: set = set()                                      # per-call failures already reported
 _ONLY_K = None                                            # debug: restrict the task table to these heights
+
+
+_SMALL_KMAX = 8                                          # tallest chunk fsb_forest_build_small builds (2^8 slots)
+# share of the SMs a unit table that fits on the GPU spreads over: the rest stays free for the prefill's overlapped
+# window branch (FSB_WINDOW_OVERLAP), which a build on every SM would hold back (each CTA fills an SM's registers)
+_SMALL_SM_SHARE = 0.5
+
+
+def small_on() -> bool:
+    # FSB_BUILD_SMALL=1: a trimmed prefill build (mb_max) whose chunks are all at most _SMALL_KMAX high runs them in
+    # fsb_forest_build_small (two warps per 32-slot tile, the CTAs spread over the GPU; the same records bit for bit):
+    # the short and mid prefills, where the build kernel's 512-slot batches leave most of the GPU idle and their long
+    # per-warp chains set the time. Taller builds are throughput-bound and stay in the build kernel, as do decode
+    # builds. 0 (the default): the build kernel builds every chunk
+    return os.environ.get("FSB_BUILD_SMALL", "0") == "1"
+
+
+def _small_fits(M: int, mb_max) -> bool:
+    # every chunk of the trimmed table is at most _SMALL_KMAX high (so the build kernel has nothing left)
+    return mb_max is not None and all(k <= _SMALL_KMAX or spine_chunks(M, k, mb_max)[2] == 0
+                                      for k in forest_layout(M)["ks"])
 
 
 def prefill_trim_on() -> bool:
@@ -144,9 +171,18 @@ def forest_layout(M: int) -> dict:
 _DEBUG_DEFS: dict = {}                                    # debug: extra #defines (e.g. DBG_TIME)
 
 
-def _source(Dh: int) -> str:
+def _defines(Dh: int) -> str:
     defs = {"DH": Dh, "PER": Dh // 32, "NC": Dh + _NC_EXTRA, "NA": _NC_EXTRA, "XS": Dh + 4, **_DEBUG_DEFS}
-    return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _bc._HELPERS + _COMMON + _PROLOGUE + _WPHASE + _CPHASE + _GPHASE + _BUILD
+    return "".join(f"#define {k} {v}\n" for k, v in defs.items())
+
+
+def _source(Dh: int) -> str:
+    return _defines(Dh) + _bc._HELPERS + _COMMON + _PROLOGUE + _WPHASE + _CPHASE + _GPHASE + _BHELPERS + _BUILD
+
+
+def _small_source(Dh: int) -> str:
+    # fsb_forest_build_small in a module of its own (compiled only when FSB_BUILD_SMALL is on)
+    return _defines(Dh) + _bc._HELPERS + _COMMON + _WPHASE + _CPHASE + _BHELPERS + _SMALL
 
 
 def _smem_bytes(Dh: int) -> int:
@@ -157,6 +193,11 @@ def _smem_bytes(Dh: int) -> int:
     c = 512 * (Dh + 4) + 4 * 512 + 2 * 16 + 4 * 512 + 3 * 8 * Dh + 512 + 16 * 5 + 32
     g = 2 * 8192 + 8192 + 16 * Dh + 2 * Dh + 16 * 5 + 32
     return 4 * max(c, g)
+
+
+def _small_smem_bytes(Dh: int) -> int:
+    # SSMEM_FLOATS: eight 32-row tiles (rows, sort keys, hand-off lists, slot arrays), node slots, per-warp lists
+    return 4 * (256 * (Dh + 4) + 6 * 256 + 16 + 4 * 256 + 12 * Dh + 48 + 2 * 512 + 4 * 256)
 
 
 class _Unavailable(RuntimeError):
@@ -198,6 +239,30 @@ def _functions(dev: torch.device, Dh: int):
         fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16)
     return fn[:2]
 
+
+
+def _small_function(dev: torch.device, Dh: int):
+    # fsb_forest_build_small of a variant, compiled at first use in a module of its own; a failure to set it up turns
+    # FSB_BUILD_SMALL off for the variant (its builds run every chunk in the build kernel), with one warning
+    key = _variant(dev.index, Dh)
+    fn = _small_fns.get(key)
+    if fn is None:
+        try:
+            fn = _bc.load_function(dev, _small_source(Dh), "fsb_forest_build_small")
+            _, cuda = _bc._libraries()
+            cuda.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            _bc._check(cuda.cuFuncSetAttribute(fn, 8, _small_smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:
+            if "CUDA error 2 (" in str(e):
+                raise torch.cuda.OutOfMemoryError(f"fsb_build_cuda: {e}") from e
+            _small_failed[key] = repr(e)
+            warnings.warn(f"FS-B small-chunk forest build unavailable on cuda:{dev.index} for head size {Dh}, "
+                          f"using the build kernel for every chunk: {e!r}")
+            return None
+        _small_fns[key] = fn
+    return fn
 
 
 def _launch(fn, grid: int, block: int, smem: int, dev: torch.device, args) -> None:
@@ -252,12 +317,14 @@ def _table_store(key, hit) -> None:
         gc.collect()
 
 
-def _table_key(T: int, M: int, nf: int, g: int, kmax_cuda: int, dev: torch.device, mb_max=None) -> tuple:
-    return (T, M, nf, g, kmax_cuda, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)), mb_max)
+def _table_key(T: int, M: int, nf: int, g: int, kmax_cuda: int, dev: torch.device, mb_max=None,
+               kmin: int = -1) -> tuple:
+    return (T, M, nf, g, kmax_cuda, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)), mb_max) + (
+        (kmin,) if kmin >= 0 else ())
 
 
 def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, only_layv: bool = False,
-           mb_max=None):
+           mb_max=None, kmin: int = -1):
     # static task table of one launch and the layout vector, cached per shape, grouping and spine bound: an LRU of the
     # _TABLES_MAX most recently used shapes, plus every table a CUDA graph captured (_table_lookup). Built outside
     # graph capture: the first call of a shape runs before any capture of it, as for the kernels.
@@ -266,12 +333,13 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
     # >= 10, raising flag when its slot lists are written; type 2: the 512-cell subtree n (at level k - 9) of such a
     # chunk. dep: the flag a task waits for (its parent G node), -1 none. The chunks of each height are
     # spine_chunks(M, k, mb_max): every chunk, or with mb_max only those a prefill spine can read (every other chunk,
-    # batched with l = 1; up to 16 heads per W batch when they fill it only partly).
+    # batched with l = 1; up to 16 heads per W batch when they fill it only partly). kmin >= 0: the heights above kmin
+    # only (fsb_forest_build_small builds the others).
     # Order: G roots (tallest first), then the batches longest first; each dependent task is inserted once the
     # estimated dispatch time (sum of earlier task costs / SMs) passes its parent's estimated finish, so waits are
     # rare; a task only ever waits for an earlier one, which is resident or finished by then (blocks start in index
     # order: see wait_flag in the kernel source).
-    key = _table_key(T, M, nf, g, kmax_cuda, dev, mb_max)
+    key = _table_key(T, M, nf, g, kmax_cuda, dev, mb_max, kmin)
     hit, pinned = _table_lookup(key)
     if hit is None and only_layv:
         lay = forest_layout(M)
@@ -281,7 +349,7 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
     elif hit is None or (not only_layv and hit[0] is None):
         lay = forest_layout(M)
         chunks = {k: spine_chunks(M, k, mb_max) for k in lay["ks"]}
-        use = [k for k in lay["ks"] if k <= kmax_cuda and (_ONLY_K is None or k in _ONLY_K) and chunks[k][2] > 0]
+        use = [k for k in lay["ks"] if kmin < k <= kmax_cuda and (_ONLY_K is None or k in _ONLY_K) and chunks[k][2] > 0]
         big = sorted((k for k in use if k >= 10), reverse=True)
         nsm = torch.cuda.get_device_properties(dev).multi_processor_count
         rows = []
@@ -351,6 +419,91 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
             hit[1].record_stream(s)
             hit[5].add(s.cuda_stream)
     return hit[:5]
+
+
+def _tile_warp(s: int, role: int) -> int:
+    # the warp of tile slot s's A (role 0) or B warp: A warps 0 .. 7, B warps 8 .. 15 rotated by two, so that the A
+    # warps (alone in the loads, C levels and level-5 split) and the B warps of a CTA's first tiles sit on different
+    # schedulers (warp w issues on scheduler w % 4)
+    return s if role == 0 else 8 + ((s + 2) & 7)
+
+
+# rough latency (thousands of cycles) of a fsb_forest_build_small unit by chunk height: the h-levels of a half tile from
+# level min(k, 4), plus the level-5 split and the C levels of the taller chunks
+_SMALL_COST = {0: 6, 1: 22, 2: 34, 3: 43, 4: 52, 5: 66, 6: 78, 7: 90, 8: 102}
+
+
+def _small_units(T: int, M: int, nf: int, dev: torch.device, mb_max, kmax: int):
+    # static unit table of fsb_forest_build_small for the chunks of height k <= kmax of spine_chunks(M, k, mb_max) (all
+    # heads of both forests) and its CTA count, cached per shape like the task tables (and pinned by a capture). Units
+    # (records: see the kernel source): one warp per 16 slots of chunks of height <= 4; per chunk of height 5 .. 8 one
+    # 32-slot tile slot per 32 slots, two warps each (A splits, B builds half 1), the chunk's first tile slot a multiple
+    # of its tile count (its named barriers: see the kernel). Each CTA holds units of one height only: every height runs
+    # its own long straight-line code path, and warps of different paths on one SM thrash its instruction cache (about
+    # twice as slow). A table that fits on _SMALL_SM_SHARE of the SMs at once (eight tile slots per SM) spreads each
+    # height over that many CTAs in proportion to its estimated work (latency x warps), a larger one fills each CTA,
+    # the longest heights first.
+    key = ("small", T, M, nf, kmax, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)), mb_max)
+    hit, pinned = _table_lookup(key)
+    if hit is None:
+        lay = forest_layout(M)
+        classes = {}                                       # height -> [(tiles (0: one warp of kind 1), record)]
+        for k in lay["ks"]:
+            if k > kmax or (_ONLY_K is not None and k not in _ONLY_K):
+                continue
+            ja, jsh, nj = spine_chunks(M, k, mb_max)
+            for f in range(nf):
+                for t in range(T):
+                    if k <= 4:
+                        per = 16 >> k
+                        for i0 in range(0, nj, per):
+                            classes.setdefault(k, []).append(
+                                (0, [1, f, t, k, ja + (i0 << jsh), min(per, nj - i0), jsh, 0]))
+                    else:
+                        for i in range(nj):
+                            classes.setdefault(k, []).append((1 << (k - 5), [2, f, t, k, ja + (i << jsh), 1, 0, 0]))
+        nsm = int(torch.cuda.get_device_properties(dev).multi_processor_count * _SMALL_SM_SHARE)
+        tiles = {k: sum(g for g, _ in us) + (sum(1 for g, _ in us if g == 0) + 1) // 2 for k, us in classes.items()}
+        alloc = {k: -(-n // 8) for k, n in tiles.items()}  # CTAs per height, eight tile slots each at the least
+        if sum(tiles.values()) <= 8 * nsm:
+            work = {k: _SMALL_COST[k] * sum(2 * g or 1 for g, _ in us) for k, us in classes.items()}
+            for _ in range(nsm - sum(alloc.values())):
+                k = max((k for k in classes if alloc[k] < len(classes[k])), key=lambda k: work[k] / alloc[k],
+                        default=None)
+                if k is None:
+                    break
+                alloc[k] += 1
+        recs = []
+        for k in sorted(classes, key=lambda k: -_SMALL_COST[k]):
+            n = alloc[k]
+            crec = [[[0] * 8 for _ in range(16)] for _ in range(n)]
+            free = [[2] * 8 for _ in range(n)]             # free warps of each tile slot
+            for i, (g, rec) in enumerate(classes[k]):
+                c = i % n
+                if g == 0:
+                    s0 = next((s for s in range(8) if free[c][s] == 1), None)
+                    s0 = next(s for s in range(8) if free[c][s] == 2) if s0 is None else s0
+                    crec[c][2 * s0 + 2 - free[c][s0]] = list(rec)
+                    free[c][s0] -= 1
+                else:
+                    s0 = next(s0 for s0 in range(0, 8, g) if all(free[c][s] == 2 for s in range(s0, s0 + g)))
+                    for ti in range(g):
+                        free[c][s0 + ti] = 0
+                        for role in range(2):
+                            r = list(rec)
+                            r[7] = role | (ti << 1) | ((s0 + ti) << 8) | (1 << 12)
+                            crec[c][_tile_warp(s0 + ti, role)] = r
+            recs += crec
+        flat = [r for cta in recs for r in cta] or [[0] * 8]
+        hit = (torch.tensor(flat, dtype=torch.int32, device=dev).reshape(-1, 8).contiguous(), len(recs),
+               {torch.cuda.current_stream(dev).cuda_stream})
+        _table_store(key, hit)
+    if not pinned:
+        s = torch.cuda.current_stream(dev)
+        if s.cuda_stream not in hit[2]:
+            hit[0].record_stream(s)
+            hit[2].add(s.cuda_stream)
+    return hit[0], hit[1]
 
 
 def _aligned(x: torch.Tensor, n: int) -> bool:
@@ -649,9 +802,17 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
     nf = len(taus)
     H = taus[0].shape[0]
     lay = forest_layout(M)
+    small = None
     if T > 0:
-        tasks, layv, bounds, nbig, nflags = _tasks(T, M, nf, _group(), dev, _kmax_cuda, mb_max=mb_max)
-        if torch.cuda.is_current_stream_capturing() and _variant(dev.index, Dh) not in _fns:
+        capturing = torch.cuda.is_current_stream_capturing()
+        if small_on() and _small_fits(M, mb_max) and _variant(dev.index, Dh) not in _small_failed:
+            if capturing and _variant(dev.index, Dh) not in _small_fns:
+                raise RuntimeError("fsb_build_cuda: kernels must be compiled before graph capture")
+            small = _small_function(dev, Dh)
+        kmin = min(_SMALL_KMAX, _kmax_cuda) if small is not None else -1
+        tasks, layv, bounds, nbig, nflags = _tasks(T, M, nf, _group(), dev, _kmax_cuda, mb_max=mb_max, kmin=kmin)
+        units, ncta = _small_units(T, M, nf, dev, mb_max, kmin) if small is not None else (None, 0)
+        if capturing and _variant(dev.index, Dh) not in _fns:
             raise RuntimeError("fsb_build_cuda: kernels must be compiled before graph capture")
         pro = _functions(dev, Dh)[0]
     Kbar = Kbar.contiguous(); ceil_c = ceil_c.contiguous()
@@ -683,6 +844,13 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
                                             P(a0.data_ptr()), P(a1.data_ptr()), P(m0.data_ptr()), P(m1.data_ptr()),
                                             P(b0.data_ptr()), P(b1.data_ptr()), P(ctl), I32(nctl), I32(T), I32(M), I32(H),
                                             I32(nb)])
+        if ncta > 0:
+            _launch(small, ncta, _THREADS, _small_smem_bytes(Dh), dev,
+                    [P(units.data_ptr()), P(layv.data_ptr()), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
+                     P(sp.data_ptr()), P(a0.data_ptr()), P(a1.data_ptr()), P(m0.data_ptr()), P(m1.data_ptr()),
+                     P(u0.data_ptr()), P(u1.data_ptr()), P(x0.data_ptr()), P(x1.data_ptr()),
+                     P(l0.data_ptr()), P(l1.data_ptr()), I32(M), I32(lay["Ntot"]), I32(lay["Ltot"]),
+                     I32(int(spread is not None)), I32(T)])
         for off, cnt in bounds:
             _launch(bld16, cnt, _THREADS, _smem_bytes(Dh), dev,
                     [P(tasks.data_ptr() + 40 * off), P(layv.data_ptr()), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),

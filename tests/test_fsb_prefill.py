@@ -777,7 +777,7 @@ def test_prefill_blkchunk_bounds_fast_stages(monkeypatch):
 def test_bench_rows_record_fsb_switches_and_latches(monkeypatch):
     # bench_efficiency rows of FS-B record the resolved FS-B switches and the fallback latches
     import bench_efficiency as be
-    from src.fsattn import fsb_beam_cuda, fsb_rows_cuda
+    from src.fsattn import fsb_beam_cuda, fsb_build_cuda, fsb_rows_cuda
     for name in be.FSB_FLAGS:
         monkeypatch.delenv(name, raising=False)
     assert be.fsb_flags() == be.FSB_FLAGS
@@ -788,10 +788,12 @@ def test_bench_rows_record_fsb_switches_and_latches(monkeypatch):
     monkeypatch.setattr(fsb_beam_cuda, "_rows2_failed", [])
     monkeypatch.setattr(fsb_rows_cuda, "_failed", [])
     monkeypatch.setattr(fsb_rows_cuda, "_v3_failed", ["RuntimeError('simulated')"])
+    monkeypatch.setattr(fsb_build_cuda, "_small_failed", {(0, 64, ()): "RuntimeError('small')"})
     monkeypatch.setattr(fp, "_warned", [1])
     assert be.fsb_fast_status() == {"beam_cuda_failure": None, "beam_rows_failure": "OSError('simulated')",
                                     "beam_rows2_failure": None, "rows_union_failure": None,
-                                    "rows_v3_failure": "RuntimeError('simulated')", "fast_prefill_unfused": True}
+                                    "rows_v3_failure": "RuntimeError('simulated')",
+                                    "build_small_failure": "RuntimeError('small')", "fast_prefill_unfused": True}
 
 
 def test_scratch_budget_counts_the_layer_tables(monkeypatch):

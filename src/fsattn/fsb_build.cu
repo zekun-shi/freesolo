@@ -280,6 +280,14 @@ __device__ __forceinline__ SM carve(float* smem) {
 }
 #define SMEM_FLOATS (512 * XS + 4 * 512 + 2 * 16 + 4 * 512 + 3 * 8 * DH + 512 + 16 * 5 + 32)   // _smem_bytes mirrors it
 
+// barrier of the NS threads (one per slot) that build one group of slots: the CTA for the build kernel's 512-slot
+// batches, named barrier bid for a smaller group of the small-chunk kernel (fsb_forest_build_small)
+template <int NS>
+__device__ __forceinline__ void group_sync(const int bid) {
+    if constexpr (NS == 512) __syncthreads();
+    else asm volatile("bar.sync %0, %1;" :: "r"(bid), "n"(NS) : "memory");
+}
+
 // column halving of node n (thread role (g, d, n) with G = V / DH lanes per (n, d)): sum over the node's slots of
 // val(slot, d), pad term folded in first, then the cross-lane steps; result valid in lane g == 0
 template <int LV, class F>
@@ -292,14 +300,16 @@ __device__ __forceinline__ float col_sum(F& val, const int g, const int n) {
     return s;
 }
 
-// One C level (nodes of V = 2^LV rows, NN = 512 / V of them). S.Xs and x hold the raw rows of the slots at level start;
+// One C level (nodes of V = 2^LV rows, NN = NS / V of them, NS slots and threads: 512 in the build kernel). S.Xs and x
+// hold the raw rows of the slots at level start;
 // after the mean each warp centres its rows into S.Xs in place (the row passes re-read them, so the 32-row tile is not
 // live across the CTA-wide column sums) and the split gathers the next order's raw rows from Kbar (kt: the head's rows,
 // cells from S.cell). The pad zero is folded once into each column sum (see the W phase note).
-template <int LV>
+template <int LV, int NS = 512>
 __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const Rec& R, const float* __restrict__ kt,
-                                         const int tid, const int lane, const int wid, const bool fold, const bool has_sp) {
-    constexpr int V = 1 << LV, NN = 512 / V, G = V / DH, LG = LV - LOGDH;
+                                         const int tid, const int lane, const int wid, const bool fold,
+                                         const bool has_sp, const int bid = 0) {
+    constexpr int V = 1 << LV, NN = NS / V, G = V / DH, LG = LV - LOGDH;
     const int g = tid & (G - 1), d = (tid >> LG) & (DH - 1), n = tid >> (LG + LOGDH);       // column role
     const int nw = (32 * wid) >> LV;                                                     // node of this warp's rows
     const int row = 32 * wid + lane;
@@ -313,7 +323,7 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
         const float mu = f_mul_ftz(s, f_pow2neg(LV));
         if (g == 0) S.mu[n * DH + d] = mu;
     }
-    __syncthreads();
+    group_sync<NS>(bid);
     // ---- centre the warp's rows (registers and S.Xs), squared distances, warp partial summaries
     {
         const float* muw = S.mu + nw * DH;
@@ -351,7 +361,7 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
             w5[0] = bd; w5[1] = __int_as_float(far); w5[2] = rq; w5[3] = am; w5[4] = __int_as_float(pm);
         }
     }
-    __syncthreads();
+    group_sync<NS>(bid);
     // ---- node summaries and records; v0 = Xc[far] / max(sqrt(d2[far]), 1e-6) (one warp per node)
     if (tid < NN) {
         const float* w5 = S.ws + 5 * (tid * (V / 32));
@@ -383,12 +393,12 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
             write_scalars(R, tid * V, LV, rad, f_max(am, 0.0f), pm, esp);
         }
     }
-    for (int e = tid; e < NN * DH; e += 512)
+    for (int e = tid; e < NN * DH; e += NS)
         if (node_full(R, (e / DH) * V)) {
             if (R.node_mu != nullptr) mu16_ptr(R, (e / DH) * V, LV)[e % DH] = f2bf(S.mu[e]);
             else mu_ptr(R, (e / DH) * V, LV)[e % DH] = S.mu[e];
         }
-    __syncthreads();
+    group_sync<NS>(bid);
     if (wid < NN) {
         const int nn = wid, far = S.far[nn];
         const float den = f_max(f_sqrt_ftz(S.pvp[nn]), 1e-6f);
@@ -407,7 +417,7 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
         __syncwarp();
         if (lane == 0) S.pvp[nn] = f_sz(an);
     }
-    __syncthreads();
+    group_sync<NS>(bid);
     const float xcp_d = f_mul(f_sub(zd, S.mu[n * DH + d]), 0.0f);
     // ---- two power iterations
 #pragma unroll 1
@@ -427,14 +437,14 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
             };
             S.pv[row] = rs_lazy(dv, lane);
         }
-        __syncthreads();
+        group_sync<NS>(bid);
         {
             auto val = [&](const int s) { return f_mul(S.Xs[s * XS + d], S.pv[s]); };
             float s = col_sum<LV>(val, g, n);
             if (fold) s = f_add(s, f_mul(xcp_d, S.pvp[n]));
             if (g == 0) S.vr[n * DH + d] = s;
         }
-        __syncthreads();
+        group_sync<NS>(bid);
         if (wid < NN) {
             const int nn = wid;
             float vv[PER];
@@ -452,7 +462,7 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
             const bool an = __all_sync(FULL, alln);
             if (lane == 0) S.pvp[nn] = f_sz(an);
         }
-        __syncthreads();
+        group_sync<NS>(bid);
     }
     // ---- projections -> sort keys (value order, -0 == +0, ties by slot in node)
     {
@@ -486,7 +496,7 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
         }
         S.keys[row] = ((u64)kk << 32) | (u64)(unsigned)sl;
     }
-    __syncthreads();
+    group_sync<NS>(bid);
     // ---- merge the node's sorted 32-runs pairwise (runs of 64, 128, ... V): an element's place in the merged run is
     // its place in its own run plus the keys below it in the partner run (keys are unique); ping-pong buffers
     u64* kin = S.keys;
@@ -501,7 +511,7 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
         for (int step = L; step >= 1; step >>= 1)
             if (pos + step <= L && part[pos + step - 1] < key) pos += step;
         kout[b0 + own + pos] = key;
-        __syncthreads();
+        group_sync<NS>(bid);
         u64* tmp = kin; kin = kout; kout = tmp;
     }
     const u64* ksort = kin;
@@ -517,22 +527,28 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
 #pragma unroll
             for (int i = 0; i < PER; i++) x[r][i] = __ldg(pr + 32 * i);
         }
-        __syncthreads();
+        group_sync<NS>(bid);
 #pragma unroll
         for (int r = 0; r < 32; r++)
 #pragma unroll
             for (int i = 0; i < PER; i++) S.Xs[(32 * wid + r) * XS + lane + 32 * i] = x[r][i];
         S.cell[row] = c; S.ce[row] = e; S.sp[row] = p;
     }
-    __syncthreads();
+    group_sync<NS>(bid);
 }
 
+// C levels lv0 .. 6 of a group of NS slots (levels above log2(NS) do not exist in it)
+template <int NS = 512>
 __device__ __forceinline__ void c_phase(const int lv0, float (&x)[32][PER], const SM& S, const Rec& R, const float* kt,
-                                         const int tid, const int lane, const int wid, const bool fold, const bool has_sp) {
-    if (lv0 >= 9) { c_level<9>(x, S, R, kt, tid, lane, wid, fold, has_sp); DBG_MARK(9); }
-    if (lv0 >= 8) { c_level<8>(x, S, R, kt, tid, lane, wid, fold, has_sp); DBG_MARK(8); }
-    if (lv0 >= 7) { c_level<7>(x, S, R, kt, tid, lane, wid, fold, has_sp); DBG_MARK(7); }
-    c_level<6>(x, S, R, kt, tid, lane, wid, fold, has_sp); DBG_MARK(6);
+                                         const int tid, const int lane, const int wid, const bool fold,
+                                         const bool has_sp, const int bid = 0) {
+    if constexpr (NS >= 512)
+        if (lv0 >= 9) { c_level<9, NS>(x, S, R, kt, tid, lane, wid, fold, has_sp, bid); DBG_MARK(9); }
+    if constexpr (NS >= 256)
+        if (lv0 >= 8) { c_level<8, NS>(x, S, R, kt, tid, lane, wid, fold, has_sp, bid); DBG_MARK(8); }
+    if constexpr (NS >= 128)
+        if (lv0 >= 7) { c_level<7, NS>(x, S, R, kt, tid, lane, wid, fold, has_sp, bid); DBG_MARK(7); }
+    c_level<6, NS>(x, S, R, kt, tid, lane, wid, fold, has_sp, bid); DBG_MARK(6);
 }
 // >>> SECTION: _WPHASE <<<
 
@@ -1002,30 +1018,36 @@ __device__ __forceinline__ void h_level(float (&x)[16][PER], int& cell, float& c
     }
 }
 
-// levels lv0 (<= 4) .. 0 of both 16-slot halves of a warp's 32 slots, one half at a time; rows from Xw via org
+// levels lv0 (<= 4) .. 0 of the 16-slot half h of a warp's 32 slots (lane l: slot l's cell, ceiling, spread and load
+// order org); rows from Xw via org
+__device__ __forceinline__ void h_half(const int lv0, const int h, const int cell32, const float ce32, const float sp32,
+                                       const int org32, const u64 zb, const float* Xw, int* pw, int* po, const Rec& R,
+                                       const int lane, const int gs0, const bool fold, const bool has_sp) {
+    const int src = 16 * h + (lane >> 1);
+    int cell = __shfl_sync(FULL, cell32, src), org = __shfl_sync(FULL, org32, src);
+    float ce = __shfl_sync(FULL, ce32, src), sp = __shfl_sync(FULL, sp32, src);
+    const unsigned zh = (unsigned)(zb >> (16 * PER * h));
+    float x[16][PER];
+#pragma unroll
+    for (int q = 0; q < 16; q++) {
+        const int oq = __shfl_sync(FULL, org, 2 * q);
+#pragma unroll
+        for (int i = 0; i < PER; i++) x[q][i] = Xw[oq * XS + lane + 32 * i];
+    }
+    const int gsh = gs0 + 16 * h;
+    if (lv0 >= 4) { h_level<4>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 4); }
+    if (lv0 >= 3) { h_level<3>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 3); }
+    if (lv0 >= 2) { h_level<2>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 2); }
+    if (lv0 >= 1) { h_level<1>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 1); }
+    h_level<0>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10);
+}
+
+// levels lv0 (<= 4) .. 0 of both 16-slot halves of a warp's 32 slots, one half at a time
 __device__ __forceinline__ void h_phase(const int lv0, const int cell32, const float ce32, const float sp32, const int org32,
                                         const u64 zb, const float* Xw, int* pw, int* po, const Rec& R, const int lane,
                                         const int gs0, const bool fold, const bool has_sp) {
 #pragma unroll 1
-    for (int h = 0; h < 2; h++) {
-        const int src = 16 * h + (lane >> 1);
-        int cell = __shfl_sync(FULL, cell32, src), org = __shfl_sync(FULL, org32, src);
-        float ce = __shfl_sync(FULL, ce32, src), sp = __shfl_sync(FULL, sp32, src);
-        const unsigned zh = (unsigned)(zb >> (16 * PER * h));
-        float x[16][PER];
-#pragma unroll
-        for (int q = 0; q < 16; q++) {
-            const int oq = __shfl_sync(FULL, org, 2 * q);
-#pragma unroll
-            for (int i = 0; i < PER; i++) x[q][i] = Xw[oq * XS + lane + 32 * i];
-        }
-        const int gsh = gs0 + 16 * h;
-        if (lv0 >= 4) { h_level<4>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 4); }
-        if (lv0 >= 3) { h_level<3>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 3); }
-        if (lv0 >= 2) { h_level<2>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 2); }
-        if (lv0 >= 1) { h_level<1>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10 + 1); }
-        h_level<0>(x, cell, ce, sp, org, zh, Xw, pw, po, R, lane, gsh, fold, has_sp); DBG_MARK(10);
-    }
+    for (int h = 0; h < 2; h++) h_half(lv0, h, cell32, ce32, sp32, org32, zb, Xw, pw, po, R, lane, gs0, fold, has_sp);
 }
 
 // W phase from nodes of 2^lv0 rows: the full-tile level 5 (x holds the rows), then the half-tile levels
@@ -1363,19 +1385,16 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
         __syncthreads();
     }
 }
-// >>> SECTION: _BUILD <<<
+// >>> SECTION: _BHELPERS <<<
 
-// ---- K1: forest construction tasks (512 threads; dynamic shared memory) ----
-// task record (8 ints): type, f, t, k, j0, nsub, l0, n0.  type 0: batch of nsub chunks j0 + (i << l0) of height
-// k <= 9 (nsub << k <= 512 slots; l0 = 0: consecutive chunks, 1: every other chunk), for k <= 5 of the n0 heads
-// t .. t + n0 - 1 (0: one head); LAY: bases[16] | leafbases[16] | fold mask (bit k: Kpad(k) > k)
-
+// ---- batch helpers of the build kernels (fsb_forest_build*, fsb_forest_build_small) ----
 // records of the n chunks ja + (c << jsh) of height k that hold no admitted cell: mu = signed zeros of Kbar[t, 0] (the
-// cell an empty slot reads), rad = amax = 0, pmin = 2^30, static fields; leaves -1. One warp per node record.
+// cell an empty slot reads), rad = amax = 0, pmin = 2^30, static fields; leaves -1. One warp per node record, warps
+// wid of nw (the CTA's warps by default)
 __device__ void empty_chunks(const Args& A, const int f, const int t, const int k, const int ja, const int n,
-                             const int jsh) {
+                             const int jsh, const int wid = threadIdx.x >> 5, const int nw = blockDim.x >> 5) {
     if (n <= 0) return;
-    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int lane = threadIdx.x & 31;
     const int nodes = (2 << k) - 1, base = A.lay[k], lbase = A.lay[16 + k];
     const bool m16 = A.node_mu[f] != nullptr;
     float* nt = m16 ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
@@ -1428,7 +1447,7 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
         }
     }
     i64* lt = A.leaf[f] + (i64)t * A.Ltot + lbase;
-    for (int e2 = threadIdx.x; e2 < n << k; e2 += blockDim.x)
+    for (int e2 = 32 * wid + lane; e2 < n << k; e2 += 32 * nw)
         lt[((ja + ((e2 >> k) << jsh)) << k) + (e2 & ((1 << k) - 1))] = -1;
 }
 
@@ -1462,6 +1481,13 @@ __device__ __forceinline__ void zb_of_row(const SM& S, const int ci, const int r
     const unsigned hi = DH == 64 ? __ballot_sync(FULL, sgn(S.Xs[row * XS + lane + (DH == 64 ? 32 : 0)])) : 0u;
     if (lane == 0) S.zb[ci] = (u64)lo | ((u64)hi << 32);
 }
+
+// >>> SECTION: _BUILD <<<
+
+// ---- K1: forest construction tasks (512 threads; dynamic shared memory) ----
+// task record (8 ints): type, f, t, k, j0, nsub, l0, n0.  type 0: batch of nsub chunks j0 + (i << l0) of height
+// k <= 9 (nsub << k <= 512 slots; l0 = 0: consecutive chunks, 1: every other chunk), for k <= 5 of the n0 heads
+// t .. t + n0 - 1 (0: one head); LAY: bases[16] | leafbases[16] | fold mask (bit k: Kpad(k) > k)
 
 // type 0, k <= 5: a batch of nsub chunks of height k, one warp per 32 slots. np > 1 packs the same chunks of the np
 // heads t0 .. t0 + np - 1 into one block, 16 / 2^ceil(log2 np) warps per head (the table keeps each head's slots
@@ -2010,3 +2036,352 @@ fsb_spine_lean16(const unsigned short* __restrict__ NMU0, const float* __restric
     }
 }
 
+// >>> SECTION: _SMALL <<<
+
+// ---- K1s (FSB_BUILD_SMALL=1): the chunks (height k <= 8) of a short or mid prefill's trimmed build ----
+// fsb_forest_build_small builds the chunks that the build kernel batches 512 slots per CTA (task type 0) in units that
+// spread a short prefill's few chunks over the GPU. A 512-thread CTA hosts eight 32-slot tile slots; each warp reads
+// its unit record (8 ints: kind, f, t, k, j0, nsub, jsh, aux), 16 records per CTA. Kind 0: an idle warp. Kind 1
+// (k <= 4): one warp builds the chunks j0 + (i << jsh), i < nsub (at most 16 slots) of head t, levels k .. 0 on one
+// half tile (task_wbatch's h-levels). Kind 2 (k >= 5): tile ti (aux bits 1-3) of the 2^(k - 5) tiles of chunk j0, on
+// tile slot s (aux bits 8-10). Its A warp (aux bit 0 clear) loads the tile, runs the C levels k .. 6 together with the
+// chunk's other A warps (c_level on the chunk's 2^k slots, named barrier 9 + s0 / 2 over those threads, s0 the
+// chunk's first tile slot) and the level-5 split of its tile (w_level<5>); with aux bit 12 (split) it then hands the
+// tile's slot order to its B warp (aux bit 0 set) over named barrier 1 + s and builds half 0 while B builds half 1,
+// else it builds both halves itself. The table (fsb_build_cuda._small_units) puts one height in each CTA and the A
+// and B warps of a tile on different schedulers. Every record and bit is the build kernel's: the same level functions
+// on the same slots in the same order, only the warps that run them differ. Every branch around shuffles tests a value
+// that ptxas can see is warp-uniform (a record field or count broadcast from lane 0, uni(), a kernel parameter): on a
+// value it cannot prove uniform it compiles the code twice, once more with each shuffle behind a WARPSYNC call, and the
+// copies spill.
+#ifdef DBG_TIME
+extern "C" __device__ u64 g_dbs[65536];                // per warp: 8 globaltimer stamps of its unit (0 start, 7 end)
+#define DBS(slot) \
+    do { if ((threadIdx.x & 31) == 0) g_dbs[8 * (16 * blockIdx.x + (threadIdx.x >> 5)) + (slot)] = gtimer(); } while (0)
+#else
+#define DBS(slot) do { } while (0)
+#endif
+struct SSM {                   // shared memory of a small-chunk CTA: eight tile slots of 32 rows (end: SSMEM_FLOATS)
+    float* Xs; u64* keys; u64* keys2; u64* hzb; u64* zb; int* cell; float* ce; float* sp; float* pv;
+    float* mu; float* v; float* vr; float* ws; int* far; float* pvp; int* pw; int* po;
+    int* hcell; float* hce; float* hsp; int* horg; float* end;
+};
+__device__ __forceinline__ SSM carve_small(float* smem) {
+    SSM S;
+    float* p = smem;
+    S.Xs = p; p += 256 * XS;
+    S.keys = (u64*)p; p += 2 * 256;
+    S.keys2 = (u64*)p; p += 2 * 256;
+    S.hzb = (u64*)p; p += 2 * 256;
+    S.zb = (u64*)p; p += 2 * 8;
+    S.cell = (int*)p; p += 256;
+    S.ce = p; p += 256;
+    S.sp = p; p += 256;
+    S.pv = p; p += 256;
+    S.mu = p; p += 4 * DH;
+    S.v = p; p += 4 * DH;
+    S.vr = p; p += 4 * DH;
+    S.ws = p; p += 8 * 5;
+    S.far = (int*)p; p += 4;
+    S.pvp = p; p += 4;
+    S.pw = (int*)p; p += 16 * 32;
+    S.po = (int*)p; p += 16 * 32;
+    S.hcell = (int*)p; p += 256;
+    S.hce = p; p += 256;
+    S.hsp = p; p += 256;
+    S.horg = (int*)p; p += 256;
+    S.end = p;
+    return S;
+}
+#define SSMEM_FLOATS (256 * XS + 6 * 256 + 16 + 4 * 256 + 12 * DH + 48 + 2 * 512 + 4 * 256)   // _small_smem_bytes
+
+__device__ __forceinline__ int uni(const int v) { return __shfl_sync(FULL, v, 0); }
+struct SArgs {                 // the inputs and one forest's tables (selected by f), uniform scalars, no arrays
+    const int* lay; const float* kb; const float* ce; const float* spr; const i64* adm; const i64* mt;
+    unsigned short* node_mu; float* node_aux; i64* leaf;
+    int M, Ntot, Ltot, has_sp;
+};
+
+// empty_chunks for one forest's split tables, warps wr of nw
+__device__ __forceinline__ void small_empty(const SArgs& A, const int t, const int k, const int ja, const int n,
+                                            const int jsh, const int wr, const int nw) {
+    if (n <= 0) return;
+    const int lane = threadIdx.x & 31;
+    const int nodes = (2 << k) - 1, base = A.lay[k], lbase = A.lay[16 + k];
+    unsigned short* ntm = A.node_mu + (i64)t * A.Ntot * DH;
+    float* nta = A.node_aux + (i64)t * A.Ntot * NA;
+    float z[PER];
+#pragma unroll
+    for (int i = 0; i < PER; i++) z[i] = f_sz(sgn(A.kb[(i64)t * A.M * DH + lane + 32 * i]));
+    const int tot = n * nodes;
+    for (int it = wr; it < tot; it += nw) {
+        const int jj = ja + ((it / nodes) << jsh), h = it - (it / nodes) * nodes;
+        const int rb = base + jj * nodes;
+        const int l = 31 - __clz(h + 1), idx = h + 1 - (1 << l), V = 1 << (k - l);
+        unsigned short* pm = ntm + (i64)(rb + h) * DH;
+#pragma unroll
+        for (int i = 0; i < PER; i++) pm[lane + 32 * i] = f2bf(z[i]);
+        if (lane < 9) {
+            float val;
+            switch (lane) {
+                case 0: case 1: val = 0.0f; break;
+                case 2: val = 1073741824.0f; break;
+                case 3: case 8: val = (float)V; break;
+                case 4: val = l < k ? (float)(rb + 2 * h + 1) : -1.0f; break;
+                case 5: val = l < k ? (float)(rb + 2 * h + 2) : -1.0f; break;
+                case 6: val = 1.0f; break;
+                default: val = (float)(lbase + jj * (1 << k) + idx * V); break;
+            }
+            nta[(i64)(rb + h) * NA + lane] = val;
+        }
+    }
+    i64* lt = A.leaf + (i64)t * A.Ltot + lbase;
+    for (int e2 = 32 * wr + lane; e2 < n << k; e2 += 32 * nw)
+        lt[((ja + ((e2 >> k) << jsh)) << k) + (e2 & ((1 << k) - 1))] = -1;
+}
+
+// the build kernel's carve-up of the chunk on tile slots s0 .. s0 + 2^(k - 5) - 1 (s0 a multiple of the tile count):
+// its rows and slot arrays, and node slots that no other chunk of the CTA uses
+__device__ __forceinline__ SM group_view(const SSM& T, const int s0) {
+    SM S;
+    S.Xs = T.Xs + 32 * s0 * XS;
+    S.keys = T.keys + 32 * s0;
+    S.keys2 = T.keys2 + 32 * s0;
+    S.zb = T.zb + s0;
+    S.pw = nullptr;                                    // the C levels do not use it
+    S.cell = T.cell + 32 * s0;
+    S.ce = T.ce + 32 * s0;
+    S.sp = T.sp + 32 * s0;
+    S.pv = T.pv + 32 * s0;
+    S.mu = T.mu + (s0 >> 1) * DH;
+    S.v = T.v + (s0 >> 1) * DH;
+    S.vr = T.vr + (s0 >> 1) * DH;
+    S.ws = T.ws + 5 * s0;
+    S.far = T.far + (s0 >> 1);
+    S.pvp = T.pvp + (s0 >> 1);
+    S.end = T.end;
+    return S;
+}
+
+// load_rows over a group of NS slots and threads (every slot admitted)
+template <int NS>
+__device__ __forceinline__ void load_rows_g(const SM& S, const float* kt, const int tid) {
+    constexpr int Q = DH / 4;
+    float4 buf[Q];
+#pragma unroll
+    for (int u = 0; u < Q; u++) {
+        const int e = tid + NS * u, s = e / Q, q = e - s * Q;
+        buf[u] = __ldg(reinterpret_cast<const float4*>(kt + (i64)S.cell[s] * DH) + q);
+    }
+#pragma unroll
+    for (int u = 0; u < Q; u++) {
+        const int e = tid + NS * u, s = e / Q, q = e - s * Q;
+        *reinterpret_cast<float4*>(S.Xs + s * XS + 4 * q) = buf[u];
+    }
+}
+
+__device__ __forceinline__ Rec small_rec(const SArgs& A, const int t, const int k, const int j0, const int jsh,
+                                         const int nfull) {
+    Rec R;
+    R.node = nullptr;
+    R.node_mu = A.node_mu + (i64)t * A.Ntot * DH;
+    R.node_aux = A.node_aux + (i64)t * A.Ntot * NA;
+    R.leaf = A.leaf + (i64)t * A.Ltot;
+    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = j0; R.jsh = jsh;
+    R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
+    R.nfull = nfull; R.zsh = min(k, 5);
+    return R;
+}
+
+// kind 2, A warp of a chunk of height 5 (one tile): task_wbatch's warp on the one-chunk batch, its rows into Xw
+__device__ __forceinline__ void small_tile_load(const SArgs& A, const int t, const int j0, float* Xw, int& cell,
+                                                float& ce, float& sp, u64& zb) {
+    const int lane = threadIdx.x & 31, M = A.M;
+    cell = (int)A.adm[(i64)t * M + ((i64)j0 << 5) + lane];
+    ce = A.ce[(i64)t * M + cell];
+    sp = A.has_sp ? A.spr[(i64)t * M + cell] : 0.0f;
+    const float* kt = A.kb + (i64)t * M * DH + lane;
+    float x[32][PER];
+#pragma unroll
+    for (int r = 0; r < 32; r++) {
+        const float* p = kt + (i64)__shfl_sync(FULL, cell, r) * DH;
+#pragma unroll
+        for (int i = 0; i < PER; i++) x[r][i] = __ldg(p + 32 * i);
+    }
+    unsigned zc[PER];
+#pragma unroll
+    for (int i = 0; i < PER; i++) zc[i] = sgn(x[0][i]);
+    zb = 0;
+#pragma unroll
+    for (int r = 0; r < 32; r++)
+#pragma unroll
+        for (int i = 0; i < PER; i++) {
+            Xw[r * XS + lane + 32 * i] = x[r][i];
+            zb |= (u64)zc[i] << (r * PER + i);
+        }
+    __syncwarp();
+}
+
+// kind 2, A warp ti of a chunk of NS = 2^k slots on tile slots s0 = s - ti ..: task_cbatch on the chunk (loads, C
+// levels k .. 6 with the chunk's other A warps); leaves the tile's slots in level-5 order in Xw (its rows) and in
+// cell / ce / sp, the pad signs in zb
+template <int NS>
+__device__ __forceinline__ void small_c(const SArgs& A, const SSM& T, const Rec& R, const int t, const int k,
+                                        const int j0, const int ti, const int s, const bool fold, int& cell, float& ce,
+                                        float& sp, u64& zb) {
+    const int lane = threadIdx.x & 31, M = A.M;
+    const int s0 = s - ti, bid = 9 + (s0 >> 1), gt = 32 * ti + lane;
+    const SM S = group_view(T, s0);
+    const float* kt = A.kb + (i64)t * M * DH;
+    {
+        const int c = (int)A.adm[(i64)t * M + ((i64)j0 << k) + gt];
+        S.cell[gt] = c;
+        S.ce[gt] = A.ce[(i64)t * M + c];
+        S.sp[gt] = A.has_sp ? A.spr[(i64)t * M + c] : 0.0f;
+    }
+    group_sync<NS>(bid);
+    load_rows_g<NS>(S, kt, gt);
+    group_sync<NS>(bid);
+    if (ti == 0) zb_of_row(S, 0, 0, lane);
+    group_sync<NS>(bid);
+    DBS(1);
+    float x[32][PER];
+#pragma unroll
+    for (int r = 0; r < 32; r++)
+#pragma unroll
+        for (int i = 0; i < PER; i++) x[r][i] = S.Xs[(32 * ti + r) * XS + lane + 32 * i];
+    c_phase<NS>(k, x, S, R, kt, gt, lane, ti, fold, A.has_sp != 0, bid);
+    DBS(2);
+    cell = S.cell[gt];
+    ce = S.ce[gt];
+    sp = S.sp[gt];
+    zb = 0;
+#pragma unroll
+    for (int i = 0; i < PER; i++) {
+        const u64 bit = (S.zb[0] >> (lane + 32 * i)) & 1ull;
+#pragma unroll
+        for (int r = 0; r < 32; r++) zb |= bit << (r * PER + i);
+    }
+}
+
+// Every unit ends in the h-levels of one or two half tiles, and every unit of height >= 5 passes through the level-5
+// split: the kernel reaches each of them from one place (one inlined copy each, with every branch to it warp-uniform),
+// so the instruction cache holds one copy of the long straight-line level code and ptxas compiles it once, converged.
+extern "C" __global__ void __launch_bounds__(512, 1)
+fsb_forest_build_small(const int* __restrict__ UNITS, const int* __restrict__ LAY,
+                       const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
+                       const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
+                       const i64* __restrict__ MT0, const i64* __restrict__ MT1,
+                       unsigned short* __restrict__ MU0, unsigned short* __restrict__ MU1,
+                       float* __restrict__ AX0, float* __restrict__ AX1,
+                       i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
+                       const int M, const int Ntot, const int Ltot, const int has_sp, const int T) {
+    extern __shared__ float smem[];
+    const int lane = threadIdx.x & 31, wid = uni(threadIdx.x >> 5);
+    const int* u = UNITS + 8 * (16 * blockIdx.x + wid);
+    const int kind = uni(u[0]);
+    if (kind == 0) return;
+    DBS(0);
+    DBG_MARK(1);
+    const int f = uni(u[1]), t = uni(u[2]), k = uni(u[3]), j0 = uni(u[4]), nsub = uni(u[5]), jsh = uni(u[6]);
+    const int aux = uni(u[7]);
+    SArgs A;                                 // forest f's tables: selects on the uniform f, no indexed pointer arrays
+    A.lay = LAY; A.kb = KB; A.ce = CE; A.spr = SPR;
+    A.adm = f ? ADM1 : ADM0; A.mt = f ? MT1 : MT0;
+    A.node_mu = f ? MU1 : MU0; A.node_aux = f ? AX1 : AX0; A.leaf = f ? LEAF1 : LEAF0;
+    A.M = M; A.Ntot = Ntot; A.Ltot = Ltot; A.has_sp = has_sp;
+    const SSM S = carve_small(smem);
+    const bool fold = uni((LAY[32] >> k) & 1), hsp = has_sp != 0;
+    const int s = (aux >> 8) & 7, ti = (aux >> 1) & 7;
+    int* pw = S.pw + 32 * wid;
+    int* po = S.po + 32 * wid;
+    Rec R;
+    float* Xw;
+    int cell, org = lane, lv0 = 4, h = 0, gs0 = 0;
+    float ce, sp;
+    u64 zb = 0;
+    bool w5 = false, split = false;
+    if (kind == 1) {                         // the chunks j0 + (i << jsh), i < nsub, of height <= 4 (16 slots)
+        const int nfull = uni(batch_full((int)A.mt[t], k, j0, nsub, jsh));
+        small_empty(A, t, k, j0 + (nfull << jsh), nsub - nfull, jsh, 0, 1);
+        if (nfull == 0) return;
+        R = small_rec(A, t, k, j0, jsh, nfull);
+        Xw = S.Xs + 16 * wid * XS;
+        const bool ok = lane < (nfull << k);
+        cell = ok ? (int)A.adm[(i64)t * M + slot_pos(j0, k, jsh, lane)] : -1;
+        ce = ok ? A.ce[(i64)t * M + cell] : 0.0f;
+        sp = (ok && hsp) ? A.spr[(i64)t * M + cell] : 0.0f;
+        const float* kt = A.kb + (i64)t * M * DH + lane;
+        float x[16][PER];
+#pragma unroll
+        for (int r = 0; r < 16; r++) {
+            const float* p = kt + (i64)max(__shfl_sync(FULL, cell, r), 0) * DH;
+#pragma unroll
+            for (int i = 0; i < PER; i++) x[r][i] = __ldg(p + 32 * i);
+        }
+        unsigned zc[PER];                    // pad sign of the current chunk (its first row), per dim
+#pragma unroll
+        for (int r = 0; r < 16; r++)
+#pragma unroll
+            for (int i = 0; i < PER; i++) {
+                Xw[r * XS + lane + 32 * i] = x[r][i];
+                if ((r & ((1 << k) - 1)) == 0) zc[i] = sgn(x[r][i]);
+                zb |= (u64)zc[i] << (r * PER + i);
+            }
+        __syncwarp();
+        lv0 = k;
+    } else {                                 // tile ti of chunk j0 of height k >= 5
+        if (((j0 + 1) << k) > uni((int)A.mt[t])) {
+            // the admitted cells are a prefix: a chunk with an unadmitted cell holds none; its A warps write the
+            // empty records
+            if (!(aux & 1)) small_empty(A, t, k, j0, 1, 0, ti, 1 << (k - 5));
+            return;
+        }
+        R = small_rec(A, t, k, j0, 0, 1);
+        gs0 = 32 * ti;
+        Xw = S.Xs + 32 * s * XS;
+        split = (aux >> 12) & 1;
+        if (aux & 1) {                       // B: half 1 of the tile once A has split it
+            asm volatile("bar.sync %0, 64;" :: "r"(1 + s) : "memory");
+            DBS(4);
+            const int e = 32 * s + lane;
+            cell = S.hcell[e]; ce = S.hce[e]; sp = S.hsp[e]; org = S.horg[e]; zb = S.hzb[e];
+            h = 1;
+        } else {
+            if (k == 5) {
+                small_tile_load(A, t, j0, Xw, cell, ce, sp, zb);
+                DBS(1);
+            } else if (k == 6) {
+                small_c<64>(A, S, R, t, k, j0, ti, s, fold, cell, ce, sp, zb);
+            } else if (k == 7) {
+                small_c<128>(A, S, R, t, k, j0, ti, s, fold, cell, ce, sp, zb);
+            } else {
+                small_c<256>(A, S, R, t, k, j0, ti, s, fold, cell, ce, sp, zb);
+            }
+            w5 = true;
+        }
+    }
+    if (w5) {                                // the level-5 split of the tile (rows in slot order in Xw)
+        float x[32][PER];
+#pragma unroll
+        for (int r = 0; r < 32; r++)
+#pragma unroll
+            for (int i = 0; i < PER; i++) x[r][i] = Xw[r * XS + lane + 32 * i];
+        w_level<5, false>(x, cell, ce, sp, org, zb, Xw, pw, po, R, lane, gs0, fold, hsp);
+        DBG_MARK(10 + 5);
+        DBS(3);
+        if (split) {
+            const int e = 32 * s + lane;
+            S.hcell[e] = cell; S.hce[e] = ce; S.hsp[e] = sp; S.horg[e] = org; S.hzb[e] = zb;
+            asm volatile("bar.arrive %0, 64;" :: "r"(1 + s) : "memory");
+        }
+    }
+    const int h1 = w5 && !split ? 2 : h + 1;
+#pragma unroll 1
+    for (int hh = h; hh < h1; hh++) {
+        DBG_MARK(9);
+        h_half(lv0, hh, cell, ce, sp, org, zb, Xw, pw, po, R, lane, gs0, fold, hsp);
+    }
+    __syncwarp();
+    DBS(7);
+}
