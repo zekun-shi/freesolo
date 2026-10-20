@@ -28,12 +28,12 @@ def _fsb_execution_env():
 
 def _attn_execution_env():
     # inference execution switches of every variant (window, trunk glue, prefill readout and its launch shape, FS-L
-    # selection, KV-cache cell statistics); "0" restores the eager path
+    # selection, KV-cache cell statistics, the FS / FS-L prefill window fork); "0" restores the eager path
     defaults = {"FSL_SLIDING_MODE": "chunked", "FSL_WINDOW_BATCHED": "1", "FSL_TRUNK_FUSED": "1",
                 "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1", "FSL_PREFILL_CELL_REUSE": "1",
                 "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0", "FSL_READOUT_G": "64", "FSL_READOUT_WARPS": "4",
                 "FSL_READOUT_STAGES": "2", "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1",
-                "FSL_FAST_CACHE_STATS": "1"}
+                "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "0"}
     return {name: os.environ.get(name, default) for name, default in defaults.items()}
 
 def _file_sha256_once(path):

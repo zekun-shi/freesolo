@@ -227,9 +227,10 @@ class FSAttn(nn.Module):
         return out, ev
 
     def _window_overlap_on(self) -> bool:
-        # FSB_WINDOW_OVERLAP=1: an FS-B prefill's chunked-RoPE window branch runs concurrently with the long-range
-        # branch (_window_fork), which does not read the window output
-        return self.fsb_enabled and os.environ.get("FSB_WINDOW_OVERLAP", "0") == "1"
+        # FSB_WINDOW_OVERLAP=1 (FS-B layers) / FS_WINDOW_OVERLAP=1 (FS and FS-L layers): a prefill's chunked-RoPE
+        # window branch runs concurrently with the long-range branch (_window_fork), which does not read the window
+        # output before its join (the readout's hand-off or _combine)
+        return os.environ.get("FSB_WINDOW_OVERLAP" if self.fsb_enabled else "FS_WINDOW_OVERLAP", "0") == "1"
 
     @staticmethod
     def _window_fork(fn, dev):
