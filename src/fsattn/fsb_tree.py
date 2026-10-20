@@ -2092,12 +2092,17 @@ def readout_handoff(attn, state=None):
     # returns W_o's input (_lr_combine_sr, _lr_combined) and the cell statistics handed to the KV cache
     # (_cell_stats_out). Without state: a snapshot. With a snapshot: restore it, for a caller that discards a readout
     # it already queued and redoes the layer (the deferred rows capacity check), so the redo combines again and the
-    # cache keeps one copy of the statistics.
+    # cache keeps one copy of the statistics. An in-place hand-off (_lr_inplace_sr: the readout writes W_o's input
+    # over the window output) is snapshotted with a copy of the window output, since the first readout overwrites it.
     if state is None:
         cs = getattr(attn, "_cell_stats_out", None)
-        return (getattr(attn, "_lr_combine_sr", None), getattr(attn, "_lr_combined", False),
-                None if cs is None else len(cs))
+        sr = getattr(attn, "_lr_combine_sr", None)
+        inplace = bool(getattr(attn, "_lr_inplace_sr", False))
+        return (sr.clone() if (inplace and sr is not None) else sr, getattr(attn, "_lr_combined", False),
+                None if cs is None else len(cs), inplace)
     attn._lr_combine_sr, attn._lr_combined = state[0], state[1]
+    if len(state) > 3:
+        attn._lr_inplace_sr = state[3]
     cs = getattr(attn, "_cell_stats_out", None)
     if cs is not None and state[2] is not None:
         del cs[state[2]:]

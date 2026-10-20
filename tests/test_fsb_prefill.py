@@ -548,6 +548,53 @@ def test_overflow_redo_keeps_fused_combine(monkeypatch, fast):
     assert _same(res["1"][0], res["0"][0])
 
 
+
+@gpu
+@torch.no_grad()
+def test_overflow_redo_with_in_place_window_output(monkeypatch):
+    # with the window output handed over in place (the chunked-RoPE prefill), the first fused readout overwrites it
+    # with W_o's input; a deferred overflow redo must combine from the window output itself, not from that sum.
+    # A flag forced on the first stage (no row really overflows, so the redo repeats the same selection) must
+    # leave the layer output unchanged
+    attn = _attn(blkchunk=2)
+    N = 16384 + 1024                                      # M = 544 > UCAP: the stages raise deferred flags
+    Q, K, V, sigma = _inputs(43, 1, 4, N)
+    _set_tau(attn, K)
+    assert rows.UCAP >= 512                               # the in-place hand-off's gate (FSAttn._begin_lr)
+    for k, v in (("FS_FUSED_ATTN", "1"), ("FSL_READOUT_FUSED", "1"), ("FSB_FAST_PREFILL", "1"),
+                 ("FSB_ROWS_DEFER", "1")):
+        monkeypatch.setenv(k, v)
+    real = rows.union_rerank_rows
+    forced = []
+
+    def force(*a, **k):
+        r = real(*a, **k)
+        flags = k.get("ovf_out")
+        if forced and flags is not None and not forced[0]:
+            flags.append(torch.ones((), dtype=torch.bool, device="cuda"))
+            forced[0] = True
+        return r
+
+    monkeypatch.setattr(rows, "union_rerank_rows", force)
+    sr0 = torch.randn(1, N, 4, 64, generator=torch.Generator().manual_seed(3)).to("cuda", torch.bfloat16)
+    out = {}
+    for f in (False, True):
+        forced[:] = [False] if f else []
+        sr = torch.empty(1, N, 4, 64, device="cuda", dtype=torch.bfloat16)
+        sr.copy_(sr0)
+        sr = sr.transpose(1, 2)                           # the window kernel's (B, H, N, D) view of (B, N, H, D)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            attn._begin_lr(sr, want_cell_stats=True, inplace_sr=True)
+            assert attn._lr_inplace_sr
+            try:
+                y = ft.fsb_long_range(attn, Q, K, V, sigma, N)
+            finally:
+                fused, _ = attn._end_lr()
+        assert fused
+        out[f] = y.clone()
+    assert forced[0], "no deferred flag was forced"
+    assert _same(out[True], out[False])
+
 @gpu
 def test_log_stats_after_lean_eval_prefill(monkeypatch):
     # fsb_log_stats after an eval prefill on the fast path: without FSB_PREFILL_STATS the per-query statistics are not
