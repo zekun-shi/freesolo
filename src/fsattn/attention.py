@@ -19,6 +19,7 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
 
 
 _WINDOW_STREAMS: dict = {}
+_FSB_READ_STREAMS: dict = {}
 
 
 def _window_stream(dev):
@@ -41,6 +42,14 @@ def _decode_read_stream(dev):
     s = _DECODE_READ_STREAMS.get(dev)
     if s is None:
         s = _DECODE_READ_STREAMS[dev] = torch.cuda.Stream(device=dev)
+    return s
+
+
+def _fsb_read_stream(dev):
+    # FSB_DECODE_FORK: the stream an FS-B decode layer's long-range read forks to (joined back before the combine)
+    s = _FSB_READ_STREAMS.get(dev)
+    if s is None:
+        s = _FSB_READ_STREAMS[dev] = torch.cuda.Stream(device=dev)
     return s
 
 
@@ -1373,9 +1382,21 @@ class FSAttn(nn.Module):
         fc = getattr(cache, "_fsb_forest", None)
         tk = getattr(fc, "_tok", None)
         sig = tk.get("sigma") if tk is not None and tk.get("sigma") is not None else self.sigma
-        out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
         win_pos = buf.get("win_pos")
         pos_f = win_pos[-1:] if win_pos is not None else None
+        if Q.is_cuda and getattr(fc, "_live", False) and os.environ.get("FSB_DECODE_FORK", "0") == "1" and not compiling():
+            # FSB_DECODE_FORK: the long-range read and the window only meet at the combine, so the read forks to its
+            # own stream and runs beside the window (in a captured decode step, two parallel branches of the graph)
+            cur = torch.cuda.current_stream(Q.device)
+            side = _fsb_read_stream(Q.device)
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f)
+            out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
+            cur.wait_stream(side)
+            out = out_short + self.long_range_scale.unsqueeze(0) * out_long
+            return self.W_o(out.transpose(1, 2).contiguous().view(B, N, self.d_model))
+        out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
         out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f, sr=out_short)
         if out_long.dim() == 3:
             return self.W_o(out_long)

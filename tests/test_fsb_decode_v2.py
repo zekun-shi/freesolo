@@ -142,3 +142,32 @@ def test_fused_decode_flag_and_envelope(monkeypatch):
     gd.step()
     gd.step()
     assert ran and all(r is None for r in ran)
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("v2", ["0", "1"])
+def test_forked_read_matches_serial_step(monkeypatch, v2):
+    # FSB_DECODE_FORK: each layer's long-range read on its own stream beside the window, captured as two parallel
+    # branches of the step graph: the same read cells as the serial step at every token; the combine runs as torch's
+    # two ops instead of inside the readout, so the logits agree to that rounding
+    m = _model(monkeypatch, 1024)
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(67)).cuda()
+    forced = torch.randint(0, 512, (200,), generator=torch.Generator().manual_seed(71)).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", v2)
+    runs = {}
+    for fork in ("0", "1"):
+        monkeypatch.setenv("FSB_DECODE_FORK", fork)
+        gd = _decoder(m, prompt, len(forced))
+        logits, sels = [], []
+        for t in forced:
+            gd.next_tok = t.view(1)
+            gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(gd.cache[0]._fsb_forest._last_sel.clone())
+        runs[fork] = (torch.stack(logits), torch.stack(sels))
+    (l0, s0), (l1, s1) = runs["0"], runs["1"]
+    assert torch.equal(s0, s1)
+    rel = ((l1 - l0).norm(dim=-1) / l0.norm(dim=-1)).max().item()
+    assert rel < 1e-2, rel
+    assert (l1.argmax(-1) == l0.argmax(-1)).float().mean().item() >= 0.99

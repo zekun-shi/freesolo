@@ -66,6 +66,7 @@ def ruler_driver(monkeypatch):
     {"FSB_DECODE_GRAPH": "0"},
     {"FSB_DECODE_GRAPH_CHECK": "1"},
     {"FSB_DECODE_V2": "1"},
+    {"FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1"},
     {"FSB_BEAM_CUDA": "0"},
     {"FSB_BEAM_ROWS": "0"},
     {"FSB_TRAVERSE_TRITON": "0"},
@@ -95,7 +96,8 @@ def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, t
     assert report["results"]["niah_single_1"]["n"] == 1
     flags = report["meta"]["fsb_execution_env"]
     expected = {**dict.fromkeys(FAST_FLAGS, "1"), "FSB_DECODE_GRAPH": "1",
-                "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "0", "FSB_TRAIN_GRAPH": "0", **ROWS_FLAGS, **overrides}
+                "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "0", "FSB_DECODE_FORK": "0", "FSB_TRAIN_GRAPH": "0",
+                **ROWS_FLAGS, **overrides}
     assert flags == expected
     env_line = next(line for line in capsys.readouterr().out.splitlines() if "FS-B eval env:" in line)
     for name, value in expected.items():
