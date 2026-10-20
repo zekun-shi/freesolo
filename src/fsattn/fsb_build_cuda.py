@@ -223,12 +223,15 @@ def _functions(dev: torch.device, Dh: int):
             bld16 = _bc.load_function(dev, src, "fsb_forest_build16")
             prep_dirty = _bc.load_function(dev, src, "fsb_prep_lean_dirty")
             prep_tall = _bc.load_function(dev, src, "fsb_prep_lean_tall")
+            many = tuple(_bc.load_function(dev, src, n) for n in (
+                "fsb_append_many", "fsb_prep_lean_dirty_many", "fsb_forest_build_lean16_many", "fsb_spine_lean16_many"))
             _, cuda = _bc._libraries()
             cuda.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             _bc._check(cuda.cuFuncSetAttribute(bld, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
             _bc._check(cuda.cuFuncSetAttribute(bld_lean, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
             _bc._check(cuda.cuFuncSetAttribute(bld_lean16, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
             _bc._check(cuda.cuFuncSetAttribute(bld16, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
+            _bc._check(cuda.cuFuncSetAttribute(many[2], 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:
@@ -238,7 +241,8 @@ def _functions(dev: torch.device, Dh: int):
             warnings.warn(f"FS-B CUDA forest build unavailable on cuda:{dev.index} for head size {Dh}, using the "
                           f"Triton builder: {e!r}")
             raise _Unavailable(repr(e)) from e
-        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16, prep_dirty, prep_tall)
+        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16, prep_dirty, prep_tall,
+                          many)
     return fn[:2]
 
 
@@ -267,11 +271,11 @@ def _small_function(dev: torch.device, Dh: int):
     return fn
 
 
-def _launch(fn, grid: int, block: int, smem: int, dev: torch.device, args) -> None:
+def _launch(fn, grid: int, block: int, smem: int, dev: torch.device, args, grid_y: int = 1) -> None:
     _, cuda = _bc._libraries()
     params = (ctypes.c_void_p * len(args))(*[ctypes.addressof(a) for a in args])
     stream = torch.cuda.current_stream(dev).cuda_stream
-    res = cuda.cuLaunchKernel(fn, grid, 1, 1, block, 1, 1, smem, ctypes.c_void_p(stream), params, None)
+    res = cuda.cuLaunchKernel(fn, grid, grid_y, 1, block, 1, 1, smem, ctypes.c_void_p(stream), params, None)
     if res == 2:                                           # CUDA_ERROR_OUT_OF_MEMORY (e.g. local memory for the launch)
         raise torch.cuda.OutOfMemoryError("fsb_build_cuda: cuLaunchKernel: CUDA error 2 (out of memory)")
     _bc._check(res, "cuLaunchKernel")
@@ -863,6 +867,82 @@ def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: 
             [P(amu0.data_ptr()), P(anx0.data_ptr()), P(mt0.data_ptr()), P(sp_node.data_ptr()),
              P(sp_root.data_ptr()), P(sp_hgt.data_ptr()), I32(T), I32(amu0.shape[1]), I32(int(Kmax_lean))])
     return True
+
+
+class _LeanDesc(ctypes.Structure):
+    # struct LeanDesc of fsb_build.cu: one forest of a batched device-decided block change
+    _fields_ = ([("ce", ctypes.c_void_p)] + [(k, ctypes.c_longlong) for k in ("ce_sB", "ce_sH", "ce_sM")]
+                + [("tau", ctypes.c_void_p), ("adm", ctypes.c_void_p), ("adm_s0", ctypes.c_longlong)]
+                + [(k, ctypes.c_void_p) for k in ("mt", "mc", "tasks", "jb", "kb", "ce_rows", "spr", "mu", "ax", "leaf",
+                                                  "sp_node", "sp_root", "sp_hgt")]
+                + [(k, ctypes.c_int) for k in ("M_adm0", "M_kb", "M_ce", "M_spr", "Ntot", "Ltot", "kmax", "nk", "skip",
+                                               "has_sp")])
+
+
+_MANY: dict = {}                # device -> [descriptor bytes on the device, their device copy, the work list]
+
+
+def lean_many_ok(entry) -> bool:
+    # whether a forest's device-decided ingest can join lean_dirty_build_many: lean_dirty_build's inputs (no taller
+    # chunk proposals), fp32 ceilings for the append, a task buffer with room for its records
+    ce, Kbar, lean = entry["ce"], entry["Kbar"], entry["lean"]
+    T = Kbar.shape[0]
+    tb = lean[11]
+    return (entry["tall"] is None and ce.is_cuda and ce.dtype == torch.float32 and ce.dim() == 3
+            and ce.shape[0] * ce.shape[1] == T and tb is not None and tb.dtype == torch.int32
+            and entry["nk"] * T * 10 + 40 <= tb.numel() and entry["nk"] <= 16 and T <= 4096
+            and build_cuda_ok(Kbar, entry["ceil_c"], entry["spread"], [entry["tau32"]], entry["E"]))
+
+
+@torch.no_grad()
+def lean_dirty_build_many(entries: list, n_seen: int, M_vis: int) -> None:
+    # lean_dirty_build for many forests of one block change at once, their admitted-cell appends included: four
+    # launches (fsb_append_many, fsb_prep_lean_dirty_many, fsb_forest_build_lean16_many over the records that build,
+    # fsb_spine_lean16_many) instead of four per forest, every forest's tables, counts and spines as its own
+    # append_admitted_fast + lean_dirty_build would leave them. entries (lean_many_ok each): dicts of the forest's
+    # ceilings ce (B, H, M) and fp32 thresholds tau32 (B H), its adm / m_tot / mc_buf, and lean_dirty_build's
+    # Kbar, ceil_c, spread, lean, nk, skip; all with the same head count and M = lean[7], cells n_seen .. M_vis - 1 new
+    dev = entries[0]["Kbar"].device
+    T, Dh = entries[0]["Kbar"].shape[0], entries[0]["Kbar"].shape[2]
+    M = entries[0]["lean"][7]
+    H = entries[0]["ce"].shape[1]
+    _, fold_mask, nbig = _lean_layout_info(M, _group())
+    _functions(dev, Dh)
+    app, prep, bld, spn = _fns[_variant(dev.index, Dh)][10]
+    keep, descs = [], (_LeanDesc * len(entries))()
+    for d, e in zip(descs, entries):
+        lean = e["lean"]
+        amu0, anx0, leaf0, _, _, jb0, Kmax_lean, _, sp_node, sp_root, sp_hgt, task_buf = lean[:12]
+        Kbar, ceil_c, sp, adm0, mt0, M_kb, M_ce, M_spr, M_adm0 = _lean_operands(e["Kbar"], e["ceil_c"], e["spread"], lean)
+        keep += [Kbar, ceil_c, sp, adm0, mt0]
+        ce, adm, mc = e["ce"], e["adm"], e["mc"]
+        d.ce, d.ce_sB, d.ce_sH, d.ce_sM = ce.data_ptr(), ce.stride(0), ce.stride(1), ce.stride(2)
+        d.tau, d.adm, d.adm_s0 = e["tau32"].data_ptr(), adm.data_ptr(), adm.stride(0)
+        d.mt, d.mc, d.tasks, d.jb = mt0.data_ptr(), mc.data_ptr(), task_buf.data_ptr(), jb0.data_ptr()
+        d.kb, d.ce_rows, d.spr = Kbar.data_ptr(), ceil_c.data_ptr(), sp.data_ptr()
+        d.mu, d.ax, d.leaf = amu0.data_ptr(), anx0.data_ptr(), leaf0.data_ptr()
+        d.sp_node, d.sp_root, d.sp_hgt = sp_node.data_ptr(), sp_root.data_ptr(), sp_hgt.data_ptr()
+        d.M_adm0, d.M_kb, d.M_ce, d.M_spr = int(M_adm0), int(M_kb), int(M_ce), int(M_spr)
+        d.Ntot, d.Ltot, d.kmax, d.nk = amu0.shape[1], leaf0.shape[1], int(Kmax_lean), int(e["nk"])
+        d.skip, d.has_sp = int(e["skip"]), int(e["spread"] is not None)
+    raw = bytes(descs)
+    st = _MANY.get(dev.index)
+    nwork = 2 + sum(int(e["nk"]) for e in entries) * T
+    if st is None or st[1].numel() < len(raw) or st[2].numel() < nwork:
+        st = _MANY[dev.index] = [None, torch.empty(max(len(raw), 16384), dtype=torch.uint8, device=dev),
+                                 torch.empty(max(nwork, 2 + 16 * 48 * T), dtype=torch.int32, device=dev)]
+    if st[0] != raw:                                        # the tables moved (or the skip masks changed): upload
+        st[1][:len(raw)].copy_(torch.frombuffer(bytearray(raw), dtype=torch.uint8).pin_memory(), non_blocking=True)
+        st[0] = raw
+    P, I32, I64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong
+    dp, wp = P(st[1].data_ptr()), P(st[2].data_ptr())
+    nf = len(entries)
+    _launch(app, T, 32, 0, dev, [dp, wp, I64(int(n_seen)), I32(int(M_vis - n_seen)), I32(H), I32(T)], grid_y=nf)
+    _launch(prep, nf, 256, 0, dev, [dp, wp, I32(T), I32(fold_mask)])
+    nsm = torch.cuda.get_device_properties(dev).multi_processor_count
+    _launch(bld, nsm, _THREADS, _smem_bytes(Dh), dev, [dp, wp, I32(M), I32(nbig), I32(T)])
+    nb = (T + 15) // 16
+    _launch(spn, nf * nb, _THREADS, 0, dev, [dp, I32(T), I32(nb)])
 
 
 @torch.no_grad()

@@ -1773,11 +1773,14 @@ fsb_prep_lean_tasks(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
 // skips its rebuild where SKIP_MASK has the height's bit: the rows hold that chunk's build already, and a build is a
 // pure function of the chunk's cells (append-only admissions, completed cells) and of the height's fold flag
 // (fold_mask), so the caller sets the bit only where the rows were built with this launch's flag. NK <= 16; one CTA.
-extern "C" __global__ void __launch_bounds__(256)
-fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
-                    i64* __restrict__ JB0, const i64* __restrict__ MT0, const i64* __restrict__ NN,
-                    const int NK, const int T, const int fold_mask, const int Kmax_lean,
-                    const int M_adm0, const int M_kb, const int M_ce, const int M_spr, const int skip_mask) {
+// WORK (the batched launch, fsb_forest_build_lean16_multi): every record that builds is also listed there as
+// (forest F << 16 | record), after the count WORK[0].
+__device__ __forceinline__ void prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
+                                                i64* __restrict__ JB0, const i64* __restrict__ MT0,
+                                                const i64* __restrict__ NN, const int NK, const int T,
+                                                const int fold_mask, const int Kmax_lean, const int M_adm0,
+                                                const int M_kb, const int M_ce, const int M_spr, const int skip_mask,
+                                                int* __restrict__ WORK, const int F) {
     __shared__ int s_now[16], s_was[16], s_moved[16];
     const int tid = threadIdx.x;
     if (tid < 16) { s_now[tid] = 0; s_was[tid] = 0; s_moved[tid] = 0; }
@@ -1803,6 +1806,7 @@ fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
         int* tk = TASKS_OUT + 10 * r;
         tk[0] = 0; tk[1] = 0; tk[2] = t; tk[3] = k; tk[4] = j0;
         tk[5] = dirty ? 1 : 0; tk[6] = 0; tk[7] = 0; tk[8] = -1; tk[9] = -1;
+        if (dirty && WORK != nullptr) WORK[2 + atomicAdd(&WORK[0], 1)] = (F << 16) | r;
     }
     if (tid < 16) {
         LAY_OUT[tid] = (2 << tid) - tid - 2;
@@ -1823,6 +1827,15 @@ fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
         const i64 mi = MT0[tt];
         JB0[e] = ((mi >> kk) & 1ll) ? ((mi >> (kk + 1)) << 1) : 0ll;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
+                    i64* __restrict__ JB0, const i64* __restrict__ MT0, const i64* __restrict__ NN,
+                    const int NK, const int T, const int fold_mask, const int Kmax_lean,
+                    const int M_adm0, const int M_kb, const int M_ce, const int M_spr, const int skip_mask) {
+    prep_lean_dirty(TASKS_OUT, LAY_OUT, JB0, MT0, NN, NK, T, fold_mask, Kmax_lean, M_adm0, M_kb, M_ce, M_spr, skip_mask,
+                    nullptr, 0);
 }
 
 // fsb_prep_lean_dirty's counterpart for the chunks of height KLO .. KHI (>= 10) of such an ingest: TASKS holds NREC
@@ -2057,13 +2070,12 @@ fsb_forest_build_lean16(const int* __restrict__ TASKS, const int* __restrict__ L
                      LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
 }
 
-// fsb_spine_lean over the split table (bf16 means upcast, fp32 aggregates); the spine rows stay packed fp32
-extern "C" __global__ void __launch_bounds__(512)
-fsb_spine_lean16(const unsigned short* __restrict__ NMU0, const float* __restrict__ NAX0, const i64* __restrict__ MT0,
-                 float* __restrict__ SP_NODE, i64* __restrict__ SP_ROOT, i64* __restrict__ SP_HGT,
-                 const int T, const int Ntot, const int Kmax_lean) {
-    const int t = blockIdx.x * 16 + (threadIdx.x >> 5);
-    if (t >= T) return;
+// fsb_spine_lean over the split table (bf16 means upcast, fp32 aggregates) for head t, one warp; the spine rows stay
+// packed fp32
+__device__ __forceinline__ void spine_lean16_row(const unsigned short* __restrict__ NMU0, const float* __restrict__ NAX0,
+                                                 const i64* __restrict__ MT0, float* __restrict__ SP_NODE,
+                                                 i64* __restrict__ SP_ROOT, i64* __restrict__ SP_HGT, const int Ntot,
+                                                 const int Kmax_lean, const int t) {
     const int lane = threadIdx.x & 31;
     const i64 m = MT0[t];
     const int S = Kmax_lean + 1;
@@ -2148,6 +2160,108 @@ fsb_spine_lean16(const unsigned short* __restrict__ NMU0, const float* __restric
         SP_ROOT[t] = (m > 0) ? r_ref : -1ll;
         SP_HGT[t] = (m > 1) ? (hb + (pop >= 2 ? 1ll : 0ll)) : 0ll;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(512)
+fsb_spine_lean16(const unsigned short* __restrict__ NMU0, const float* __restrict__ NAX0, const i64* __restrict__ MT0,
+                 float* __restrict__ SP_NODE, i64* __restrict__ SP_ROOT, i64* __restrict__ SP_HGT,
+                 const int T, const int Ntot, const int Kmax_lean) {
+    const int t = blockIdx.x * 16 + (threadIdx.x >> 5);
+    if (t >= T) return;
+    spine_lean16_row(NMU0, NAX0, MT0, SP_NODE, SP_ROOT, SP_HGT, Ntot, Kmax_lean, t);
+}
+
+// ---- one device-decided block change of many decode forests in four launches (FSB_DECODE_ASYNC: fsb_tree's
+// _ingest_async_many, fsb_build_cuda.lean_dirty_build_many): the forests' tables and strides in a descriptor array ----
+struct LeanDesc {
+    const float* ce; i64 ce_sB, ce_sH, ce_sM;      // the layer's ceilings: cell c of head (b, h) at ce + b sB + h sH + c sM
+    const float* tau;                               // admission thresholds per head (fp32)
+    i64* adm; i64 adm_s0;                           // admitted cells per head, row stride adm_s0
+    i64* mt; i64* mc;                               // m_tot per head; the append's counts (admitted, then m_tot after it)
+    int* tasks; i64* jb;                            // the forest's task buffer (records, then the layout vector); chunk index
+    const float* kb; const float* ce_rows; const float* spr;  // the build's inputs (row strides in the layout vector)
+    unsigned short* mu; float* ax; i64* leaf;       // the lean arena
+    float* sp_node; i64* sp_root; i64* sp_hgt;      // the spines
+    int M_adm0, M_kb, M_ce, M_spr, Ntot, Ltot, kmax, nk, skip, has_sp;
+};
+
+// _append_adm_kernel (fsb_build_fast) for forest blockIdx.y, head blockIdx.x: the cells n_seen .. n_seen + nn - 1 whose
+// ceiling reaches the head's threshold appended in cell order after its m_tot, the rest of those slots -1, then m_tot
+// and the counts (the same values: integer bookkeeping and one fp32 comparison per cell). Block (0, 0) also clears
+// the batched build's work count and claim counter. One warp per (forest, head).
+extern "C" __global__ void __launch_bounds__(32)
+fsb_append_many(const LeanDesc* __restrict__ D, int* __restrict__ WORK, const i64 n_seen, const int nn, const int H,
+                const int T) {
+    const LeanDesc& d = D[blockIdx.y];
+    const int t = blockIdx.x, lane = threadIdx.x;
+    if (blockIdx.x == 0 && blockIdx.y == 0 && lane == 0) { WORK[0] = 0; WORK[1] = 0; }
+    const int b = t / H, h = t - b * H;
+    const float tau = d.tau[t];
+    const i64 m0 = d.mt[t];
+    const float* ce = d.ce + b * d.ce_sB + h * d.ce_sH;
+    i64* adm = d.adm + (i64)t * d.adm_s0;
+    i64 tot = 0;
+    for (int off = 0; off < nn; off += 32) {
+        const int idx = off + lane;
+        const i64 cid = n_seen + idx;
+        const bool in = idx < nn;
+        const float c = in ? ce[cid * d.ce_sM] : __int_as_float(0xff800000);       // -inf
+        const bool a = in && c >= tau;
+        const unsigned bal = __ballot_sync(0xffffffffu, a);
+        if (a) adm[m0 + tot + __popc(bal & ((1u << lane) - 1u))] = cid;
+        tot += __popc(bal);
+    }
+    for (int off = 0; off < nn; off += 32) {
+        const int idx = off + lane;
+        if (idx < nn - tot) adm[m0 + tot + idx] = -1;
+    }
+    if (lane == 0) {
+        d.mt[t] = m0 + tot;
+        d.mc[t] = tot;
+        d.mc[T + t] = m0 + tot;
+    }
+}
+
+// fsb_prep_lean_dirty for forest blockIdx.x, listing its records that build in WORK
+extern "C" __global__ void __launch_bounds__(256)
+fsb_prep_lean_dirty_many(const LeanDesc* __restrict__ D, int* __restrict__ WORK, const int T, const int fold_mask) {
+    const LeanDesc& d = D[blockIdx.x];
+    prep_lean_dirty(d.tasks, d.tasks + 10 * d.nk * T, d.jb, d.mt, d.mc, d.nk, T, fold_mask, d.kmax, d.M_adm0, d.M_kb,
+                    d.M_ce, d.M_spr, d.skip, WORK, blockIdx.x);
+}
+
+// fsb_forest_build_lean16 over the records WORK lists (any forests, one CTA per record), with persistent CTAs claiming
+// them in list order: every record builds a chunk of height <= 9, which waits for no other record
+extern "C" __global__ void __launch_bounds__(512, 1)
+fsb_forest_build_lean16_many(const LeanDesc* __restrict__ D, int* __restrict__ WORK, const int M, const int nbig,
+                             const int T) {
+    __shared__ int s_job;
+    for (;;) {
+        if (threadIdx.x == 0) s_job = atomicAdd(&WORK[1], 1);
+        __syncthreads();
+        const int i = s_job;
+        if (i >= WORK[0]) return;
+        const int e = WORK[2 + i];
+        const LeanDesc& d = D[e >> 16];
+        const int r = e & 0xffff;
+        // build_task reads the record at TASKS + 10 blockIdx.x: shift the base so that is record r
+        const int* tasks = reinterpret_cast<const int*>(reinterpret_cast<unsigned long long>(d.tasks)
+                                                        + 40ull * (unsigned long long)(long long)(r - (int)blockIdx.x));
+        build_task<true>(tasks, d.tasks + 10 * d.nk * T, d.kb, d.ce_rows, d.spr, d.adm, nullptr, d.mt, d.mt, nullptr,
+                         nullptr, d.mu, d.mu, d.ax, d.ax, d.leaf, d.leaf, nullptr, nullptr, M, d.Ntot, d.Ltot, d.has_sp,
+                         nbig, T);
+        __syncthreads();
+    }
+}
+
+// fsb_spine_lean16 for every forest: block f * nb + i holds forest f's heads 16 i .. 16 i + 15
+extern "C" __global__ void __launch_bounds__(512)
+fsb_spine_lean16_many(const LeanDesc* __restrict__ D, const int T, const int nb) {
+    const int f = blockIdx.x / nb;
+    const LeanDesc& d = D[f];
+    const int t = (blockIdx.x - f * nb) * 16 + (threadIdx.x >> 5);
+    if (t >= T) return;
+    spine_lean16_row(d.mu, d.ax, d.mt, d.sp_node, d.sp_root, d.sp_hgt, d.Ntot, d.kmax, t);
 }
 
 // >>> SECTION: _SMALL <<<

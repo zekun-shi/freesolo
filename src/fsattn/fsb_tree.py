@@ -1450,6 +1450,7 @@ class ForestCache:
         self._async_dm = 0                # _async_ready's bound on the new cells of the coming ingest
         self._async_tall = False          # and whether a head's count may cross a multiple of 2^(DIRTY_KMAX + 1)
         self._async_stale = []            # the tall heights such a crossing may dirty whose chunks another fold built
+        self._async_done = False          # this block's device-decided ingest already ran (_ingest_async_many)
         self._plan = None                 # the V3 fused read's per-row cache of its prefix walk (fsb_decode_cuda)
 
     def _get_tau32(self, tau):
@@ -1876,42 +1877,33 @@ class ForestCache:
             return (mi - 1).bit_length() if mi > 1 else 0
         return any(eff(h(a)) != eff(h(a + dm)) for a in self._m_known)
 
-    @torch.no_grad()
-    def _ingest_async(self, Kbar_all, ceil_all, M_vis, tau, spread_all=None) -> bool:
-        # _ingest_lean after an append whose counts the host has not read (_async_ready held before it): the device
-        # decides which chunk heights to rebuild (lean_dirty_build: the heights the host would pick, the same rows and
-        # bits) and rebuilds the spines, with no host read. The host-side state the counts determine follows one block
-        # late (_settle); until then it holds values the checks proved equal to the exact ones (Kmax, liveness, the
-        # budget keys) or that only the exact path reads (_lean_meta, F's height list). False: nothing launched.
-        from .fsb_build_cuda import DIRTY_KMAX, lean_dirty_build, lean_fold_mask
-        T, dev = self.T, self.dev
-        if not Kbar_all.is_cuda or torch.cuda.is_current_stream_capturing() or self._mc_buf is None:
-            return False
+    def _async_inputs(self, Kbar_all, ceil_all, M_vis, tau, spread_all=None) -> dict:
+        # what a device-decided ingest launches with (_ingest_async, or _ingest_async_many for many forests at once):
+        # lean_dirty_build's arguments, the skip mask of the unmoved chunks that keep their rows (only at heights whose
+        # rows this layout's fold flag built: the host-decided ingest rebuilds every chunk of a dirty height with the
+        # current flag) and the taller chunks the append may complete
+        from .fsb_build_cuda import DIRTY_KMAX, lean_fold_mask
         Kmax = self.F["Kmax"]
         sp_out = self._sp_stable
         M_pad = max(512, 1 << (M_vis - 1).bit_length())
-        # a chunk that stays in place keeps its rows only at heights whose rows this layout's fold flag built (the
-        # host-decided ingest rebuilds every chunk of a dirty height with the current flag)
         fold, nk = lean_fold_mask(M_pad), min(Kmax, DIRTY_KMAX) + 1
         skip = sum(1 << k for k in range(nk) if self._fold_rows.get(k) == (fold >> k) & 1)
-        tall = self._tall_rows() if self._async_tall else None
-        lean_arg = (self._arena_mu, self._arena_aux, self._leaf_arena, self.adm, self.m_tot, self._jbase_buf, Kmax,
-                    M_pad, sp_out["node"], sp_out["root"], sp_out["height"], self._task_buf)
-        Kbar, ceil_c, spread_c = self._forest_inputs(Kbar_all, ceil_all, M_vis, spread_all, lean_arg)
+        lean = (self._arena_mu, self._arena_aux, self._leaf_arena, self.adm, self.m_tot, self._jbase_buf, Kmax,
+                M_pad, sp_out["node"], sp_out["root"], sp_out["height"], self._task_buf)
+        Kbar, ceil_c, spread_c = self._forest_inputs(Kbar_all, ceil_all, M_vis, spread_all, lean)
         if self._zero_e is None:
-            self._zero_e = torch.zeros(1, dtype=torch.long, device=dev)
-        try:
-            ok = lean_dirty_build(Kbar, ceil_c, spread_c, [self._get_tau32(tau)], self._zero_e, self._mc_nn, lean_arg,
-                                  skip_mask=skip, tall=tall)
-        except torch.cuda.OutOfMemoryError:
-            raise
-        except Exception as e:                                  # the host-decided path builds this block instead
-            import warnings
-            warnings.warn(f"FS-B device-decided decode ingest failed, using the host-decided one: {e!r}")
-            return False
-        if not ok:
-            return False
-        self._fold_pend = (fold, Kmax + 1 if tall is not None else nk)
+            self._zero_e = torch.zeros(1, dtype=torch.long, device=self.dev)
+        return {"Kbar": Kbar, "ceil_c": ceil_c, "spread": spread_c, "lean": lean, "tau32": self._get_tau32(tau),
+                "E": self._zero_e, "fold": fold, "nk": nk, "skip": skip,
+                "tall": self._tall_rows() if self._async_tall else None}
+
+    def _async_commit(self, inp: dict):
+        # the host side of a launched device-decided ingest: the forest dict and spines the decode reads, and the host
+        # state the counts determine, which follows one block late (_settle); until then it holds values the checks
+        # proved equal to the exact ones (Kmax, liveness, the budget keys) or that only the exact path reads
+        T, dev = self.T, self.dev
+        self._fold_pend = (inp["fold"], self.F["Kmax"] + 1 if inp["tall"] is not None else inp["nk"])
+        sp_out = self._sp_stable
         sp_out["m_b"] = self.m_tot
         sp_out["t_idx"] = self._t_idx_rows()
         F = dict(self.F)
@@ -1925,6 +1917,28 @@ class ForestCache:
         self._m_max_h = max(m)
         self._height_h = tuple((mi - 1).bit_length() if mi > 1 else 0 for mi in m)
         self._m_known = None
+
+    @torch.no_grad()
+    def _ingest_async(self, Kbar_all, ceil_all, M_vis, tau, spread_all=None) -> bool:
+        # _ingest_lean after an append whose counts the host has not read (_async_ready held before it): the device
+        # decides which chunk heights to rebuild (lean_dirty_build: the heights the host would pick, the same rows and
+        # bits) and rebuilds the spines, with no host read. False: nothing launched
+        from .fsb_build_cuda import lean_dirty_build
+        if not Kbar_all.is_cuda or torch.cuda.is_current_stream_capturing() or self._mc_buf is None:
+            return False
+        inp = self._async_inputs(Kbar_all, ceil_all, M_vis, tau, spread_all)
+        try:
+            ok = lean_dirty_build(inp["Kbar"], inp["ceil_c"], inp["spread"], [inp["tau32"]], inp["E"], self._mc_nn,
+                                  inp["lean"], skip_mask=inp["skip"], tall=inp["tall"])
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:                                  # the host-decided path builds this block instead
+            import warnings
+            warnings.warn(f"FS-B device-decided decode ingest failed, using the host-decided one: {e!r}")
+            return False
+        if not ok:
+            return False
+        self._async_commit(inp)
         return True
 
     def _settle(self, row=None):
@@ -1971,6 +1985,9 @@ class ForestCache:
     @torch.no_grad()
     def _ingest_lean(self, Kbar_all, ceil_all, M_vis, tau, spread_all=None):
         T, Dh, dev = self.T, self.Dh, self.dev
+        if self._async_done:                            # this block's ingest ran in _ingest_async_many
+            self._async_done = False
+            return
         if self._rb is not None:
             self._settle()
         if self._async_next:
@@ -3409,14 +3426,54 @@ def _layer_caps(attn, cache, fc, pos):
 
 
 @torch.no_grad()
+def _ingest_async_many(items: list) -> list:
+    # the device-decided ingests of many forests in one batch (fsb_build_cuda.lean_dirty_build_many): each forest's
+    # append and chunk rebuild as append_admitted_fast and _ingest_async would run them, in four launches for all of
+    # them. items: (forest, the layer's completed cells, ceilings, spreads, visible cells, threshold) of forests that
+    # passed _async_go and are not appended yet. -> the forests left out (no batch for them: the caller appends them
+    # and takes the per-forest path)
+    from .fsb_build_cuda import lean_dirty_build_many, lean_many_ok
+    from .fsb_build_fast import fast_build_on
+    if not fast_build_on():
+        return items
+    batch, rest = [], []
+    for it in items:
+        fc, Kbar_all, ceil_all, spread_all, M_vis, tau = it
+        if not (M_vis > fc.n_seen and ceil_all.is_cuda and fc._mc_buf is not None and fc._mc_buf.shape == (2, fc.T)
+                and fc.n_seen == items[0][0].n_seen and M_vis == items[0][4]):
+            rest.append(it)
+            continue
+        if fc.adm.shape[1] < M_vis:                     # the append's room, as append_admitted_fast makes it
+            cap = fc.adm.shape[1]
+            grown = torch.full((fc.T, max(M_vis, fc.m_cap, 2 * cap, 1)), -1, dtype=torch.long, device=fc.dev)
+            if cap > 0:
+                grown[:, :cap] = fc.adm
+            fc.adm = grown
+        inp = fc._async_inputs(Kbar_all, ceil_all, M_vis, tau, spread_all)
+        inp.update(ce=ceil_all, adm=fc.adm, mc=fc._mc_buf)
+        if lean_many_ok(inp):
+            batch.append((fc, inp))
+        else:
+            rest.append(it)
+    if batch:
+        lean_dirty_build_many([inp for _, inp in batch], batch[0][0].n_seen, items[0][4])
+        for fc, inp in batch:
+            fc.n_seen = items[0][4]
+            fc._async_commit(inp)
+            fc._async_done = True
+    return rest
+
+
+@torch.no_grad()
 def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
     # fsb_decode_prepare for every layer at a block change, the newly completed cells appended to all forests first and
     # their admitted counts read in one host transfer. FSB_DECODE_ASYNC=1: forests whose ingest provably needs none of
-    # this block's counts on the host (_async_go) skip that read and decide their chunk rebuilds on the device, so the
-    # block change enqueues behind the decode steps still running instead of waiting for them; and the layers' updates
-    # (independent forests) run on side streams forked from this stream after the steps before the block and joined
-    # back before the next one, so their many small kernels overlap. A block in which some forest needs its counts on
-    # the host takes that read for every forest: it waits for the queue anyway
+    # this block's counts on the host (_async_go) skip that read and decide their chunk rebuilds on the device, all in
+    # one batch of launches (_ingest_async_many), so the block change enqueues behind the decode steps still running
+    # instead of waiting for them, and with less host work than the host-decided one even when nothing is queued; the
+    # layers' remaining updates (independent forests) run on side streams forked from this stream after the steps before
+    # the block and joined back before the next one, so their small kernels overlap. A block in which some forest
+    # needs its counts on the host takes that read for every forest: it waits for the queue anyway
     T = B * H
     async_on = os.environ.get("FSB_DECODE_ASYNC", "0") == "1"
     capturing = torch.device(dev).type == "cuda" and torch.cuda.is_current_stream_capturing()
@@ -3461,7 +3518,21 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
         if streams:
             for st in streams:
                 main.wait_stream(st)
-    staged, on_device = [], []
+    staged, on_device, many = [], [], []
+
+    def append(f, attn, cache, ceil_all, M_vis, tau, go, li):
+        # the forest's admitted-cell append now (on its layer's stream), or, for a device-decided ingest, later in one
+        # batch for all such forests (_ingest_async_many)
+        if go:
+            Kbar_all, _, _ = cache.completed_cells()
+            spread_all = cache.completed_spread() if attn.fsb_leaf_radius else None
+            many.append(((f, Kbar_all, ceil_all, spread_all, M_vis, tau), li))
+            return
+        nn = f._append_admitted(ceil_all, M_vis, tau)
+        if f._mc_buf is not None and nn is f._mc_nn:
+            staged.append(f)
+        elif nn is not None:
+            f._pend_mc = (nn.cpu().tolist(), f.m_tot.cpu().tolist())
     try:
         for li, (attn, cache, fc) in enumerate(zip(attns, caches, forests)):
             with on_side(li):
@@ -3472,11 +3543,7 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
                     if M_vis > fc.n_seen:
                         go = async_on and _async_go(fc, attn, M_vis, False, False)
                         tau_m = attn.fsb_tau.view(1, H).expand(B, H).reshape(T)
-                        nn = fc._append_admitted(ceil_all, M_vis, tau_m)
-                        if fc._mc_buf is not None and nn is fc._mc_nn:
-                            (on_device if go else staged).append(fc)
-                        elif nn is not None:
-                            fc._pend_mc = (nn.cpu().tolist(), fc.m_tot.cpu().tolist())
+                        append(fc, attn, cache, ceil_all, M_vis, tau_m, go, li)
                     if union_tau_on(attn):
                         if fc.utau is None:
                             fc.utau = ForestCache(T, Dh, dev, lean=fc.lean)
@@ -3487,23 +3554,31 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
                         if M_vis > fc.utau.n_seen:
                             main_live = fc._m_known is not None and max(fc._m_known, default=0) > 0
                             go = async_on and _async_go(fc.utau, attn, M_vis, True, main_live)
-                            tau_u = attn.fsb_tau_union.view(1, H).expand(B, H).reshape(T)
-                            nnu = fc.utau._append_admitted(ceil_all, M_vis, tau_u)
-                            if fc.utau._mc_buf is not None and nnu is fc.utau._mc_nn:
-                                (on_device if go else staged).append(fc.utau)
-                            elif nnu is not None:
-                                fc.utau._pend_mc = (nnu.cpu().tolist(), fc.utau.m_tot.cpu().tolist())
+                            append(fc.utau, attn, cache, ceil_all, M_vis,
+                                   attn.fsb_tau_union.view(1, H).expand(B, H).reshape(T), go, li)
+        if many and not staged:
+            # the device-decided ingests in one batch on this stream, which the layers' streams wait for before their
+            # forest updates read its tables
+            rest = {id(it[0]) for it in _ingest_async_many([it for it, _ in many])}
+            on_device += [it[0] for it, _ in many if id(it[0]) not in rest]
+            many = [(it, li) for it, li in many if id(it[0]) in rest]
+            for st in streams:
+                st.wait_stream(main)
+        for (f, _, ceil_all, _, M_vis, tau), li in many:  # the forests the batch leaves to the per-forest path
+            with on_side(li):
+                nn = f._append_admitted(ceil_all, M_vis, tau)
+            (on_device if f._mc_buf is not None and nn is f._mc_nn else staged).append(f)
         if staged:
             # this read waits for the queue anyway: the forests that could have gone without it join it
-            staged += on_device
-            on_device = []
+            staged += [f for f in on_device if not f._async_done]
+            on_device = [f for f in on_device if f._async_done]
             join()                                      # the counts were written on the side streams
             all_mc = torch.stack([f._mc_buf for f in staged]).cpu().tolist()
             for f, mc_val in zip(staged, all_mc):
                 f._pend_mc = mc_val
                 f._eff_open = False
         for f in on_device:
-            f._async_next = True
+            f._async_next = not f._async_done
         res = []
         for li, (a, c) in enumerate(zip(attns, caches)):
             with on_side(li):
@@ -3513,7 +3588,7 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
         _SIDE_PHASE[0] = False
         _STATIC_EVENTS.clear()          # the join ordered every side stream's tables before this stream's later work
     for f in on_device:
-        f._async_next = False
+        f._async_next = f._async_done = False
     # the forests that did ingest on the device (the others fell back to a host read: their m_tot is known again)
     _async_readback([f for f in on_device if f._m_known is None and f._rb is None])
     return res

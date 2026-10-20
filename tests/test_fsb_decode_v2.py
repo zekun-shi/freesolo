@@ -330,11 +330,13 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
     # (0.97: a few cells per head, so the beam widths grow during the decode and are recomputed on the device).
     # dev_budgets False: the device cannot write the budgets in place (_budgets_on_device declines) while the host's
     # heights are a block old, so they are recomputed from the spines' heights on the device, never from the stale host
-    # heights. busy False: the stream is idle at every block change (a loop that synchronises every token). mix
-    # "decline": every other device-decided ingest declines (its forest reads its counts and takes the host-decided
-    # path inside a block whose other forests stay on the device), so blocks mix the two paths (no sync guard then);
-    # "kmax3": chunks taller than 8 cells count as tall, so heads cross their boundaries every few blocks and the
-    # device completes those chunks from the host's proposals
+    # heights. busy False: the stream is idle at every block change (a loop that synchronises every token). The
+    # device-decided ingests of a block run as one batch (lean_dirty_build_many) where they can. mix "decline": every
+    # other forest stays out of the batch and every other such forest's own device-decided ingest declines (it reads
+    # its counts and takes the host-decided path), so blocks mix the batch, per-forest device ingests and host-decided
+    # ones (no sync guard then); "kmax3": chunks taller than 8 cells count as tall, so heads cross their boundaries
+    # every few blocks and the device completes those chunks from the host's proposals (their forests outside the
+    # batch)
     from src.fsattn import fsb_build_cuda as fbc
     from src.fsattn import fsb_tree as ft
     m = _model(monkeypatch, L, n_layers=2)
@@ -342,13 +344,24 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
     forced = torch.randint(0, 512, (700,), generator=torch.Generator().manual_seed(103)).cuda()
     monkeypatch.setenv("FSB_DECODE_V2", "1")
     monkeypatch.setenv("FSB_DECODE_FORK", "1")
-    ran, talls, real = [], [], fbc.lean_dirty_build
+    ran, talls, nok = [], [], [0]
+    real, real_many, real_ok = fbc.lean_dirty_build, fbc.lean_dirty_build_many, fbc.lean_many_ok
 
-    def spy_build(*a, **k):
+    def spy_build(*a, **k):                             # a forest's own device-decided ingest
         talls.append(k.get("tall") is not None and len(k["tall"][0]) > 0)
         ran.append(False if mix == "decline" and len(ran) % 2 else real(*a, **k))
         return ran[-1]
+
+    def spy_many(entries, *a, **k):                     # the batch of a block's device-decided ingests
+        ran.extend([True] * len(entries))
+        return real_many(entries, *a, **k)
+
+    def spy_ok(e):                                      # "decline": every other forest left out of the batch
+        nok[0] += 1
+        return real_ok(e) and not (mix == "decline" and nok[0] % 2)
     monkeypatch.setattr(fbc, "lean_dirty_build", spy_build)
+    monkeypatch.setattr(fbc, "lean_dirty_build_many", spy_many)
+    monkeypatch.setattr(fbc, "lean_many_ok", spy_ok)
     if mix == "kmax3":
         monkeypatch.setattr(fbc, "DIRTY_KMAX", 3)
     opened, real_bud = [], ft._forest_budgets
@@ -367,6 +380,7 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
         ran.clear()
         talls.clear()
         opened.clear()
+        nok[0] = 0
         restore()
         gd = _decoder(m, prompt, len(forced))
         if uq != 0.5:
@@ -580,6 +594,72 @@ def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base):
     assert on_dev == list(seq[1:]) and len(talls) == len(on_dev), (on_dev, len(talls))
     assert sum(t is not None and len(t[0]) > 0 for t in talls) >= 3
     assert (base == 1016) == any(t is not None and t[1] > 0 for t in talls), [t and t[1] for t in talls]
+
+
+@gpu
+@torch.no_grad()
+def test_batched_async_ingests_match_host_decided(monkeypatch):
+    # FSB_DECODE_ASYNC's batched block change outside a decode graph (_ingest_async_many -> lean_dirty_build_many: one
+    # append, record, build and spine launch for all forests) against each forest's own host-decided ingests: three
+    # forests with different thresholds (different counts per head, heights and Kmax) through ingests that pass 512
+    # visible cells, where height 9's fold flag turns on while forest 0's head 0 keeps its 512-cell chunk and head 1
+    # completes one; every table after each ingest and the settled host state equal bit for bit, every ingest after
+    # the first in one batch of all three forests
+    from src.fsattn import fsb_build_cuda as fbc
+    from src.fsattn.fsb_tree import ForestCache, _async_readback, _ingest_async_many
+    T, Dh, M_cap, dev = 16, 64, 544, torch.device("cuda")
+    g = torch.Generator(device="cuda").manual_seed(13)
+    Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
+    ceil = torch.rand(1, T, M_cap, device=dev, generator=g)
+    ceil[0, 1, 100] = -1.0                                  # forest 0's head 1 admits 511 of the first 512 cells
+    taus = [torch.full((T,), q, device=dev) for q in (0.0, 0.25, 0.5)]
+    seq = (508, 512, 516, 520, 524)
+    batches, single = [], []
+    real_many, real_one = fbc.lean_dirty_build_many, fbc.lean_dirty_build
+    monkeypatch.setattr(fbc, "lean_dirty_build_many",
+                        lambda e, *a, **k: batches.append(len(e)) or real_many(e, *a, **k))
+    monkeypatch.setattr(fbc, "lean_dirty_build", lambda *a, **k: single.append(1) or real_one(*a, **k))
+
+    def run(asy):
+        fcs = []
+        for _ in taus:
+            fc = ForestCache(T, Dh, dev, lean=True)
+            fc.m_cap, fc.k_cap = M_cap, M_cap.bit_length() - 1
+            fcs.append(fc)
+        tabs = []
+        for M_vis in seq:
+            items = []
+            if asy and fcs[0].F is not None:
+                for fc, tau in zip(fcs, taus):
+                    if fc._rb is not None:
+                        fc._settle()
+                    assert fc._async_ready(M_vis, need_live=True)
+                    items.append((fc, Kbar, ceil, None, M_vis, tau))
+                assert _ingest_async_many(items) == []
+            for fc, tau in zip(fcs, taus):
+                fc.ingest(Kbar, ceil, M_vis, tau)
+                fc._stable_spines()
+            if items:
+                _async_readback(fcs)
+            torch.cuda.synchronize()
+            tabs.append([_forest_tables(fc) for fc in fcs])
+        host = []
+        for fc in fcs:
+            if fc._rb is not None:
+                fc._settle()
+            if fc._meta_m is not None:
+                fc._meta_now()
+            host.append((list(fc._m_known), fc._lean_meta, fc._height_h, dict(fc._fold_rows)))
+        return tabs, host
+
+    t0, h0 = run(False)
+    t1, h1 = run(True)
+    assert batches == [3] * (len(seq) - 1) and not single, (batches, single)
+    for a, b in zip(t0, t1):
+        for fa, fb in zip(a, b):
+            assert all(torch.equal(_bits(x), _bits(y)) for x, y in zip(fa, fb))
+    assert h0 == h1 and h1[0][3][9] == 1
+    assert len({h[2] and max(h[2]) for h in h1}) > 1          # the forests' heights differ
 
 
 @gpu
