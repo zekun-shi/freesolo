@@ -1445,6 +1445,15 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
 //   its queries' child scores after a __syncwarp.
 // A union of more than UC2 slots hands the block's queries to the warp-per-query descent from that level, as in
 // fsb_beam_rows.
+// The AKEY build (FSB_BEAM_LONG=1) selects exactly with 32-bit keys alone: a query's keys hold its children's score
+// bits relative to its best child's, key = (AWIN - 1 - d) << 5 | (31 - child index) for a child d = o_best - o
+// order-preserving units below the best (o: all 32 bits of child_key's order-preserving score), so every child within
+// AWIN - 3 units of the best (AWIN = 2^27: the best child's top 16 binades of one sign) ranks exactly as fsb_beam_rows
+// ranks it (score desc, child asc), and the children further below share d = AWIN - 2, below every one in the window.
+// Should a query's kept ranks reach such a child (none does on real or random prompts: the last kept child sits within
+// 2^25 units of the best), its warp ranks that level's children again by counting (akey_count_select), exactly as the
+// 64-bit keys rank them. With no 64-bit keys the level loop fits 80 registers: three blocks per SM (MINB2 = 3) instead
+// of the exact build's two.
 
 // UC2: union slots of a level (a larger union falls back), DCH: union slots per warp dot chunk (fsb_beam_cuda)
 #define MK2 (UC2 + 16)                            // bytes per mark buffer: one per union slot, then the level flags
@@ -1557,6 +1566,20 @@ template <typename K> __device__ __forceinline__ K child_key(const float s, cons
     return (exists && s > -5e8f) ? (K)((o & ~31u) | (unsigned)(31 - c)) : (K)0;
 }
 
+#if AKEY
+// the AKEY build's first pass: all 32 order-preserving bits of a child's score (child_key's), 0 when it has no child
+// or its score is not above -5e8 (a real child's bits are above those of -5e8, so never 0)
+__device__ __forceinline__ unsigned child_bits(const float s, const bool exists) {
+#if BOUND
+    const unsigned u = __float_as_uint(s);
+#else
+    const unsigned u = __float_as_uint(f_add(s, 0.0f));
+#endif
+    const unsigned o = u ^ ((unsigned)((int)u >> 31) | 0x80000000u);
+    return (exists && s > -5e8f) ? o : 0u;
+}
+#endif
+
 // one dot chunk of a warp (union slots [cd, cd + DCH), all of the union when !CHUNKED): the mma of its 16 queries with
 // the chunk's tile rows (B fragments by ldmatrix: thread i addresses row 8 nt + (i & 7), piece i >> 3, + 4 for the
 // second load; rows past the union repeat its last row), bf16 after the scale as fsb_beam_rows, then this lane's
@@ -1621,11 +1644,16 @@ __device__ __forceinline__ void chunk_keys(K (&key)[16], const unsigned* s_mu, u
         const float sl = f_add(dl, tm.y);
         const float sr = f_add(dr, tm.w);
 #endif
+#if AKEY
+        if (!CHUNKED || (two & 1u)) key[2 * jj] = child_bits(sl, CHUNKED || (two & 1u) != 0u);
+        if (!CHUNKED || (two & 2u)) key[2 * jj + 1] = child_bits(sr, CHUNKED || (two & 2u) != 0u);
+#else
         const int c = 2 * (8 * h + jj);
         if (!CHUNKED || (two & 1u))
             key[2 * jj] = CHUNKED ? child_key<K>(sl, c, true) : child_key<K>(sl, c, (two & 1u) != 0u);
         if (!CHUNKED || (two & 2u))
             key[2 * jj + 1] = CHUNKED ? child_key<K>(sr, c + 1, true) : child_key<K>(sr, c + 1, (two & 2u) != 0u);
+#endif
     }
     __syncwarp();
 }
@@ -1648,6 +1676,92 @@ __device__ __forceinline__ K warp_select(K (&r8)[8], const unsigned* s_mu, unsig
     }
     return pair_top16(key, r8, h);
 }
+
+#if AKEY
+// the AKEY build's selection of a warp-level: the children's score bits (chunk_keys), also left in the query's dot row
+// for akey_count_select (lane h's 16 in four 16-byte pieces, piece m at m ^ (query & 3) of the row's half h: no bank
+// conflicts), each query's best (the lane pair's maximum), the keys relative to it (key = (AWIN - 1 - d) << 5 |
+// (31 - c), d clamped to AWIN - 2; no child: 0), and the lane pair's ranked top 16 (pair_top16). Returns whether one of
+// this lane's kept ranks (below k, with a child) holds a child outside the key window (key < 64), whose rank the keys
+// do not decide
+__device__ __forceinline__ bool akey_select(unsigned (&r8)[8], const unsigned* s_mu, unsigned* s_dw,
+                                            const float4* s_ux2, const unsigned (&qa)[4][4], const unsigned bv_lo,
+                                            const unsigned bv_hi, const unsigned pk, const float qn, const float scale,
+                                            const int Pc, const int lane, const int h, const int k) {
+    unsigned key[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) key[i] = 0u;
+    if (Pc <= DCH) {
+        chunk_keys<false>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, 0, lane, h);
+    } else {
+        for (int cd = 0; cd < Pc; cd += DCH)
+            chunk_keys<true>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, cd, lane, h);
+    }
+    uint4* orow = reinterpret_cast<uint4*>(s_dw + (lane >> 1) * (DCH / 2) + 16 * h);
+    const int sw = (lane >> 1) & 3;
+#pragma unroll
+    for (int m = 0; m < 4; m++) orow[m ^ sw] = make_uint4(key[4 * m], key[4 * m + 1], key[4 * m + 2], key[4 * m + 3]);
+    unsigned best = 0u;
+#pragma unroll
+    for (int i = 0; i < 16; i++) best = max(best, key[i]);
+    best = max(best, __shfl_xor_sync(FULL, best, 1));
+    // key[i] is child 16 h + i: (AWIN - 1 - d) << 5 | (31 - c) as one subtraction from a per-child constant
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const unsigned d = min(best - key[i], (unsigned)AWIN - 2u);
+        key[i] = key[i] != 0u ? ((((unsigned)AWIN - 1u) << 5) | (unsigned)(31 - 16 * h - i)) - (d << 5) : 0u;
+    }
+    pair_top16(key, r8, h);
+    bool out = false;
+#pragma unroll
+    for (int j = 0; j < 8; j++) out |= 8 * h + j < k && r8[j] != 0u && r8[j] < 64u;
+    return out;
+}
+
+// the AKEY build's exact selection of a warp-level at which some query's kept ranks left its key window: each child's
+// rank among its query's 32 by counting over the score bits akey_select left in the query's dot row, as the 64-bit
+// keys rank them (bits desc, then child index asc; a child without a score never counts), then the kept ranks' union
+// slots by rank position through the row's first 16 bytes (cs: the query's open ranks' left child slots). Returns this
+// lane's new open entries (positions 8 h .. 8 h + 7) and their number, as open_slots. Out of line: inlined, its
+// registers weigh on the level loop (which then spills), though it never runs at the default window
+__device__ __noinline__ uint3 akey_count_select(unsigned* row, const unsigned char* cs, const int h, const int sw,
+                                                const int k) {
+    __syncwarp();                                                      // the pair's bits in the row
+    unsigned o[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) o[i] = row[16 * h + 4 * ((i >> 2) ^ sw) + (i & 3)];
+    // the rank of child 16 h + i in 5-bit fields (children 6 w .. 6 w + 5 in word w): child j outranks it with higher
+    // bits, or equal bits at a lower index
+    unsigned rk[3] = {0u, 0u, 0u};
+#pragma unroll 1
+    for (int j = 0; j < 32; j++) {
+        const unsigned oj = row[16 * (j >> 4) + 4 * (((j & 15) >> 2) ^ sw) + (j & 3)];
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            rk[i / 6] += (unsigned)(oj > o[i] || (oj == o[i] && j < 16 * h + i)) << (5 * (i % 6));
+    }
+    int nmine = 0;
+#pragma unroll
+    for (int i = 0; i < 16; i++) nmine += o[i] != 0u;
+    const int nkeep = min(k, nmine + __shfl_xor_sync(FULL, nmine, 1));
+    // positions 0 .. nkeep - 1 hold the kept children's union slots (cs of their open rank, + 1 for a right child); the
+    // pair's lanes write each other's positions, so __syncwarp orders the reads of the bits, the clearing, the writes
+    // and the reads of the positions
+    __syncwarp();
+    row[2 * h] = 0u;
+    row[2 * h + 1] = 0u;
+    __syncwarp();
+    unsigned char* pos = reinterpret_cast<unsigned char*>(row);
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const int r = (int)((rk[i / 6] >> (5 * (i % 6))) & 31u);
+        if (o[i] != 0u && r < nkeep) pos[r] = (unsigned char)(cs[8 * h + (i >> 1)] + (i & 1));
+    }
+    __syncwarp();
+    const uint2 v = *reinterpret_cast<const uint2*>(row + 2 * h);
+    return make_uint3(v.x, v.y, (unsigned)min(max(nkeep - 8 * h, 0), 8));
+}
+#endif
 
 // the new open entries from a lane's ranks 8 h .. 8 h + 7: the kept ranks (below k, the free slots after the carried
 // prefix), their union slots from the child index in the key (s_cs: the query's open ranks' left child slots)
@@ -2016,6 +2130,22 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
                 warp_select(r8, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, lane, h);
                 PMARK(5);
                 nv = open_slots(r8, s_cs + qi * 16, k, h, nlo, nhi);
+#elif AKEY
+                unsigned r8[8];
+                const bool aout = akey_select(r8, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, lane, h, k);
+                PMARK(5);
+                if (__any_sync(FULL, aout)) {
+                    // a query's kept ranks left its key window: the warp ranks every child exactly by counting
+#ifdef PROF
+                    if (lane == 0 && FBC != nullptr) atomicAdd(FBC + 122, 1);
+#endif
+                    const uint3 cv = akey_count_select(s_dw + ql * (DCH / 2), s_cs + qi * 16, h, ql & 3, k);
+                    nlo = cv.x;
+                    nhi = cv.y;
+                    nv = (int)cv.z;
+                } else {
+                    nv = open_slots(r8, s_cs + qi * 16, k, h, nlo, nhi);
+                }
 #else
                 unsigned r8[8];
                 const unsigned r16 = warp_select(r8, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, lane, h);

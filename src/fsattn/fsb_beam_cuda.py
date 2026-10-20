@@ -13,7 +13,9 @@ keys instead of rank counting, register frontiers, two block barriers per level 
 order two children whose scores agree in their top 27 bits by child index; the exact build (FSB_BEAM_V2_EXACT=1, the
 default) finds such ties among a query's kept ranks and the first dropped one and selects that level again with
 64-bit keys, so its selections are fsb_beam_rows' exactly (FSB_BEAM_V2_EXACT=0: the faster 32-bit build, whose
-selections can differ at such ties); its key64 test build selects with 64-bit keys at every level.
+selections can differ at such ties); its key64 test build selects with 64-bit keys at every level. Its AKEY build
+(FSB_BEAM_LONG=1, over the exact build) selects exactly with 32-bit keys that hold each child's score bits relative to
+its query's best child, so it needs no 64-bit re-selection and runs three blocks per SM instead of two.
 
 fsb_beam_cuda (decode, small rows): one warp per query, lane l holds child slot l (frontier slot l // 2); each level
 loads the children's node fields once, the dot products of the valid children run as a shuffle reduce-scatter, and
@@ -450,6 +452,15 @@ def beam_v2_exact() -> bool:
     return os.environ.get("FSB_BEAM_V2_EXACT", "1") == "1"
 
 
+def beam_long_on() -> bool:
+    # FSB_BEAM_LONG=1: fsb_beam_rows2's AKEY build in place of its exact build (the same selections: 32-bit keys
+    # relative to each query's best child, no 64-bit re-selection, three blocks per SM)
+    return os.environ.get("FSB_BEAM_LONG", "0") == "1"
+
+
+_AKEY_WIN = 1 << 27                    # the AKEY build's key window (order-preserving score units below a query's best)
+
+
 def _rows2_layout(uc: int = _ROWS2_UC):
     # byte offsets of fsb_beam_rows2's dynamic shared memory regions (16-byte aligned) and the total: the union tile
     # (also the fallback's per-warp scratch), the warps' dot chunks, two levels of union node fields, the union's score
@@ -466,15 +477,21 @@ def _rows2_layout(uc: int = _ROWS2_UC):
 
 
 def rows2_source(NC: int, DH: int, WM: int, R: int, BOUND: bool, RC_T: bool, key64: bool = False,
-                 uc: int = _ROWS2_UC, exact: bool = False):
+                 uc: int = _ROWS2_UC, exact: bool = False, akey: bool = False, akey_win: int = _AKEY_WIN):
     # -> (source, dynamic shared memory bytes); fsb_beam_rows' sections in their tensor-core configuration supply the
     # shared helpers and the fallback descent. exact: 32-bit keys with their score-bit ties redone on 64-bit keys
     # (FSB_BEAM_V2_EXACT), two blocks per SM (at three the 64-bit path would spill the level loop's registers).
+    # akey: the AKEY build (FSB_BEAM_LONG), exact with 32-bit keys relative to each query's best child, three blocks
+    # per SM; akey_win: its key window (a test hook: a narrow one sends warps to its exact counting selection).
     # key64 / uc: test builds (64-bit selection keys at every level; a smaller union table)
     src, _ = rows_source(NC, DH, WM, R, BOUND, RC_T, _ROWS_CAP, _ROWS_UMAX, 128, True)
     off, total = _rows2_layout(uc)
-    defs = dict(MINB2=2 if exact else 3, KEY64=int(key64), EXACT=int(exact), UC2=uc, DCH=_ROWS2_DCH,
+    defs = dict(MINB2=2 if exact and not akey else 3, KEY64=int(key64), EXACT=int(exact), UC2=uc, DCH=_ROWS2_DCH,
                 **{f"OFF2_{k}": v for k, v in off.items()})
+    if akey:
+        if not 3 <= akey_win <= _AKEY_WIN:
+            raise ValueError(f"akey_win {akey_win} outside [3, 2^27]")
+        defs.update(AKEY=1, AWIN=int(akey_win))
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + src + _ROWS2_KERNEL, total
 
 
@@ -535,15 +552,15 @@ def beam_rows_ok(F: dict, q: torch.Tensor, W_max: int) -> bool:
 def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch.Tensor, sigv: torch.Tensor,
                           scale: float, s: int, delta_max: int, node_score: str, radius_coef, cap: int = None,
                           umax: int = None, qb: int = None, fallback: torch.Tensor = None, q_nq: int = None,
-                          key64: bool = False, uc2: int = None):
+                          key64: bool = False, uc2: int = None, akey_win: int = None):
     # beams: one or two (F, SP, W, bud, W_max) sharing the queries (same W_max) -> [(cells (T',Bq,W_max*2^delta_max)
     # int64, n_visit (T',Bq) fp32)] per beam, forest_beam_fused's contract, from one launch; None when the kernel is
     # unavailable (the caller then runs the warp-per-query kernel). cap / umax / qb: test hooks for the tile and union
     # sizes and the queries per block. fallback: test / diagnostic hook, 65 int32 counters on the device to which the
     # launch adds the number of its blocks that left the cooperative descent for the warp-per-query fallback ([0]) and
     # the level at which they did ([1 + level]). FSB_BEAM_V2=1 runs fsb_beam_rows2 where it applies (its exact build
-    # with FSB_BEAM_V2_EXACT=1); key64: its test build with 64-bit selection keys at every level, uc2: its union table
-    # size (32, 64 or 128).
+    # with FSB_BEAM_V2_EXACT=1, its AKEY build with FSB_BEAM_LONG=1 too); key64: its test build with 64-bit selection
+    # keys at every level, uc2: its union table size (32, 64 or 128), akey_win: the AKEY build's key window (test hook).
     v2 = (cap is None and umax is None and qb is None and q.dtype == torch.bfloat16 and delta_max <= 2
           and beams[0][4] == 16 and beam_v2_on())
     cap, umax, qb = cap or _ROWS_CAP, umax or _ROWS_UMAX, qb or (128 if q.dtype == torch.bfloat16 else _ROWS_QB)
@@ -577,12 +594,14 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     ent = None
     if v2:
         exact = beam_v2_exact()
-        cfg2 = ("rows2", dev.index, Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC, exact)
+        akey = exact and not key64 and beam_long_on()
+        awin = (akey_win or _AKEY_WIN) if akey else 0
+        cfg2 = ("rows2", dev.index, Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC, exact, awin)
         ent = _beam_fns.get(cfg2)
         if ent is None and not torch.cuda.is_current_stream_capturing():
             try:
                 src, smem = rows2_source(Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC,
-                                         exact)
+                                         exact, akey, awin or _AKEY_WIN)
                 ent = _beam_fns[cfg2] = (load_function(dev, src, "fsb_beam_rows2"), smem)
             except Exception as e:                                           # its own latch: fsb_beam_rows runs
                 import warnings

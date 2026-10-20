@@ -894,6 +894,174 @@ def test_rows2_compact_and_full_layout(monkeypatch):
     assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
 
 
+def _edge_rows(beams, q, seed):
+    # a quarter of the rows on per-query widths 0..16 and budgets 2^0..2^8 (roots carried at once, width-0 queries)
+    (F, SP, W, bud, _), second = beams
+    g = torch.Generator().manual_seed(seed)
+    edge = (torch.arange(q.shape[0]) % 4 == 0)[:, None].cuda()
+    W = torch.where(edge, torch.randint(0, 17, W.shape, generator=g).cuda(), W)
+    dl = torch.randint(0, 9, bud.shape, generator=g).cuda()
+    bud = torch.where(edge, torch.bitwise_left_shift(torch.ones_like(bud), dl), bud)
+    return [(F, SP, W, bud, 16), second]
+
+
+def _same(a, b):
+    return all(torch.equal(x, y) for r, o in zip(a, b) for x, y in zip(r, o))
+
+
+def _akey(monkeypatch, *args, **kw):
+    # fsb_beam_rows2's AKEY build (FSB_BEAM_LONG=1 over the exact build)
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", "1")
+    try:
+        return _rows2(monkeypatch, *args, **kw)
+    finally:
+        monkeypatch.setenv("FSB_BEAM_LONG", "0")
+
+
+@gpu
+@pytest.mark.parametrize("Bq", [128, 77, 200])
+@pytest.mark.parametrize("node_score,rc_tensor", [("bound", False), ("bound", True), ("mean", False)])
+def test_rows2_akey_build_matches_exact(monkeypatch, Bq, node_score, rc_tensor):
+    # FSB_BEAM_LONG's AKEY build (32-bit keys relative to each query's best child, three blocks per SM) == the exact
+    # build and fsb_beam_rows bitwise: both beams' cells, in order, and visit counts, on rows that fill a block partly or
+    # need two and on edge rows; the same blocks leave the cooperative descent on an overflowing union
+    beams, q, qpos, lam, sigv = _bf16_pair(53 + Bq, Bq=Bq)
+    beams = _edge_rows(beams, q, Bq + 1)
+    rc = torch.rand(q.shape[0], generator=torch.Generator().manual_seed(2)).cuda() * 8 + 1 if rc_tensor else 8.0
+    args = (beams, q, qpos, lam, sigv, 0.125, 32, 0, node_score, rc)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    ref = bc.forest_beam_rows_cuda(*args)
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", "0")
+    fb_x = torch.zeros(65, dtype=torch.int32, device="cuda")
+    exact = _rows2(monkeypatch, *args, fallback=fb_x)
+    names = _launch_names(monkeypatch)
+    fb_a = torch.zeros(65, dtype=torch.int32, device="cuda")
+    got = _akey(monkeypatch, *args, fallback=fb_a)
+    assert names() == ["fsb_beam_rows2"]
+    assert _same(ref, got) and _same(exact, got)
+    assert torch.equal(fb_x, fb_a)
+
+
+@gpu
+@pytest.mark.parametrize("win", [3, 64, 1 << 12, 1 << 20])
+@pytest.mark.parametrize("Bq,node_score", [(128, "bound"), (77, "mean"), (200, "bound")])
+def test_rows2_akey_narrow_window_counts_exactly(monkeypatch, win, Bq, node_score):
+    # a narrow key window (test hook) puts kept ranks of most queries outside it, so their warps rank the level's
+    # children by counting (akey_count_select): with a window of 3 units only a query's best child and its exact ties
+    # keep exact keys, and a key order alone would keep the others by child index. The selections still equal the
+    # exact build's bitwise, at every window
+    beams, q, qpos, lam, sigv = _bf16_pair(97 + Bq, Bq=Bq)
+    beams = _edge_rows(beams, q, Bq + 3)
+    args = (beams, q, qpos, lam, sigv, 0.125, 32, 0, node_score, 8.0)
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", "0")
+    exact = _rows2(monkeypatch, *args)
+    got = _akey(monkeypatch, *args, akey_win=win)
+    assert _same(exact, got)
+    with pytest.raises(ValueError, match="akey_win"):
+        bc.rows2_source(73, 64, 16, 1, True, False, exact=True, akey=True, akey_win=2)
+
+
+@gpu
+def test_rows2_akey_build_resolves_score_bit_ties(monkeypatch):
+    # the forests of test_rows2_exact_build_resolves_score_bit_ties (siblings a few units in the last place apart, the
+    # right child higher, where 32-bit absolute keys mostly rank the left child first): the AKEY build's keys keep all
+    # of those score bits and match fsb_beam_rows bitwise without 64-bit keys, as does its counting path
+    beams, q, qpos, lam, sigv = _bf16_pair(81)
+    for F, *_ in beams:
+        mu, aux = fsb_tree._beam_views(F)
+        t, n = ((aux[..., 4] >= 0) & (aux[..., 5] >= 0)).nonzero(as_tuple=True)
+        lc, rc_ = aux[t, n, 4].long(), aux[t, n, 5].long()
+        mu[t, rc_] = mu[t, lc]
+        aux[t, rc_, 1:3] = aux[t, lc, 1:3]
+        aux[t, rc_, 0] = aux[t, lc, 0] * (1.0 + 2.0 ** -20)
+    args = (beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    ref = bc.forest_beam_rows_cuda(*args)
+    assert _same(ref, _akey(monkeypatch, *args))
+    assert _same(ref, _akey(monkeypatch, *args, akey_win=16))
+
+
+@gpu
+@pytest.mark.parametrize("uc2", [None, 32])
+def test_rows2_akey_union_overflow(monkeypatch, uc2):
+    # an overflowing union hands the AKEY build's block to the warp-per-query descent at the same level as the exact
+    # build's: equal fallback counters (32 slots: most blocks), cells and visits bitwise
+    beams, q, qpos, lam, sigv = _bf16_pair(71)
+    args = (beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", "0")
+    fb_x = torch.zeros(65, dtype=torch.int32, device="cuda")
+    exact = _rows2(monkeypatch, *args, fallback=fb_x, uc2=uc2)
+    fb_a = torch.zeros(65, dtype=torch.int32, device="cuda")
+    got = _akey(monkeypatch, *args, fallback=fb_a, uc2=uc2)
+    assert int(fb_a[0]) > (q.shape[0] if uc2 else 0) and torch.equal(fb_x, fb_a)
+    assert _same(exact, got)
+
+
+@gpu
+@pytest.mark.parametrize("pad", [0, 45, 300])
+def test_rows2_akey_head_major_stage_views(monkeypatch, pad):
+    # the AKEY build on FSB_PREFILL_NOCOPY's head-major view at the released shape (16 heads of 64, width 16, pads past
+    # the stage's last query poisoned with NaNs) == the exact build on the same view == itself on the packed copy
+    H, nbc = 16, 8
+    beams, q, qpos, lam, sigv = _bf16_pair(173 + pad, M=512, nbc=nbc)
+    rows, Bq, Dh = q.shape
+    nq, q0, Npad = nbc * Bq - pad, 3 * Bq, 12 * Bq
+    heads = q.view(H, nbc * Bq, Dh)
+    base = torch.full((1, Npad, H, Dh), float("nan"), device="cuda", dtype=torch.bfloat16)
+    base[0, q0:q0 + nq] = heads[:, :nq].transpose(0, 1)
+    Q = base.transpose(1, 2)
+    qview = Q.as_strided((H, nq, Dh), (Q.stride(1), Q.stride(2), 1), Q.storage_offset() + q0 * Q.stride(2))
+    qpack = torch.zeros(H, nbc * Bq, Dh, device="cuda", dtype=torch.bfloat16)
+    qpack[:, :nq] = heads[:, :nq]
+    qpack = qpack.view(rows, Bq, Dh)
+    args = (qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", "0")
+    exact = _rows2(monkeypatch, beams, qview, *args, q_nq=nq)
+    got = _akey(monkeypatch, beams, qview, *args, q_nq=nq)
+    packed = _akey(monkeypatch, beams, qpack, *args)
+    assert int((got[0][0] >= 0).sum()) > 0
+    assert _same(exact, got) and _same(packed, got)
+
+
+@gpu
+def test_rows2_akey_graph_replay(monkeypatch):
+    # the AKEY build replays in a CUDA graph equal to eager, and again after its inputs change in place
+    beams, q, qpos, lam, sigv = _bf16_pair(83, nbc=4)
+    monkeypatch.setenv("FSB_BEAM_V2", "1")
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", "1")
+    names = _launch_names(monkeypatch)
+    qs, ps = q.clone(), qpos.clone()
+    args = (0.125, 32, 0, "bound", 8.0)
+    eager = [t.clone() for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, *args) for t in o]
+    assert names() == ["fsb_beam_rows2"]
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, *args)
+    torch.cuda.current_stream().wait_stream(st)
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        out = [t for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, *args) for t in o]
+    gr.replay()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(out, eager))
+    qs.add_((0.3 * torch.randn(qs.shape, generator=torch.Generator().manual_seed(78))).to(qs))
+    ps.add_(5.0)
+    gr.replay()
+    torch.cuda.synchronize()
+    eager2 = [t for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, *args) for t in o]
+    monkeypatch.setenv("FSB_BEAM_LONG", "0")
+    exact2 = [t for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, *args) for t in o]
+    assert not torch.equal(eager2[0], eager[0])
+    assert all(torch.equal(a, b) for a, b in zip(out, eager2)) and all(torch.equal(a, b) for a, b in zip(out, exact2))
+
+
 def _split_stage(seed, M=512, H=16, nbc=32, Bq=128, D=64, s=32):
     # _forest_stage's keys over the CUDA build's split forests (all cells; cells above the head's median norm), as the
     # prefill builds them, with the last nbc blocks' m_b rows (head-major)
