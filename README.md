@@ -51,16 +51,16 @@ Both variants retrieve single needles at 262k — 64x the training length — wi
 
 | Model | Prefill, Ktok/s (4k/16k/64k/131k) | Decode, tok/s (4k/16k/64k/131k) | Prefill peak, GiB (4k/16k/64k/131k) | Decode peak, GiB (4k/16k/64k/131k) |
 | --- | --- | --- | --- | --- |
-| TF++ (full attention) | 159.3 / 119.8 / 48.4 / 26.2 | 264.5 / 199.8 / 95.8 / 55.5 | 1.6 / 3.6 / 11.8 / 22.8 | 1.5 / 3.6 / 11.8 / 22.8 |
+| TF++ | 159.3 / 119.8 / 48.4 / 26.2 | 264.5 / 199.8 / 95.8 / 55.5 | 1.6 / 3.6 / 11.8 / 22.8 | 1.5 / 3.6 / 11.8 / 22.8 |
 | MoBA | 84.0 / 84.0 / 40.0 / 22.3 | 261.4 / 196.1 / 95.4 / 55.4 | 1.6 / 3.6 / 11.9 / 23.1 | 1.5 / 3.6 / 11.8 / 23.5 |
 | NSA | 129.2 / 136.8 / 104.6 / 76.1 | 153.8 / 149.2 / 143.1 / 139.7 | 1.0 / 2.0 / 5.8 / 11.0 | 1.0 / 1.9 / 5.8 / 11.0 |
 | GDN | 145.6 / 170.7 / 174.5 / 174.1 | 349.9 / 368.3 / 357.8 / 339.0 | 1.1 / 1.9 / 5.3 / 9.7 | 1.1 / 1.9 / 5.2 / 9.6 |
 | NAtS-L | 60.1* / 154.0* / 154.0* / 134.9* | 267.8 / 233.7 / 172.3 / 118.2 | 1.2* / 2.6* / 8.2* / 15.6* | 1.4 / 3.1 / 9.9 / 19.0 |
-| Raven (recurrent) | 141.6 / 171.1 / 176.7 / 176.7 | 238.1 / 236.7 / 245.6 / 238.5 | 1.0 / 1.8 / 5.1 / 9.5 | 0.9 / 1.8 / 5.1 / 9.5 |
+| Raven | 141.6 / 171.1 / 176.7 / 176.7 | 238.1 / 236.7 / 245.6 / 238.5 | 1.0 / 1.8 / 5.1 / 9.5 | 0.9 / 1.8 / 5.1 / 9.5 |
 | Raven-full | 102.3 / 112.4 / 101.6 / 88.5 | 234.8 / 232.6 / 211.7 / 182.7 | 1.0 / 1.9 / 5.5 / 10.3 | 1.1 / 2.1 / 6.0 / 11.3 |
-| **FS** | 130.5 / 173.1 / 155.1 / 133.1 | 413.3 / 406.7 / 366.6 / 330.0 | 0.8 / 1.0 / 1.4 / 2.0 | 1.0 / 1.8 / 4.6 / 8.5 |
-| **FS-L** (masked) | 136.0 / 177.3 / 182.5 / 182.8 | 430.3 / 430.5 / 428.9 / 428.4 | 0.8 / 1.0 / 1.4 / 2.0 | 1.0 / 1.8 / 4.6 / 8.5 |
-| **FS-B** | 85.0 / 114.9 / 107.4 / 101.8 | 338.2 / 321.1 / 305.0 / 296.1 | 0.8 / 1.0 / 1.8 / 2.7 | 1.0 / 1.9 / 5.1 / 9.2 |
+| **FS** | 142.6 / 172.9 / 155.2 / 133.3 | 503.3 / 492.5 / 428.3 / 385.9 | 0.8 / 1.0 / 1.4 / 2.0 | 1.0 / 1.8 / 4.6 / 8.5 |
+| **FS-L** | 141.6 / 180.4 / 184.1 / 184.2 | 522.6 / 522.2 / 522.5 / 525.4 | 0.8 / 1.0 / 1.4 / 2.0 | 0.9 / 1.1 / 1.5 / 2.2 |
+| **FS-B** | 117.1 / 139.0 / 133.3 / 128.0 | 449.5 / 433.4 / 416.8 / 410.2 | 0.8 / 1.0 / 1.7 / 2.7 | 1.0 / 1.8 / 5.0 / 9.1 |
 
 ## Models
 
@@ -104,9 +104,9 @@ CUDA_VISIBLE_DEVICES=0 freesolo-benchmark --model zekun-shi/FreeSolo-B-341M \
 The command downloads the checkpoint (and portable thresholds for FS-B), then invokes the
 paper's benchmark with bf16, batch 1, one warm-up, three measured repetitions,
 256 decode steps, and no memory cap. It prints eager and CUDA-graph measurements;
-compare the graph columns with **155.1/133.1 Ktok/s prefill** and **366.6/330.0 tok/s decode** for `FreeSolo-341M`, **182.5/182.8 Ktok/s prefill** and
-**428.9/428.4 tok/s decode** for `FreeSolo-L-341M`, or **107.4/101.8 Ktok/s prefill** and
-**305.0/296.1 tok/s decode** for `FreeSolo-B-341M` at 64k/131k. GPU clocks, host load, and software versions
+compare the graph columns with **155.2/133.3 Ktok/s prefill** and **428.3/385.9 tok/s decode** for `FreeSolo-341M`, **184.1/184.2 Ktok/s prefill** and
+**522.5/525.4 tok/s decode** for `FreeSolo-L-341M`, or **133.3/128.0 Ktok/s prefill** and
+**416.8/410.2 tok/s decode** for `FreeSolo-B-341M` at 64k/131k. GPU clocks, host load, and software versions
 affect timing. The JSON includes graph/eager logit checks and kernel fallback status.
 The reference stack uses PyTorch 2.5.1+cu121 and Triton 3.1.0.
 
