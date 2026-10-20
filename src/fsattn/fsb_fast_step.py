@@ -360,14 +360,15 @@ if _HAVE_TRITON:
                                                (KK * SP, DHP)), DHP), (KK, SP))
         sc = sc.to(Q.dtype.element_ty).to(tl.float32) * scale      # the score einsum's store, then * scale
         sc = tl.where(ok, sc, -1e9)
-        m = tl.max(tl.max(sc, axis=1), axis=0)
+        m = tl.max(tl.reshape(sc, (KK * SP,)), axis=0)
         e = _ld.exp(sc - m)
-        den = tl.sum(tl.sum(e, axis=1), axis=0)
+        den = tl.sum(tl.reshape(e, (KK * SP,)), axis=0)
         w = (e / den).to(VAL.dtype.element_ty).to(tl.float32)            # softmax stored, cast to the value dtype
         vt = tl.load(VAL + bi * svb + hi * svh + tok[:, :, None] * svn + d[None, None, :],
                      mask=ok[:, :, None] & (d[None, None, :] < DH), other=0.0)
-        acc = tl.sum(tl.sum(w[:, :, None] * vt.to(tl.float32), axis=1), axis=0)  # (DHP,); axis1 first: nested
-        # axis-0 reductions miscompile on some register layouts (wrong second reduction, no error)
+        # (DHP,): one reduction over the flattened (KK * SP) token rows. Nested reductions of the 3D tile (over the
+        # tokens, then the cells) miscompile silently on some register layouts (Dh 64, K 4: wrong sums, no error)
+        acc = tl.sum(tl.reshape(w[:, :, None] * vt.to(tl.float32), (KK * SP, DHP)), axis=0)
         x = tl.where(tl.sum(ok.to(tl.int32)) > 0, acc, 0.0).to(Q.dtype.element_ty)   # the readout store; empty row 0
         xf = x.to(tl.float32)
         sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)             # attn.lr_norm in torch's order and dtypes
@@ -424,9 +425,9 @@ if _HAVE_TRITON:
                                                (KK * SP, DHP)), DHP), (KK, SP))
         sc = sc.to(Q.dtype.element_ty).to(tl.float32) * scale      # the score einsum's store, then * scale
         sc = tl.where(ok, sc, -1e9)
-        m = tl.max(tl.max(sc, axis=1), axis=0)
+        m = tl.max(tl.reshape(sc, (KK * SP,)), axis=0)
         e = _ld.exp(sc - m)
-        den = tl.sum(tl.sum(e, axis=1), axis=0)
+        den = tl.sum(tl.reshape(e, (KK * SP,)), axis=0)
         w = (e / den).to(HOTV.dtype.element_ty).to(tl.float32)           # softmax stored, cast to the value dtype
         vq = tl.load(QV + bi * sqvb + hi * sqvh + tok[:, :, None] * sqvn + d[None, None, :],
                      mask=inq[:, :, None] & (d[None, None, :] < DH), other=0).to(tl.float32)
@@ -434,7 +435,7 @@ if _HAVE_TRITON:
         vh = tl.load(HOTV + bi * shvb + hi * shvh + hot_i[:, :, None] * shvn + d[None, None, :],
                      mask=(ok & is_hot)[:, :, None] & (d[None, None, :] < DH), other=0.0).to(tl.float32)
         vt = tl.where(is_hot[:, :, None], vh, vq * vsc[:, :, None])
-        acc = tl.sum(tl.sum(w[:, :, None] * vt, axis=1), axis=0)         # (DHP,); axis1 first (see above)
+        acc = tl.sum(tl.reshape(w[:, :, None] * vt, (KK * SP, DHP)), axis=0)   # (DHP,); flat, as above
         x = tl.where(tl.sum(ok.to(tl.int32)) > 0, acc, 0.0).to(Q.dtype.element_ty)   # the readout store; empty row 0
         xf = x.to(tl.float32)
         sq_ = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)            # attn.lr_norm in torch's order and dtypes

@@ -181,22 +181,23 @@ def test_cache_finish_cell_quantizes_open_cell(monkeypatch):
     assert (err <= sc * 0.5 + 0.02).all()
 
 
-def _fsb_attn_and_int8_cache(monkeypatch, n=128):
+def _fsb_attn_and_int8_cache(monkeypatch, n=128, d_model=128, n_heads=4, int8=True):
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "experiments" / "scaling"))
     from src.fsattn.attention import FSAttn
     from experiments.scaling.kv_cache import FSKVCache
 
-    attn = FSAttn(d_model=128, n_heads=4, window_size=8, causal=True, use_rope=False,
+    attn = FSAttn(d_model=d_model, n_heads=n_heads, window_size=8, causal=True, use_rope=False,
                   lr_scale_mode="one", cell_stride=32, cell_topk=2, sel_strict_causal=1).to(torch.bfloat16).cuda().eval()
-    monkeypatch.setenv("FS_KV_INT8", "1")
+    monkeypatch.setenv("FS_KV_INT8", "1" if int8 else "0")
     c = FSKVCache(attn)
-    c.enable_int8()
+    if int8:
+        c.enable_int8()
     c.reserve = 96
     c.preallocate(1, n, torch.bfloat16, torch.device("cuda"), keep=True)
-    x = torch.randn(1, n, 128, device="cuda", generator=torch.Generator(device="cuda").manual_seed(31))
+    x = torch.randn(1, n, d_model, device="cuda", generator=torch.Generator(device="cuda").manual_seed(31))
     attn(x.bfloat16(), cache=c)
-    assert c.use_int8 and c._n_q == (n // 32) * 32
+    assert c.use_int8 == int8 and (not int8 or c._n_q == (n // 32) * 32)
     return attn, c
 
 
@@ -226,6 +227,38 @@ def test_decread_int8_fp32_lr_norm_matches_reference(monkeypatch):
     # both read the same quantized cells; only the fp32-norm promotion order can differ
     assert out.shape == ref.shape
     assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("int8,ln_f32", [(True, True), (True, False), (False, False)])
+def test_decread_production_shape_matches_reference(monkeypatch, int8, ln_f32):
+    # the fused decode readouts at the released models' shape (16 heads of 64, four read cells) against the torch
+    # reference: nested reductions of the (cells, tokens, Dh) tile once miscompiled silently at this register
+    # layout while the toy shapes above stayed exact, so the shape itself is pinned here
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    from src.fsattn import fsb_fast_step as fst
+    from src.fsattn.fsb_tree import _fsb_decode_readout
+    attn, c = _fsb_attn_and_int8_cache(monkeypatch, n=1024, d_model=1024, n_heads=16, int8=int8)
+    if ln_f32:
+        attn.lr_norm.scale.data = attn.lr_norm.scale.data.float()
+    B, H, Dh, K = 1, 16, attn.head_dim, 4
+    assert Dh == 64
+    q_t = torch.randn(B, H, 1, Dh, device="cuda", dtype=torch.bfloat16,
+                      generator=torch.Generator(device="cuda").manual_seed(37))
+    g = torch.Generator(device="cuda").manual_seed(5)
+    sel = torch.stack([torch.randperm(c._len // 32, device="cuda", generator=g)[:K] for _ in range(B * H)])
+    sel = sel.view(B * H, 1, K)
+    pos_t = torch.full((), c._len, dtype=torch.int64, device="cuda")
+    real_ok = fst.decode_readout_ok
+    # the bf16 readout is fused only inside a capture; run the same launch eagerly
+    monkeypatch.setattr(fst, "decode_readout_ok", lambda *a, **k: real_ok(*a, **{**k, "must_capture": False}))
+    out = fst.decode_readout_fast(attn, c, q_t, sel, pos_t)
+    assert out is not None
+    ref = _fsb_decode_readout(attn, q_t, c, sel, pos_t, full_buffer=True)
+    assert out.shape == ref.shape
+    o, r = out.float().reshape(-1), ref.float().reshape(-1)
+    assert ((o - r).norm() / r.norm()).item() < 1e-2
 
 
 @gpu
