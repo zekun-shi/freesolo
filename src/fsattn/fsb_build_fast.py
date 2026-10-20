@@ -363,6 +363,30 @@ if _HAVE_TRITON:
         tl.store(MC + T + t, m1)
 
     @triton.jit
+    def _budgets_kernel(HM, HU, W, DL, BUD, UW, UD, BUDU, T, d, w, uw, UNION: tl.constexpr, MAIN_UW: tl.constexpr,
+                        BLOCK: tl.constexpr):
+        # the fixed policy's per-head beam budgets from the spines' heights h: W = min(w, 2^max(0, h - d)), delta =
+        # h - max(0, h - d) = min(h, d), budget 2^delta; UNION: the union forest's (union_W, union_delta, its budget)
+        # from its own heights; MAIN_UW: without one, the main forest's union width and budget
+        t = tl.arange(0, BLOCK)
+        m = t < T
+        h = tl.load(HM + t, mask=m, other=0)
+        D = tl.maximum(h - d, 0)
+        one = tl.full([BLOCK], 1, tl.int64)
+        tl.store(W + t, tl.minimum(one * w, one << D), mask=m)
+        tl.store(DL + t, h - D, mask=m)
+        tl.store(BUD + t, one << (h - D), mask=m)
+        if UNION:
+            hu = tl.load(HU + t, mask=m, other=0)
+            Du = tl.maximum(hu - d, 0)
+            tl.store(UD + t, hu - Du, mask=m)
+            tl.store(UW + t, tl.minimum(one * uw, one << Du), mask=m)
+            tl.store(BUDU + t, one << (hu - Du), mask=m)
+        if MAIN_UW:
+            tl.store(UW + t, tl.minimum(one * uw, one << D), mask=m)
+            tl.store(BUDU + t, one << (h - D), mask=m)
+
+    @triton.jit
     def _pack_lean_chunks_kernel(MTOT, JBASE, SRC_NODE, SRC_AX, SRC_LEAF, EMP, DST_MU, DST_AX, DST_LEAF,
                                  K_N, BASE_N, STR_N, U_N, DST_N,
                                  K_L, BASE_L, STR_L, U_L, DST_L,
@@ -576,6 +600,26 @@ def build_spines_fast(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, consts, o
 
 def _enc_i(x: int) -> int:
     return (int(x) << 2) | 3
+
+
+@torch.no_grad()
+def budgets_fast(h_main: torch.Tensor, h_union, outs: tuple, d: int, w: int, uw: int) -> bool:
+    # _budgets_kernel for T heads: h_main / h_union the (T,) int64 spine heights (h_union None: no union forest), outs
+    # = (W, delta, bud, union_W, union_delta, bud_u) contiguous int64 (T, 1) tensors (the union ones None where unused).
+    # One launch, no host read; False where it does not apply (the caller computes them otherwise)
+    W, dl, bud, u_w, u_d, bud_u = outs
+    T = h_main.shape[0]
+    main_uw = h_union is None and u_w is not None
+    ts = [h_main, W, dl, bud] + ([h_union, u_w, u_d, bud_u] if h_union is not None else
+                                 ([u_w, bud_u] if main_uw else []))
+    if not (_HAVE_TRITON and 0 < T <= 1024 and all(x is not None and x.is_cuda and x.dtype == torch.int64
+                                                    and x.is_contiguous() and x.numel() == T for x in ts)):
+        return False
+    _budgets_kernel[(1,)](h_main, h_union if h_union is not None else h_main, W, dl, bud,
+                          u_w if u_w is not None else W, u_d if u_d is not None else dl,
+                          bud_u if bud_u is not None else bud, T, d, w, uw,
+                          UNION=h_union is not None, MAIN_UW=main_uw, BLOCK=_pow2(max(T, 16)), num_warps=1)
+    return True
 
 
 @torch.no_grad()

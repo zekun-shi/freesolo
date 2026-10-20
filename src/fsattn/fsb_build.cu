@@ -1763,6 +1763,66 @@ fsb_prep_lean_tasks(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
     }
 }
 
+// fsb_prep_lean_tasks with the dirty heights decided on the device (a decode ingest whose admitted counts the host has
+// not read): the records of heights 0 .. NK - 1 for every head, where a height is dirty exactly when the host's ingest
+// would rebuild it (_ingest_lean: some head holds a chunk of that height after the append, and the height held no
+// chunk in any head before it or some head's chunk index or presence changed), from MT0 (m_tot after the append) and
+// NN (the admitted counts the append added, so m_tot before it is MT0 - NN). Clean heights get nsub = 0 records,
+// which the build kernel leaves without a write; dirty ones get fsb_prep_lean_tasks' records, so the build writes the
+// same rows with the same bits, except that a head whose chunk at the height is the one it held before (same index)
+// skips its rebuild: the rows hold that chunk's build already, and a build is a pure function of the chunk's cells
+// (append-only admissions, completed cells). NK <= 16; one CTA.
+extern "C" __global__ void __launch_bounds__(256)
+fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
+                    i64* __restrict__ JB0, const i64* __restrict__ MT0, const i64* __restrict__ NN,
+                    const int NK, const int T, const int fold_mask, const int Kmax_lean,
+                    const int M_adm0, const int M_kb, const int M_ce, const int M_spr) {
+    __shared__ int s_now[16], s_was[16], s_moved[16];
+    const int tid = threadIdx.x;
+    if (tid < 16) { s_now[tid] = 0; s_was[tid] = 0; s_moved[tid] = 0; }
+    __syncthreads();
+    const int nrec = NK * T;
+    for (int r = tid; r < nrec; r += 256) {
+        const int k = r / T, t = r - k * T;
+        const i64 m1 = MT0[t], m0 = m1 - NN[t];
+        const bool h1 = ((m1 >> k) & 1ll) != 0, h0 = ((m0 >> k) & 1ll) != 0;
+        const i64 j1 = h1 ? ((m1 >> (k + 1)) << 1) : 0ll, j0 = h0 ? ((m0 >> (k + 1)) << 1) : 0ll;
+        if (h1) atomicOr(&s_now[k], 1);
+        if (h0) atomicOr(&s_was[k], 1);
+        if (h1 != h0 || j1 != j0) atomicOr(&s_moved[k], 1);
+    }
+    __syncthreads();
+    for (int r = tid; r < nrec; r += 256) {
+        const int k = r / T, t = r - k * T;
+        const i64 mi = MT0[t], m0 = mi - NN[t];
+        const bool kept = ((mi >> k) & 1ll) != 0 && ((m0 >> k) & 1ll) != 0 && (mi >> (k + 1)) == (m0 >> (k + 1));
+        const bool dirty = s_now[k] != 0 && (s_was[k] == 0 || s_moved[k] != 0) && !kept;
+        const int j0 = ((mi >> k) & 1ll) ? (int)((mi >> (k + 1)) << 1) : ((int)(mi >> k) + 1);
+        int* tk = TASKS_OUT + 10 * r;
+        tk[0] = 0; tk[1] = 0; tk[2] = t; tk[3] = k; tk[4] = j0;
+        tk[5] = dirty ? 1 : 0; tk[6] = 0; tk[7] = 0; tk[8] = -1; tk[9] = -1;
+    }
+    if (tid < 16) {
+        LAY_OUT[tid] = (2 << tid) - tid - 2;
+        LAY_OUT[16 + tid] = (1 << tid) - 1;
+    } else if (tid == 32) {
+        LAY_OUT[32] = fold_mask;
+        LAY_OUT[33] = Kmax_lean;
+        LAY_OUT[34] = M_adm0;
+        LAY_OUT[35] = 0;
+        LAY_OUT[36] = M_kb;
+        LAY_OUT[37] = M_ce;
+        LAY_OUT[38] = M_spr;
+        LAY_OUT[39] = 0;
+    }
+    const int K1 = Kmax_lean + 1;
+    for (int e = tid; e < T * K1; e += 256) {
+        const int tt = e / K1, kk = e - tt * K1;
+        const i64 mi = MT0[tt];
+        JB0[e] = ((mi >> kk) & 1ll) ? ((mi >> (kk + 1)) << 1) : 0ll;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(512)
 fsb_spine_lean(const float* __restrict__ NODE0, const i64* __restrict__ MT0,
                float* __restrict__ SP_NODE, i64* __restrict__ SP_ROOT,

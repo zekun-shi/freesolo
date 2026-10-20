@@ -284,3 +284,82 @@ def test_forked_join_matches_torch_combine(monkeypatch, v2):
     assert torch.isfinite(l0).all() and (s0 >= 0).float().mean() > 0.9
     assert torch.equal(s0, s1)
     assert torch.equal(l0, l1)
+
+
+def _forest_tables(fc):
+    # every table of a decode forest that a read or a later ingest uses, cloned (the arena, leaves, admission table,
+    # counts, spines, chunk index table)
+    out = [fc._arena_mu, fc._arena_aux, fc._leaf_arena, fc.adm, fc.m_tot, fc.SP["node"], fc.SP["root"],
+           fc.SP["height"], fc._jbase_buf]
+    return [t.clone() for t in out]
+
+
+def _budget_tables(fc):
+    # a layer's per-head beam budgets as the captured decode step reads them
+    tk = fc._tok
+    ukw = tk.get("ukw") or {}
+    return [t.clone() for t in (tk["W"], tk["delta"], tk["bud"], tk["bud_u"], ukw.get("union_W"),
+                                ukw.get("union_delta")) if t is not None]
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("L,uq", [(1024, 0.5), (4096, 0.5), (1024, 0.97)])
+def test_async_block_change_matches_host_decided(monkeypatch, L, uq):
+    # FSB_DECODE_ASYNC=1: a block change whose counts the host provably does not need appends, decides the dirty chunk
+    # heights on the device and rebuilds them with no synchronizing call (checked with torch's sync debug mode); across
+    # many teacher-forced block changes every forest table, the beam budgets, the read cells and the logits equal the
+    # host-decided path's bit for bit, and the host state that follows one block late (counts, chunk metadata, height
+    # list) agrees. uq: the union forest's threshold quantile (0.97: a few cells per head, so the beam widths grow
+    # during the decode and are recomputed on the device)
+    from src.fsattn import fsb_build_cuda as fbc
+    m = _model(monkeypatch, L, n_layers=2)
+    prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(101)).cuda()
+    forced = torch.randint(0, 512, (700,), generator=torch.Generator().manual_seed(103)).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", "1")
+    monkeypatch.setenv("FSB_DECODE_FORK", "1")
+    ran, real = [], fbc.lean_dirty_build
+    monkeypatch.setattr(fbc, "lean_dirty_build", lambda *a: ran.append(real(*a)) or ran[-1])
+    restore = _taus(m)
+    runs = {}
+    for asy in ("0", "1"):
+        monkeypatch.setenv("FSB_DECODE_ASYNC", asy)
+        ran.clear()
+        restore()
+        gd = _decoder(m, prompt, len(forced))
+        if uq != 0.5:
+            for blk, c in zip(m.blocks, gd.cache):
+                blk.attn.fsattn.fsb_tau_union.copy_(c._ceil[0].float().quantile(uq, dim=-1))
+        logits, sels, tabs = [], [], []
+        for i, t in enumerate(forced):
+            gd.next_tok = t.view(1)
+            if asy == "1" and i > 0 and gd.pos % gd.Bq == 0:
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    gd.step()
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+            else:
+                gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
+            if (gd.pos - 1) % gd.Bq == 0:
+                torch.cuda.synchronize()
+                tabs.append([_forest_tables(f) for c in gd.cache for f in (c._fsb_forest, c._fsb_forest.utau)]
+                            + [_budget_tables(c._fsb_forest) for c in gd.cache])
+        host = []
+        for c in gd.cache:
+            for f in (c._fsb_forest, c._fsb_forest.utau):
+                if f._rb is not None:
+                    f._settle()
+                host.append((list(f._m_known), f._lean_meta, list(f.F["ks"]), f._height_h, f._m_max_h))
+        runs[asy] = (torch.stack(logits), torch.stack(sels), tabs, host)
+        assert (len(ran) > 0 and all(ran)) == (asy == "1"), (asy, ran)
+    (l0, s0, t0, h0), (l1, s1, t1, h1) = runs["0"], runs["1"]
+    assert len(t0) == len(t1) >= 5
+    for a, b in zip(t0, t1):
+        for fa, fb in zip(a, b):
+            assert all(torch.equal(x, y) for x, y in zip(fa, fb))
+    assert h0 == h1
+    assert torch.equal(s0, s1) and (s0 >= 0).float().mean() > 0.9
+    assert torch.equal(l0, l1)

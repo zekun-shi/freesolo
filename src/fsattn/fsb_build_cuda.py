@@ -221,6 +221,7 @@ def _functions(dev: torch.device, Dh: int):
             bld_lean16 = _bc.load_function(dev, src, "fsb_forest_build_lean16")
             sp_lean16 = _bc.load_function(dev, src, "fsb_spine_lean16")
             bld16 = _bc.load_function(dev, src, "fsb_forest_build16")
+            prep_dirty = _bc.load_function(dev, src, "fsb_prep_lean_dirty")
             _, cuda = _bc._libraries()
             cuda.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             _bc._check(cuda.cuFuncSetAttribute(bld, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
@@ -236,7 +237,7 @@ def _functions(dev: torch.device, Dh: int):
             warnings.warn(f"FS-B CUDA forest build unavailable on cuda:{dev.index} for head size {Dh}, using the "
                           f"Triton builder: {e!r}")
             raise _Unavailable(repr(e)) from e
-        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16)
+        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16, prep_dirty)
     return fn[:2]
 
 
@@ -589,6 +590,39 @@ def _lean_layout_info(M: int, g: int) -> tuple:
     return lay, fold_mask, nbig
 
 
+def _lean_operands(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, lean):
+    # the lean build's inputs as its kernels read them: row-strided (T, M_x, .) views where the layout allows (M_kb,
+    # M_ce, M_spr, M_adm0 their per-head row strides), contiguous copies otherwise; the spread slot falls back to the
+    # ceilings when there is no spread
+    Dh = Kbar.shape[2]
+    adm0, mt0 = lean[3], lean[4]
+    if Kbar.stride(2) == 1 and Kbar.stride(1) == Dh and Kbar.stride(0) % Dh == 0 and Kbar.data_ptr() % 16 == 0:
+        M_kb = Kbar.stride(0) // Dh
+    else:
+        Kbar = Kbar.contiguous()
+        M_kb = Kbar.shape[1]
+    if ceil_c.stride(1) == 1 and ceil_c.data_ptr() % 4 == 0:
+        M_ce = ceil_c.stride(0)
+    else:
+        ceil_c = ceil_c.contiguous()
+        M_ce = ceil_c.shape[1]
+    if spread is not None:
+        if spread.stride(1) == 1 and spread.data_ptr() % 4 == 0:
+            sp = spread
+            M_spr = sp.stride(0)
+        else:
+            sp = spread.contiguous()
+            M_spr = sp.shape[1]
+    else:
+        sp = ceil_c
+        M_spr = M_ce
+    if adm0.stride(1) != 1 or adm0.data_ptr() % 8 != 0:
+        adm0 = adm0.contiguous()
+    M_adm0 = adm0.stride(0)
+    mt0 = mt0 if (mt0.stride(0) == 1 and mt0.data_ptr() % 8 == 0) else mt0.contiguous()
+    return Kbar, ceil_c, sp, adm0, mt0, M_kb, M_ce, M_spr, M_adm0
+
+
 @torch.no_grad()
 def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, sel: list,
                   kmax_cuda: int = 99, lean=None):
@@ -622,34 +656,11 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
         if tkey not in _tables and tkey not in _pinned:
             _tasks(T, M, nf, g, dev, kmax_cuda, only_layv=True)
         _functions(dev, Dh)
-        _, _, _, prep_lean, _, bld_lean16, sp_lean16, _ = _fns[_variant(dev.index, Dh)]
-        amu0, anx0, leaf0, adm0, mt0, jb0, Kmax_lean, _ = lean[:8]
+        _, _, _, prep_lean, _, bld_lean16, sp_lean16 = _fns[_variant(dev.index, Dh)][:7]
+        amu0, anx0, leaf0, _, _, jb0, Kmax_lean, _ = lean[:8]
         sp_node, sp_root, sp_hgt = lean[8:11] if len(lean) >= 11 else (None, None, None)
         task_buf = lean[11] if len(lean) >= 12 else None
-        if Kbar.stride(2) == 1 and Kbar.stride(1) == Dh and Kbar.stride(0) % Dh == 0 and Kbar.data_ptr() % 16 == 0:
-            M_kb = Kbar.stride(0) // Dh
-        else:
-            Kbar = Kbar.contiguous()
-            M_kb = Kbar.shape[1]
-        if ceil_c.stride(1) == 1 and ceil_c.data_ptr() % 4 == 0:
-            M_ce = ceil_c.stride(0)
-        else:
-            ceil_c = ceil_c.contiguous()
-            M_ce = ceil_c.shape[1]
-        if spread is not None:
-            if spread.stride(1) == 1 and spread.data_ptr() % 4 == 0:
-                sp = spread
-                M_spr = sp.stride(0)
-            else:
-                sp = spread.contiguous()
-                M_spr = sp.shape[1]
-        else:
-            sp = ceil_c
-            M_spr = M_ce
-        if adm0.stride(1) != 1 or adm0.data_ptr() % 8 != 0:
-            adm0 = adm0.contiguous()
-        M_adm0 = adm0.stride(0)
-        mt0 = mt0 if (mt0.stride(0) == 1 and mt0.data_ptr() % 8 == 0) else mt0.contiguous()
+        Kbar, ceil_c, sp, adm0, mt0, M_kb, M_ce, M_spr, M_adm0 = _lean_operands(Kbar, ceil_c, spread, lean)
         P, I32, U64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong
         jb_ptr = jb0.data_ptr() if jb0 is not None else 0
         if fast_lean:
@@ -768,6 +779,54 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
              "Cmaxs": dict(lay["Cmaxs"])}
         res.append((F, mb))
     return res
+
+
+DIRTY_KMAX = 9                                            # tallest chunk lean_dirty_build rebuilds (one-CTA batches)
+
+
+@torch.no_grad()
+def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, nn: torch.Tensor,
+                     lean) -> bool:
+    # _chunks_build's lean single-forest path for a decode ingest whose dirty chunk heights the device decides from the
+    # append's admitted counts nn (fsb_prep_lean_dirty): records for every height up to min(Kmax, DIRTY_KMAX), the
+    # clean ones empty, then the build and the spines; three launches and no host read, so a block change can be
+    # enqueued while earlier decode steps still run. The rows it writes are those the host-decided path writes, with
+    # the same bits; the caller guarantees that no taller chunk changes. Kbar, ceil_c, spread, taus, E and lean as
+    # forests_cuda gets them for that path (lean with its spine outputs and task buffer). False (nothing launched)
+    # where the CUDA build does not cover the inputs.
+    T, _, Dh = Kbar.shape
+    M = lean[7]
+    dev = Kbar.device
+    amu0, anx0, leaf0, _, _, jb0, Kmax_lean, _, sp_node, sp_root, sp_hgt, task_buf = lean[:12]
+    nk = min(int(Kmax_lean), DIRTY_KMAX) + 1
+    if not (T > 0 and len(taus) == 1 and task_buf is not None and task_buf.dtype == torch.int32
+            and nk * T * 10 + 40 <= task_buf.numel() and nn.dtype == torch.int64 and nn.is_contiguous()
+            and nn.numel() == T and jb0 is not None and sp_node is not None
+            and build_cuda_ok(Kbar, ceil_c, spread, taus, E)):
+        return False
+    _, fold_mask, nbig = _lean_layout_info(M, _group())
+    _functions(dev, Dh)
+    fns = _fns[_variant(dev.index, Dh)]
+    bld_lean16, sp_lean16, prep_dirty = fns[5], fns[6], fns[8]
+    Kbar, ceil_c, sp, adm0, mt0, M_kb, M_ce, M_spr, M_adm0 = _lean_operands(Kbar, ceil_c, spread, lean)
+    P, I32 = ctypes.c_void_p, ctypes.c_int
+    nrec = nk * T
+    tasks_ptr = task_buf.data_ptr()
+    lay_ptr = tasks_ptr + 40 * nrec
+    _launch(prep_dirty, 1, 256, 0, dev,
+            [P(tasks_ptr), P(lay_ptr), P(jb0.data_ptr()), P(mt0.data_ptr()), P(nn.data_ptr()), I32(nk), I32(T),
+             I32(fold_mask), I32(int(Kmax_lean)), I32(int(M_adm0)), I32(int(M_kb)), I32(int(M_ce)), I32(int(M_spr))])
+    _launch(bld_lean16, nrec, _THREADS, _smem_bytes(Dh), dev,
+            [P(tasks_ptr), P(lay_ptr), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
+             P(sp.data_ptr()), P(adm0.data_ptr()), P(0), P(mt0.data_ptr()), P(mt0.data_ptr()),
+             P(amu0.data_ptr()), P(amu0.data_ptr()), P(anx0.data_ptr()), P(anx0.data_ptr()),
+             P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(0),
+             P(0), I32(M), I32(amu0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)), I32(nbig),
+             I32(T), P(0), P(0)])
+    _launch(sp_lean16, (T + 15) // 16, _THREADS, 0, dev,
+            [P(amu0.data_ptr()), P(anx0.data_ptr()), P(mt0.data_ptr()), P(sp_node.data_ptr()),
+             P(sp_root.data_ptr()), P(sp_hgt.data_ptr()), I32(T), I32(amu0.shape[1]), I32(int(Kmax_lean))])
+    return True
 
 
 @torch.no_grad()
