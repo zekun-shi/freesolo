@@ -327,6 +327,9 @@ fsb_rows_fused2(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
             const int u_next = u + 1;
             unsigned short* ks_cur = stage ? ks1 : ks0;
             unsigned short* ks_nxt = stage ? ks0 : ks1;
+            // ks_nxt held the previous cell, which slower warps may still be reading: every warp must be past it
+            // before the prefetch overwrites it
+            if (u > u0) __syncthreads();
             if (u_next < u1) {
                 const i64 cell_n = (i64)s_cells[u_next];
                 const unsigned short* ksrc_n = kb + cell_n * 32 * sl;
