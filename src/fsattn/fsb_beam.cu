@@ -1703,22 +1703,75 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
     // the budget the staged codes use: the block's first query's (every query of a prefill row shares its row's)
     const float bud_blk = (float)BUDGET[t * Bq + q0];
     const bool ubud = !qok || bud == bud_blk;
-    // level 0's union is the root (buffer 0, slot 0); every query starts with it as its one open entry
-    if (tid == 0 && root != -1) {
-        const float* p = aux_row(cax, sbase, root);
-        s_um[0] = make_float4(__int_as_float(root), p[3], p[4], p[5]);
-        s_code[0] = (unsigned char)node_code(p[3], p[4], p[5], bud_blk);
-    }
     for (int v = tid; v < 2 * MK2 / 4; v += NT) reinterpret_cast<unsigned*>(s_mk)[v] = 0u;
-    __syncthreads();
     unsigned o_lo = 0u, o_hi = 0u;            // open entries: union slots in rank order, lane h ranks 8 h .. 8 h + 7
     int nopen = (qok && root != -1) ? 1 : 0, ncar = 0, nvis = 0;
     bool done = !qok;
     int ub = 0, fb_lev = -1;                  // the union buffer the open entries index; the fallback level
     int ncar0 = 0, nvis0 = 0, nopen0 = 0;     // the level's starting state (the fallback restarts the level)
+    // ---- the levels that keep every child are the same for every query of a block with one width and budget: warp 0
+    // walks them once (lane j: frontier node j; carried nodes in slot order, children in child order), up to the
+    // first level fsb_beam_rows' vote makes a selecting one, the fixed point or the level limit, and stages that
+    // level's frontier as its union (slot j); the queries start there with the walk's carried prefix and visits.
+    // Otherwise level 0's union is the root (slot 0), every query's one open entry.
+    int lev0 = 0;
+    const int w_blk = (int)min(max(WBEAM[t * Bq + q0], (i64)0), (i64)WM);
+    const bool uni = __syncthreads_and(!qok || (wl == w_blk && bud == bud_blk));
+    int* ff = reinterpret_cast<int*>(s_dot);  // the walk's frontier refs [0, 16), carried refs [16, 32), its state
+    if (wid == 0) {
+        int fref = lane == 0 ? root : -1, nf = root != -1 ? 1 : 0, ncf = 0, nvf = 0, lv = 0;
+        float fcnt = 0.0f, fchl = -1.0f, fchr = -1.0f;
+        if (fref != -1) {
+            const float* p = aux_row(cax, sbase, fref);
+            fcnt = p[3]; fchl = p[4]; fchr = p[5];
+        }
+        const unsigned lt = (1u << lane) - 1u;
+        while (uni && lv < KMAXP1 && nf > 0) {
+            const unsigned cd = lane < nf ? node_code(fcnt, fchl, fchr, bud_blk) : 0u;
+            const unsigned car = __ballot_sync(FULL, cd & 2u), lc = __ballot_sync(FULL, cd & 4u);
+            const unsigned rc = __ballot_sync(FULL, cd & 8u);
+            const int ncarry = __popc(car), n = __popc(lc) + __popc(rc);
+            if (__ballot_sync(FULL, cd & 1u) == 0u) break;
+            if (ncf + ncarry + n > w_blk && (ncarry < nf || ncf + ncarry > w_blk)) break;
+            if ((cd & 2u) && ncf + __popc(car & lt) < w_blk) ff[16 + ncf + __popc(car & lt)] = fref;
+            const int cpos = __popc(lc & lt) + __popc(rc & lt);
+            if (cd & 4u) ff[cpos] = (int)fchl;
+            if (cd & 8u) ff[cpos + ((cd & 4u) ? 1 : 0)] = (int)fchr;
+            __syncwarp();
+            ncf = min(ncf + ncarry, w_blk);
+            nvf += n;
+            nf = n;
+            lv++;
+            fref = lane < nf ? ff[lane] : -1;
+            __syncwarp();
+            if (fref != -1) {
+                const float* p = aux_row(cax, sbase, fref);
+                fcnt = __ldg(p + 3); fchl = __ldg(p + 4); fchr = __ldg(p + 5);
+            }
+        }
+        if (lane < nf) {
+            s_um[lane] = make_float4(__int_as_float(fref), fcnt, fchl, fchr);
+            s_code[lane] = (unsigned char)node_code(fcnt, fchl, fchr, bud_blk);
+        }
+        if (lane == 0) { ff[32] = nf; ff[33] = ncf; ff[34] = nvf; ff[35] = lv; }
+    }
+    __syncthreads();
+    if (uni) {
+        lev0 = ff[35];
+        if (qok) {
+            ncar = ff[33];
+            nvis = ff[34];
+            nopen = ff[32];
+            o_lo = h ? 0x0b0a0908u : 0x03020100u;
+            o_hi = h ? 0x0f0e0d0cu : 0x07060504u;
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++)
+                if (8 * h + jj < ncar) s_car[qi * 16 + 8 * h + jj] = ff[16 + 8 * h + jj];
+        }
+    }
     bool done0 = done;
     PMARK(0);
-    for (int lev = 0; lev < KMAXP1; lev++) {
+    for (int lev = lev0; lev < KMAXP1; lev++) {
         unsigned char* mk = s_mk + ub * MK2;
         const float4* um_cur = s_um + ub * UC2;
         ncar0 = ncar; nvis0 = nvis; nopen0 = nopen; done0 = done;
