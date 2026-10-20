@@ -22,10 +22,13 @@ cells its first decode block can read (SlotStore.prefill), a completed cell take
 (store_cell), and each block refresh assembles the pool of trunk_triton.fsl_pool_refresh value for value (the mean
 keys gathered through the table) and frees the slots of the cells that left the readable set (pool). An overflow
 (no free slot) and a readable pool cell without a slot cannot occur under the bound above; both are counted in a
-per-layer device counter (SlotStore.flags) instead of reading out of bounds, and checked by faults()."""
+per-layer device counter (SlotStore.flags) instead of reading out of bounds, and checked by faults().
+
+The decode reads the same values of the same cells as on the full int8 store, so its logits are identical with the
+switch on and off (tests/test_kv_bounded.py). A layer of the released models keeps about 6 MB plus the cell-indexed
+tables (8 bytes per cell and head), against about 290 MB at 131k tokens with the full int8 store."""
 from __future__ import annotations
 
-import math
 import os
 
 import torch

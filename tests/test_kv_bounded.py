@@ -95,6 +95,20 @@ def _check_held(st, K, V, kbar, ncell, want):
     assert torch.equal(st.kbar[occ], at_cells(kbar, D)[occ])
 
 
+@pytest.mark.parametrize("M", [100, 4096, 25000])
+def test_topk_takes_tied_ceilings_in_index_order(M):
+    # the property the store's retention rests on: torch.topk of a head's ceilings returns the P largest under
+    # (ceiling descending, index ascending), also on the multi-block path (16 slices of >= 20000 cells)
+    g = torch.Generator(device="cuda").manual_seed(M)
+    for levels in (3, 50, 0):
+        ceil = (torch.randint(0, levels, (1, H, M), device="cuda", generator=g).float() if levels
+                else torch.rand(1, H, M, device="cuda", generator=g))
+        k = min(P, M)
+        got = ceil.topk(k, dim=-1).indices.sort(-1).values
+        want = torch.sort(-ceil, dim=-1, stable=True).indices[..., :k].sort(-1).values
+        assert torch.equal(got, want), (M, levels)
+
+
 @pytest.mark.parametrize("N", [700, 3000, 4096, 4096 + 77, 8192 + 31])
 @pytest.mark.parametrize("ties", [False, True])
 def test_prefill_holds_the_readable_cells_as_the_int8_store(N, ties):
@@ -240,12 +254,12 @@ def test_long_range_decode_through_slots_matches_full_int8_store(N, ln_f32):
     assert torch.equal(outs[1], ref)
 
 
-def _model(d_ff=512, n_layers=2, vocab=512):
+def _model(d_ff=512, n_layers=2, vocab=512, serve="sparse"):
     import bench_efficiency as be
     from experiments.scaling.model import FreeSoloLM
     torch.manual_seed(17)
     m = FreeSoloLM(vocab_size=vocab, d_model=H * D, n_layers=n_layers, n_heads=H, d_ff=d_ff, max_seq_len=8192,
-                   attn_type="fsattn", **be.serve_kwargs("sparse")).cuda().to(torch.bfloat16).eval()
+                   attn_type="fsattn", **be.serve_kwargs(serve)).cuda().to(torch.bfloat16).eval()
     for blk in m.blocks:                                 # the released checkpoints keep the norms in fp32
         blk.attn.fsattn.lr_norm.scale.data = blk.attn.fsattn.lr_norm.scale.data.float()
     return m
@@ -306,7 +320,8 @@ def test_bounded_store_refuses_history_reads_and_stays_off_where_unsupported(mon
         with pytest.raises(RuntimeError, match="bounded store"):
             read()
     gd.step()
-    # a prompt shorter than the window, the bf16 store and an unsupported switch keep the full store
+    # a prompt shorter than the window, the bf16 store, an unsupported switch and FS (dense top-k over every cell)
+    # keep the full store
     short = GraphedDecoder(m, prompt[:, :W - 1], Lmax=W + 64, device="cuda", dtype=torch.bfloat16)
     short.prefill()
     assert not short.bounded_kv
@@ -316,3 +331,7 @@ def test_bounded_store_refuses_history_reads_and_stays_off_where_unsupported(mon
         gd2.prefill()
         assert not gd2.bounded_kv
         monkeypatch.delenv(env[0])
+    monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
+    dense = GraphedDecoder(_model(serve="dense"), prompt, Lmax=2048 + 64, device="cuda", dtype=torch.bfloat16)
+    dense.prefill()
+    assert not dense.bounded_kv and dense.cache[0]._qk_buf is not None
