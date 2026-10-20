@@ -972,3 +972,214 @@ def test_small_setup_failure_falls_back_to_the_build_kernel(monkeypatch):
     for out in (got, again):
         for a, b in zip(_all_outputs(ref), _all_outputs(out)):
             assert torch.equal(a, b)
+
+
+# ---- FSB_BUILD_UNIFORM: the split-table build kernels from the module compiled with warp-uniform branches ----
+
+def _uniform_launch_counter(monkeypatch, bc):
+    # counts the launches of the FSB_BUILD_UNIFORM module's kernels (the other kernels pass through)
+    seen = []
+    launch = bc._launch
+
+    def counting(fn, *a, **k):
+        if any(fn is v for fns in bc._uniform_fns.values() for v in fns):
+            seen.append(1)
+        return launch(fn, *a, **k)
+
+    monkeypatch.setattr(bc, "_launch", counting)
+    return seen
+
+
+@pytest.mark.parametrize("T,M,Dh", [(16, 4096, 64), (16, 2048, 64), (16, 512, 64), (2, 8192, 64), (16, 300, 64),
+                                    (4, 7, 64), (12, 40, 64), (8, 1000, 32), (1, 8192, 32)])
+def test_uniform_build_matches_build_kernel(monkeypatch, T, M, Dh):
+    # FSB_BUILD_UNIFORM=1 runs the whole-forest build in the uniform module's fsb_forest_build16: every output, and
+    # every row neither build writes, is bit-identical to the build module's (both forests; random, tie-heavy,
+    # signed-zero, duplicate, zero and subnormal keys; with and without spreads; trimmed and whole tables; prefill block
+    # starts and random ones), at the released shape (16 heads x 64, 4096 and 2048 cells: chunks of heights 10 and 11
+    # with their G nodes and 512-row subtrees) and odd ones
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_GROUP", "4")
+    monkeypatch.setenv("FSB_BUILD_SMALL", "0")
+    seen = _uniform_launch_counter(monkeypatch, bc)
+    big = T * M >= 16 * 2048
+    kinds = ("randn", "ties", "negzero") if big else ("randn", "ties", "negzero", "dups", "zeros", "subnormal")
+    for kind in kinds:
+        g = torch.Generator().manual_seed(31 * M + T + Dh + len(kind))
+        K = _keys(kind, T, M, Dh, g).to(DEV)
+        ce = torch.rand(T, M, generator=g).to(DEV)
+        spread = torch.rand(T, M, generator=g).to(DEV)
+        H = 4 if T % 4 == 0 else T
+        nb = max(1, M * 32 // 128)
+        starts = {"prefill": (torch.arange(nb, device=DEV, dtype=torch.float32) * 128 / 32).floor().long(),
+                  "random": torch.randint(0, M + 1, (29,), generator=g).sort().values.to(DEV)}
+        pairs = (("zero", "q50"),) if big else (("zero", "q50"), ("rand", "none"), ("allbut1", "rand"))
+        for ename, E in starts.items():
+            for trim in (True, False):
+                mbx = min(int(E.max()), M) if trim else None
+                work = any(bc.spine_chunks(M, k, mbx)[2] for k in bc.forest_layout(M)["ks"])
+                for pair in pairs:
+                    taus = [_taus(p, ce, H, g).float().to(DEV) for p in pair]
+                    for sp in ((None, spread) if kind == "randn" else (spread,)):
+                        outs = {}
+                        for flag in ("0", "1"):
+                            monkeypatch.setenv("FSB_BUILD_UNIFORM", flag)
+                            restore = _sentinel_empty(monkeypatch)
+                            try:
+                                n0 = len(seen)
+                                outs[flag] = bc.forests_cuda(K, ce, sp, taus, E, mb_max=mbx)
+                            finally:
+                                restore()
+                            assert outs[flag] is not None
+                            assert (len(seen) > n0) == (flag == "1" and work), (kind, ename, trim, pair)
+                        for a, b in zip(_all_outputs(outs["0"]), _all_outputs(outs["1"])):
+                            assert a.shape == b.shape and torch.equal(a, b), (kind, ename, trim, pair, sp is None)
+
+
+def test_uniform_build_against_reference_builder(monkeypatch):
+    # the uniform kernel at the released shape against build_forest itself (not only the build module's kernel), both
+    # forests, every chunk of the whole build
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_UNIFORM", "1")
+    seen = _uniform_launch_counter(monkeypatch, bc)
+    T, M, Dh, H = 16, 2048, 64, 16
+    for kind in ("randn", "ties"):
+        g = torch.Generator().manual_seed(83 + len(kind))
+        K = _keys(kind, T, M, Dh, g).to(DEV)
+        ce = torch.rand(T, M, generator=g).to(DEV)
+        E = (torch.arange(M * 32 // 128, device=DEV, dtype=torch.float32) * 128 / 32).floor().long()
+        taus = [_taus("zero", ce, H, g).float().to(DEV), _taus("q50", ce, H, g).float().to(DEV)]
+        _exact(K, ce, None, taus, E, H, bc.forests_cuda(K, ce, None, taus, E))
+    assert seen
+
+
+def test_uniform_build_graph_capture(monkeypatch):
+    # a captured FSB_BUILD_UNIFORM build replays the uniform kernel on new inputs with the build module's bits
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_UNIFORM", "1")
+    seen = _uniform_launch_counter(monkeypatch, bc)
+    T, M, Dh, H = 16, 2048, 64, 16
+    g = torch.Generator().manual_seed(43)
+    K = torch.randn(T, M, Dh, generator=g).to(DEV)
+    ce = torch.rand(T, M, generator=g).to(DEV)
+    taus = [torch.zeros(H, device=DEV), torch.full((H,), 0.5, device=DEV)]
+    E = (torch.arange(M // 4, device=DEV) * 4).long()
+    mbx = int(E.max())
+    bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    n0 = len(seen)
+    with torch.cuda.graph(graph):
+        out = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    assert len(seen) > n0                                  # the capture holds the uniform kernel
+    K.copy_(torch.randn(T, M, Dh, generator=g).to(DEV))
+    ce.copy_(torch.rand(T, M, generator=g).to(DEV))
+    graph.replay()
+    torch.cuda.synchronize()
+    monkeypatch.setenv("FSB_BUILD_UNIFORM", "0")
+    ref = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    for (F, mb), (G, gb) in zip(ref, out):
+        assert _same(mb, gb) and _same(F["adm"], G["adm"]) and _same(F["m_tot"], G["m_tot"])
+        for k in F["ks"]:
+            ja, jsh, nj = bc.spine_chunks(M, k, mbx)
+            for j in range(ja, ja + (nj << jsh), 1 << jsh):
+                assert all(torch.equal(a, b) for a, b in zip(_chunk_rows(G, k, j), _chunk_rows(F, k, j))), (k, j)
+
+
+@pytest.mark.parametrize("tau_mode,spread", [("zero", False), ("quantile", True)])
+def test_uniform_decode_ingest_matches_build_kernel(monkeypatch, tau_mode, spread):
+    # the decode ingest's builds (fsb_forest_build_lean16 over the ingest's dirty chunks: the whole forest at the first
+    # ingest, chunks of heights 10 and 11 with their G nodes and subtrees once enough cells are admitted, the prepared
+    # task path for short selections) leave bit-identical forests and spines with FSB_BUILD_UNIFORM=1
+    from src.fsattn.fsb_tree import ForestCache
+    bc = _bc()
+    seen = _uniform_launch_counter(monkeypatch, bc)
+    monkeypatch.setenv("FSB_FAST_CACHE", "1")
+    monkeypatch.setenv("FSB_BUILD_CUDA", "1")
+    torch.manual_seed(131)
+    rows, cells, dim = 4, 2600, 64
+    keys = torch.randn(1, rows, cells, dim, device=DEV)
+    ceilings = torch.rand(1, rows, cells, device=DEV)
+    if tau_mode == "zero":
+        tau = torch.zeros(rows, device=DEV)
+    else:
+        tau = torch.stack([ceilings[0, h].quantile(q) for h, q in enumerate((0.05, 0.1, 0.15, 0.2))])
+    spread_all = torch.rand(1, rows, cells, device=DEV) if spread else None
+    steps = (8, 9, 40, 41, 300, 513, 1030, 1031, 1100, 2047, 2049, 2100, 2101, 2600)
+    runs = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv("FSB_BUILD_UNIFORM", flag)
+        cache = ForestCache(rows, dim, DEV, lean=True)
+        n0 = len(seen)
+        snap = []
+        for visible in steps:
+            cache.ingest(keys, ceilings, visible, tau, spread_all=spread_all)
+            F = cache.F
+            sp = getattr(cache, "SP", None) if getattr(cache, "_sp_built", False) else None
+            snap.append([F["node_mu"].clone(), F["node_aux"].clone(), F["leaf"].clone(), F["jbase"].clone(),
+                         cache.m_tot.clone(), cache.adm.clone()]
+                        + ([sp["node"].clone(), sp["root"].clone(), sp["height"].clone()] if sp is not None else []))
+        runs[flag] = snap
+        assert (len(seen) > n0) == (flag == "1")
+    assert int(runs["1"][-1][4].max()) >= 2048              # heights 10 and 11 were built
+    for step, (ref, got) in enumerate(zip(runs["0"], runs["1"])):
+        assert len(ref) == len(got), steps[step]
+        for i, (a, b) in enumerate(zip(ref, got)):
+            assert a.shape == b.shape and torch.equal(_bits(a), _bits(b)), (steps[step], i)
+
+
+def test_uniform_setup_failure_falls_back_to_the_build_module(monkeypatch):
+    # a uniform module that cannot be compiled or loaded turns FSB_BUILD_UNIFORM off for that variant, with one warning;
+    # its builds run the build module's kernels, exactly
+    from src.fsattn import fsb_beam_cuda as fb
+    bc = _bc()
+    monkeypatch.setattr(bc, "_uniform_failed", {})
+    T, M = 16, 512
+    K, ce, taus, E, H = _inputs(T, M, 64, seed=91, H=16)
+    monkeypatch.setenv("FSB_BUILD_UNIFORM", "0")
+    restore = _sentinel_empty(monkeypatch)
+    try:
+        ref = bc.forests_cuda(K, ce, None, taus, E)
+    finally:
+        restore()
+    monkeypatch.setenv("FSB_BUILD_UNIFORM", "1")
+    load = fb.load_function
+    tries = []
+
+    def broken(dev, src, name):
+        if "#define BUILD_UNIFORM 1" in src:
+            tries.append(name)
+            raise RuntimeError("NVRTC compile failed: (test)")
+        return load(dev, src, name)
+
+    with monkeypatch.context() as m:
+        m.setattr(bc, "_uniform_fns", {})
+        m.setattr(fb, "load_function", broken)
+        restore = _sentinel_empty(monkeypatch)
+        try:
+            with pytest.warns(UserWarning):
+                got = bc.forests_cuda(K, ce, None, taus, E)
+            again = bc.forests_cuda(K, ce, None, taus, E)
+        finally:
+            restore()
+        assert len(tries) == 1
+    for out in (got, again):
+        for a, b in zip(_all_outputs(ref), _all_outputs(out)):
+            assert torch.equal(a, b)
+
+
+def test_uniform_module_holds_only_the_split_table_build_kernels():
+    # the FSB_BUILD_UNIFORM module compiles the two kernels it serves (fsb_forest_build16, fsb_forest_build_lean16) and
+    # not the build module's other kernels; the build module's source does not select the uniform task body
+    bc = _bc()
+    src = bc._source(64, uniform=True)
+    assert "#define BUILD_UNIFORM 1" in src and "#define BUILD_UNIFORM 1" not in bc._source(64)
+    from src.fsattn import fsb_beam_cuda as fb
+    dev = torch.device(DEV, torch.cuda.current_device())
+    for name in ("fsb_forest_build16", "fsb_forest_build_lean16"):
+        assert fb.load_function(dev, src, name)
+    for name in ("fsb_forest_build", "fsb_forest_build_lean", "fsb_forest_prologue", "fsb_spine_lean16",
+                 "fsb_prep_lean_tasks", "fsb_spine_lean", "fsb_prep_lean_dirty", "fsb_prep_lean_tall", "fsb_append_many",
+                 "fsb_prep_lean_dirty_many", "fsb_forest_build_lean16_many", "fsb_spine_lean16_many"):
+        with pytest.raises(RuntimeError):
+            fb.load_function(dev, src, name)

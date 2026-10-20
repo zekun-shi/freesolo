@@ -144,6 +144,24 @@ __device__ __forceinline__ void unit_nodes(float (&v)[NN][PER], const int lane) 
     }
 }
 
+// FSB_BUILD_UNIFORM=1 (fsb_build_cuda.uniform_on) compiles the split-table build kernels with BUILD_UNIFORM 1: every
+// value that a branch around shuffle code tests is one ptxas can see is warp-uniform. The task fields, the warp index,
+// the fold flag and the admitted counts are broadcast from lane 0 (UNI), and a forest's tables are picked by a select
+// on the uniform forest index (FSEL) instead of indexing the Args pointer arrays. On a value it cannot prove uniform,
+// ptxas guards each group of shuffles with a divergence branch to an out-of-line second copy of the code that runs
+// every shuffle through a WARPSYNC helper call, and the register allocation that serves both copies spills. The
+// arithmetic, its operands and its order are unchanged, so every output keeps its bits.
+#ifndef BUILD_UNIFORM
+#define BUILD_UNIFORM 0
+#endif
+#if BUILD_UNIFORM
+#define UNI(v) __shfl_sync(FULL, (v), 0)
+#define FSEL(a, f) ((f) ? (a)[1] : (a)[0])
+#else
+#define UNI(v) (v)
+#define FSEL(a, f) (a)[f]
+#endif
+
 // kernel arguments of fsb_forest_build
 struct Args {
     const int* tasks; const int* lay;
@@ -185,6 +203,8 @@ __device__ __forceinline__ void set_flag(int* fl) {
 }
 // >>> SECTION: _PROLOGUE <<<
 
+// (the uniform module, BUILD_UNIFORM 1, holds only the split-table build kernels fsb_forest_build16 and _lean16)
+#if !BUILD_UNIFORM
 // ---- K0: admission tables of both forests, one CTA (1024 threads) per (forest, head) ----
 // adm[t] = admitted cells ascending then -1 (argsort(where(admit, id, id + M)) masked), m_tot[t] = #admitted,
 // mb[t, b] = searchsorted(adm with -1 -> M, E[b]) (left): #admitted < E[b] for E[b] <= M, M above.
@@ -249,6 +269,7 @@ fsb_forest_prologue(const float* __restrict__ CE, const float* __restrict__ TAU0
         mb[b] = r;
     }
 }
+#endif
 // >>> SECTION: _CPHASE <<<
 
 // ---- C phase: nodes of 64..512 rows of one 512-slot batch, CTA-wide, rows in shared memory ----
@@ -1150,7 +1171,7 @@ __device__ __forceinline__ float g_cross(const GS& S, const int d) {
 template <bool LEAN = false>
 __device__ void g_node(const Args& A, const GS& S, const int f, const int t, const int k, const int j, const int l,
                        const int n, const i64* SRC64, const int* SRC, int* DST, const bool fold, const bool has_sp) {
-    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, wid = UNI(tid >> 5);
     const int lvn = k - l, V = 1 << lvn, q = lvn - 4, nb = V >> 9;
     const float* kt = A.kb + (i64)t * A.M * DH;
     const float* cet = A.ce + (i64)t * A.M;
@@ -1159,7 +1180,7 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
     __syncthreads();
     float zl[PER];
     {
-        const int c0 = (int)A.adm[f][(i64)t * A.M + ((i64)j << k)];
+        const int c0 = (int)FSEL(A.adm, f)[(i64)t * A.M + ((i64)j << k)];
 #pragma unroll
         for (int i = 0; i < PER; i++) zl[i] = f_sz(sgn(kt[(i64)c0 * DH + lane + 32 * i]));
     }
@@ -1253,10 +1274,10 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
             // record scalars (split table: radius carries the bf16 mean-rounding slack; the fp32 mean built the node)
             const int jo = LEAN ? 0 : j;
             const int nodes = (2 << k) - 1, rb = A.lay[k] + jo * nodes, h = (1 << l) - 1 + n;
-            float* p = A.node_mu[f] != nullptr ? A.node_aux[f] + ((i64)t * A.Ntot + rb + h) * NA
-                                               : A.node[f] + ((i64)t * A.Ntot + rb + h) * NC + DH;
+            float* p = FSEL(A.node_mu, f) != nullptr ? FSEL(A.node_aux, f) + ((i64)t * A.Ntot + rb + h) * NA
+                                                     : FSEL(A.node, f) + ((i64)t * A.Ntot + rb + h) * NC + DH;
             float eps = 0.0f;
-            if (A.node_mu[f] != nullptr) {
+            if (FSEL(A.node_mu, f) != nullptr) {
                 float s2 = 0.0f;
 #pragma unroll 8
                 for (int dd = 0; dd < DH; dd++) {
@@ -1265,17 +1286,17 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
                 }
                 eps = f_sqrt_ftz(s2);
             }
-            p[0] = A.node_mu[f] != nullptr ? f_add(rad, eps) : rad; p[1] = f_max(am0, 0.0f); p[2] = (float)pm0; p[3] = (float)V;
+            p[0] = FSEL(A.node_mu, f) != nullptr ? f_add(rad, eps) : rad; p[1] = f_max(am0, 0.0f); p[2] = (float)pm0; p[3] = (float)V;
             p[4] = (float)(rb + 2 * h + 1); p[5] = (float)(rb + 2 * h + 2); p[6] = 1.0f;
             p[7] = (float)(A.lay[16 + k] + jo * (1 << k) + n * V); p[8] = (float)V;
         }
         if (tid < DH) {
             const int jo = LEAN ? 0 : j;
             const int nodes = (2 << k) - 1, rb = A.lay[k] + jo * nodes, h = (1 << l) - 1 + n;
-            if (A.node_mu[f] != nullptr)
-                A.node_mu[f][((i64)t * A.Ntot + rb + h) * DH + tid] = f2bf(S.mu[tid]);
+            if (FSEL(A.node_mu, f) != nullptr)
+                FSEL(A.node_mu, f)[((i64)t * A.Ntot + rb + h) * DH + tid] = f2bf(S.mu[tid]);
             else
-                A.node[f][((i64)t * A.Ntot + rb + h) * NC + tid] = S.mu[tid];
+                FSEL(A.node, f)[((i64)t * A.Ntot + rb + h) * NC + tid] = S.mu[tid];
         }
         __syncthreads();
     }
@@ -1396,10 +1417,10 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
     if (n <= 0) return;
     const int lane = threadIdx.x & 31;
     const int nodes = (2 << k) - 1, base = A.lay[k], lbase = A.lay[16 + k];
-    const bool m16 = A.node_mu[f] != nullptr;
-    float* nt = m16 ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
-    unsigned short* ntm = m16 ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
-    float* nta = m16 ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
+    const bool m16 = FSEL(A.node_mu, f) != nullptr;
+    float* nt = m16 ? nullptr : FSEL(A.node, f) + (i64)t * A.Ntot * NC;
+    unsigned short* ntm = m16 ? FSEL(A.node_mu, f) + (i64)t * A.Ntot * DH : nullptr;
+    float* nta = m16 ? FSEL(A.node_aux, f) + (i64)t * A.Ntot * NA : nullptr;
     float z[PER];
 #pragma unroll
     for (int i = 0; i < PER; i++) z[i] = f_sz(sgn(A.kb[(i64)t * A.M * DH + lane + 32 * i]));
@@ -1446,7 +1467,7 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
             }
         }
     }
-    i64* lt = A.leaf[f] + (i64)t * A.Ltot + lbase;
+    i64* lt = FSEL(A.leaf, f) + (i64)t * A.Ltot + lbase;
     for (int e2 = 32 * wid + lane; e2 < n << k; e2 += 32 * nw)
         lt[((ja + ((e2 >> k) << jsh)) << k) + (e2 & ((1 << k) - 1))] = -1;
 }
@@ -1497,25 +1518,25 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
                                          const int nsub, const int jsh, const int np, const bool fold) {
     extern __shared__ float smem[];
     const SM S = carve(smem);
-    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, wid = UNI(tid >> 5);
     const int M = A.M, has_sp = A.has_sp;
     const int jo = LEAN ? 0 : j0;
     for (int p = 0; p < np; p++) {
-        const int nf_p = batch_full((int)A.mt[f][t0 + p], k, j0, nsub, jsh);
+        const int nf_p = batch_full((int)FSEL(A.mt, f)[t0 + p], k, j0, nsub, jsh);
         empty_chunks(A, f, t0 + p, k, jo + (nf_p << jsh), nsub - nf_p, jsh);
     }
     const int pb = np > 1 ? 32 - __clz(np - 1) : 0;       // the head of warp wid: wid >> (4 - pb)
     const int t = t0 + (wid >> (4 - pb));
     if (t >= t0 + np) return;
-    const int mt = (int)A.mt[f][t];
+    const int mt = UNI((int)FSEL(A.mt, f)[t]);
     const int nfull = batch_full(mt, k, j0, nsub, jsh);
     const int gs0 = 32 * (wid & ((16 >> pb) - 1));       // the warp's first slot in its head's batch
     if (gs0 >= (nfull << k)) return;
     Rec R;
-    R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
-    R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
-    R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
-    R.leaf = A.leaf[f] + (i64)t * A.Ltot;
+    R.node = FSEL(A.node_mu, f) != nullptr ? nullptr : FSEL(A.node, f) + (i64)t * A.Ntot * NC;
+    R.node_mu = FSEL(A.node_mu, f) != nullptr ? FSEL(A.node_mu, f) + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = FSEL(A.node_aux, f) != nullptr ? FSEL(A.node_aux, f) + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = FSEL(A.leaf, f) + (i64)t * A.Ltot;
     R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo; R.jsh = jsh;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = min(k, 5);
@@ -1525,7 +1546,7 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
     u64 zb = 0;
     const int s = gs0 + lane;
     const bool ok = s < (nfull << k);
-    int cell = ok ? (int)A.adm[f][(i64)t * M + slot_pos(j0, k, jsh, s)] : -1;
+    int cell = ok ? (int)FSEL(A.adm, f)[(i64)t * M + slot_pos(j0, k, jsh, s)] : -1;
     float ce = ok ? A.ce[(i64)t * M + cell] : 0.0f;
     float sp = (ok && has_sp) ? A.spr[(i64)t * M + cell] : 0.0f;
     const float* kt = A.kb + (i64)t * M * DH + lane;
@@ -1580,24 +1601,24 @@ __device__ __forceinline__ void task_cbatch(const Args& A, const int f, const in
                                          const int jsh, const bool fold) {
     extern __shared__ float smem[];
     const SM S = carve(smem);
-    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, wid = UNI(tid >> 5);
     const int M = A.M, has_sp = A.has_sp;
-    const int mt = (int)A.mt[f][t];
+    const int mt = UNI((int)FSEL(A.mt, f)[t]);
     const int nfull = batch_full(mt, k, j0, nsub, jsh);
     const int jo = LEAN ? 0 : j0;
     empty_chunks(A, f, t, k, jo + (nfull << jsh), nsub - nfull, jsh);
     if (nfull == 0) return;
     Rec R;
-    R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
-    R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
-    R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
-    R.leaf = A.leaf[f] + (i64)t * A.Ltot;
+    R.node = FSEL(A.node_mu, f) != nullptr ? nullptr : FSEL(A.node, f) + (i64)t * A.Ntot * NC;
+    R.node_mu = FSEL(A.node_mu, f) != nullptr ? FSEL(A.node_mu, f) + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = FSEL(A.node_aux, f) != nullptr ? FSEL(A.node_aux, f) + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = FSEL(A.leaf, f) + (i64)t * A.Ltot;
     R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo; R.jsh = jsh;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = 5;
     const int nrow = nfull << k;
     {
-        const int c = tid < nrow ? (int)A.adm[f][(i64)t * M + slot_pos(j0, k, jsh, tid)] : -1;
+        const int c = tid < nrow ? (int)FSEL(A.adm, f)[(i64)t * M + slot_pos(j0, k, jsh, tid)] : -1;
         S.cell[tid] = c;
         S.ce[tid] = c >= 0 ? A.ce[(i64)t * M + c] : 0.0f;
         S.sp[tid] = (c >= 0 && has_sp) ? A.spr[(i64)t * M + c] : 0.0f;
@@ -1622,7 +1643,7 @@ __device__ __forceinline__ void task_gnode(const Args& A, const int f, const int
                                         const int n0, const bool fold, const int flag, const int dep) {
     extern __shared__ float smem[];
     const int M = A.M;
-    const int mt = (int)A.mt[f][t];
+    const int mt = UNI((int)FSEL(A.mt, f)[t]);
     const bool full = ((j0 + 1) << k) <= mt;
     if (!full) {
         if (l0 == 0) {
@@ -1635,7 +1656,7 @@ __device__ __forceinline__ void task_gnode(const Args& A, const int f, const int
     int* scr = A.scr + (((i64)f * A.nbig + (k - 10)) * A.T + t) * M + ((i64)j0 << k);
     const GS G = gcarve(smem);
     const int V = 1 << (k - l0);
-    g_node<LEAN>(A, G, f, t, k, j0, l0, n0, l0 == 0 ? A.adm[f] + (i64)t * M + ((i64)j0 << k) : nullptr, scr + n0 * V,
+    g_node<LEAN>(A, G, f, t, k, j0, l0, n0, l0 == 0 ? FSEL(A.adm, f) + (i64)t * M + ((i64)j0 << k) : nullptr, scr + n0 * V,
                  scr + n0 * V, fold, A.has_sp != 0);
     set_flag(A.ctl + flag);
 }
@@ -1646,17 +1667,17 @@ __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t
                                       const bool fold, const int dep) {
     extern __shared__ float smem[];
     const SM S = carve(smem);
-    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, wid = UNI(tid >> 5);
     const int M = A.M, has_sp = A.has_sp;
-    const int mt = (int)A.mt[f][t];
+    const int mt = UNI((int)FSEL(A.mt, f)[t]);
     if (((j0 + 1) << k) > mt) return;
     wait_flag(A.ctl + dep);
     const int* scr = A.scr + (((i64)f * A.nbig + (k - 10)) * A.T + t) * M + ((i64)j0 << k) + n0 * 512;
     Rec R;
-    R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
-    R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
-    R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
-    R.leaf = A.leaf[f] + (i64)t * A.Ltot;
+    R.node = FSEL(A.node_mu, f) != nullptr ? nullptr : FSEL(A.node, f) + (i64)t * A.Ntot * NC;
+    R.node_mu = FSEL(A.node_mu, f) != nullptr ? FSEL(A.node_mu, f) + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = FSEL(A.node_aux, f) != nullptr ? FSEL(A.node_aux, f) + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = FSEL(A.leaf, f) + (i64)t * A.Ltot;
     R.k = k; R.ks = 9; R.l0 = k - 9; R.n0 = n0; R.jb = LEAN ? 0 : j0; R.jsh = 0;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = 1; R.zsh = 5;
@@ -1667,7 +1688,7 @@ __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t
         S.sp[tid] = has_sp ? A.spr[(i64)t * M + c] : 0.0f;
     }
     if (wid == 0) {
-        const int c0 = (int)A.adm[f][(i64)t * M + ((i64)j0 << k)];
+        const int c0 = (int)FSEL(A.adm, f)[(i64)t * M + ((i64)j0 << k)];
         const float* zr = A.kb + ((i64)t * M + c0) * DH;
         const unsigned lo = __ballot_sync(FULL, sgn(zr[lane]));
         const unsigned hi = DH == 64 ? __ballot_sync(FULL, sgn(zr[lane + (DH == 64 ? 32 : 0)])) : 0u;
@@ -1702,8 +1723,8 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
     A.node_mu[0] = MU0; A.node_mu[1] = MU1; A.node_aux[0] = AX0; A.node_aux[1] = AX1;
     A.M = M; A.Ntot = Ntot; A.Ltot = Ltot; A.has_sp = has_sp; A.scr = SCR; A.ctl = CTL; A.nbig = nbig; A.T = T;
     const int* tk = TASKS + 10 * blockIdx.x;
-    const int type = tk[0], f = tk[1], t = tk[2], k = tk[3], j0 = tk[4], nsub = tk[5], l0 = tk[6], n0 = tk[7];
-    const int flag = tk[8], dep = tk[9];
+    const int type = UNI(tk[0]), f = UNI(tk[1]), t = UNI(tk[2]), k = UNI(tk[3]), j0 = UNI(tk[4]), nsub = UNI(tk[5]);
+    const int l0 = UNI(tk[6]), n0 = UNI(tk[7]), flag = UNI(tk[8]), dep = UNI(tk[9]);
     if constexpr (LEAN) {
         A.adm[0] += (i64)t * (i64)(LAY[34] - M);
         if (ADM1 != nullptr) A.adm[1] += (i64)t * (i64)(LAY[35] - M);
@@ -1711,7 +1732,7 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
         A.ce += (i64)t * (i64)(LAY[37] - M);
         if (has_sp) A.spr += (i64)t * (i64)(LAY[38] - M);
     }
-    const bool fold = (LAY[32] >> k) & 1;
+    const bool fold = UNI((LAY[32] >> k) & 1);
     DBG_MARK(0);
     if (type == 0) {
         if (k <= 5) task_wbatch<LEAN>(A, f, t, k, j0, nsub, l0, max(n0, 1), fold);
@@ -1723,6 +1744,182 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
     }
 }
 
+#if BUILD_UNIFORM
+// ---- the uniform module's task body (BUILD_UNIFORM) ----
+// build_task inlines the C levels into task_cbatch and task_sub, and the per-warp levels into task_wbatch, task_cbatch
+// and task_sub; ptxas merges and register-allocates those copies differently (one of them spilling inside the
+// half-tile levels). build_task_u reaches c_phase and w_phase from one call site each, so the level code exists once.
+// Its per-kind preambles are task_wbatch's, task_cbatch's and task_sub's, load for load and store for store; G nodes
+// run task_gnode.
+// the record target of task kind (k, ks, l0, n0, jb, jsh, nfull, zsh) on head t of forest f
+__device__ __forceinline__ Rec task_rec(const Args& A, const int f, const int t, const int k, const int ks, const int l0,
+                                        const int n0, const int jb, const int jsh, const int nfull, const int zsh) {
+    Rec R;
+    R.node = FSEL(A.node_mu, f) != nullptr ? nullptr : FSEL(A.node, f) + (i64)t * A.Ntot * NC;
+    R.node_mu = FSEL(A.node_mu, f) != nullptr ? FSEL(A.node_mu, f) + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = FSEL(A.node_aux, f) != nullptr ? FSEL(A.node_aux, f) + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = FSEL(A.leaf, f) + (i64)t * A.Ltot;
+    R.k = k; R.ks = ks; R.l0 = l0; R.n0 = n0; R.jb = jb; R.jsh = jsh;
+    R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
+    R.nfull = nfull; R.zsh = zsh;
+    return R;
+}
+
+template <bool LEAN = false>
+__device__ __forceinline__ void build_task_u(const int* __restrict__ TASKS, const int* __restrict__ LAY,
+                 const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
+                 const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
+                 const i64* __restrict__ MT0, const i64* __restrict__ MT1,
+                 float* __restrict__ NODE0, float* __restrict__ NODE1,
+                 unsigned short* __restrict__ MU0, unsigned short* __restrict__ MU1,
+                 float* __restrict__ AX0, float* __restrict__ AX1,
+                 i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
+                 int* __restrict__ SCR, int* __restrict__ CTL, const int M, const int Ntot, const int Ltot,
+                 const int has_sp, const int nbig, const int T) {
+    Args A;
+    A.tasks = TASKS; A.lay = LAY; A.kb = KB; A.ce = CE; A.spr = SPR;
+    A.adm[0] = ADM0; A.adm[1] = ADM1; A.mt[0] = MT0; A.mt[1] = MT1;
+    A.node[0] = NODE0; A.node[1] = NODE1; A.leaf[0] = LEAF0; A.leaf[1] = LEAF1;
+    A.node_mu[0] = MU0; A.node_mu[1] = MU1; A.node_aux[0] = AX0; A.node_aux[1] = AX1;
+    A.M = M; A.Ntot = Ntot; A.Ltot = Ltot; A.has_sp = has_sp; A.scr = SCR; A.ctl = CTL; A.nbig = nbig; A.T = T;
+    const int* tk = TASKS + 10 * blockIdx.x;
+    const int type = UNI(tk[0]), f = UNI(tk[1]), t = UNI(tk[2]), k = UNI(tk[3]), j0 = UNI(tk[4]), nsub = UNI(tk[5]);
+    const int l0 = UNI(tk[6]), n0 = UNI(tk[7]), flag = UNI(tk[8]), dep = UNI(tk[9]);
+    if constexpr (LEAN) {
+        A.adm[0] += (i64)t * (i64)(LAY[34] - M);
+        if (ADM1 != nullptr) A.adm[1] += (i64)t * (i64)(LAY[35] - M);
+        A.kb += (i64)t * (i64)(LAY[36] - M) * DH;
+        A.ce += (i64)t * (i64)(LAY[37] - M);
+        if (has_sp) A.spr += (i64)t * (i64)(LAY[38] - M);
+    }
+    const bool fold = UNI((LAY[32] >> k) & 1), hsp = has_sp != 0;
+    DBG_MARK(0);
+    if (type == 1) {
+        task_gnode<LEAN>(A, f, t, k, j0, l0, n0, fold, flag, dep);
+        return;
+    }
+    extern __shared__ float smem[];
+    const SM S = carve(smem);
+    const int tid = threadIdx.x, lane = tid & 31, wid = UNI(tid >> 5);
+    Rec R;
+    float x[32][PER];
+    int cell, gs0, lv0;
+    float ce, sp;
+    u64 zb = 0;
+    if (type == 0 && k <= 5) {
+        // task_wbatch: nsub chunks j0 + (i << l0) of height k <= 5, one warp per 32 slots; np heads per block
+        const int np = max(n0, 1), jsh = l0, jo = LEAN ? 0 : j0;
+        for (int p = 0; p < np; p++) {
+            const int nf_p = batch_full((int)FSEL(A.mt, f)[t + p], k, j0, nsub, jsh);
+            empty_chunks(A, f, t + p, k, jo + (nf_p << jsh), nsub - nf_p, jsh);
+        }
+        const int pb = np > 1 ? 32 - __clz(np - 1) : 0;    // the head of warp wid: wid >> (4 - pb)
+        const int tw = t + (wid >> (4 - pb));
+        if (tw >= t + np) return;
+        const int mt = UNI((int)FSEL(A.mt, f)[tw]);
+        const int nfull = batch_full(mt, k, j0, nsub, jsh);
+        gs0 = 32 * (wid & ((16 >> pb) - 1));                // the warp's first slot in its head's batch
+        if (gs0 >= (nfull << k)) return;
+        R = task_rec(A, f, tw, k, k, 0, 0, jo, jsh, nfull, min(k, 5));
+        float* Xw = S.Xs + wid * 32 * XS;
+        const int s = gs0 + lane;
+        const bool ok = s < (nfull << k);
+        cell = ok ? (int)FSEL(A.adm, f)[(i64)tw * M + slot_pos(j0, k, jsh, s)] : -1;
+        ce = ok ? A.ce[(i64)tw * M + cell] : 0.0f;
+        sp = (ok && has_sp) ? A.spr[(i64)tw * M + cell] : 0.0f;
+        const float* kl = A.kb + (i64)tw * M * DH + lane;
+#pragma unroll
+        for (int r = 0; r < 32; r++) {
+            const float* p = kl + (i64)max(__shfl_sync(FULL, cell, r), 0) * DH;
+#pragma unroll
+            for (int i = 0; i < PER; i++) x[r][i] = __ldg(p + 32 * i);
+        }
+        unsigned zc[PER];                                    // pad sign of the current chunk (its first row), per dim
+#pragma unroll
+        for (int r = 0; r < 32; r++)
+#pragma unroll
+            for (int i = 0; i < PER; i++) {
+                Xw[r * XS + lane + 32 * i] = x[r][i];
+                if ((r & ((1 << k) - 1)) == 0) zc[i] = sgn(x[r][i]);
+                zb |= (u64)zc[i] << (r * PER + i);
+            }
+        __syncwarp();
+        lv0 = k;
+    } else {
+        // task_cbatch (type 0: nsub chunks of height 6 <= k <= 9) and task_sub (type 2: the 512-row subtree n0 at
+        // level k - 9 of chunk j0, height k >= 10): the slots and their rows, the C levels from 2^lc rows, then each
+        // warp's 32 slots (zb: the pad signs of their chunk's first row, S.zb[gs0 >> zshift])
+        const float* kt = A.kb + (i64)t * M * DH;
+        const int mt = UNI((int)FSEL(A.mt, f)[t]);
+        int nrow, lc, zshift;
+        if (type == 0) {
+            const int jsh = l0, jo = LEAN ? 0 : j0;
+            const int nfull = batch_full(mt, k, j0, nsub, jsh);
+            empty_chunks(A, f, t, k, jo + (nfull << jsh), nsub - nfull, jsh);
+            if (nfull == 0) return;
+            R = task_rec(A, f, t, k, k, 0, 0, jo, jsh, nfull, 5);
+            nrow = nfull << k; lc = k; zshift = k;
+            const int c = tid < nrow ? (int)FSEL(A.adm, f)[(i64)t * M + slot_pos(j0, k, jsh, tid)] : -1;
+            S.cell[tid] = c;
+            S.ce[tid] = c >= 0 ? A.ce[(i64)t * M + c] : 0.0f;
+            S.sp[tid] = (c >= 0 && has_sp) ? A.spr[(i64)t * M + c] : 0.0f;
+            __syncthreads();
+            load_rows(S, kt, tid);
+            __syncthreads();
+            DBG_MARK(2);
+            if (wid < nsub) zb_of_row(S, wid, wid << k, lane);
+            __syncthreads();
+        } else {
+            if (((j0 + 1) << k) > mt) return;
+            wait_flag(A.ctl + dep);
+            const int* scr = A.scr + (((i64)f * A.nbig + (k - 10)) * A.T + t) * M + ((i64)j0 << k) + n0 * 512;
+            R = task_rec(A, f, t, k, 9, k - 9, n0, LEAN ? 0 : j0, 0, 1, 5);
+            nrow = 512; lc = 9; zshift = 10;
+            {
+                const int c = __ldcg(scr + tid);
+                S.cell[tid] = c;
+                S.ce[tid] = A.ce[(i64)t * M + c];
+                S.sp[tid] = has_sp ? A.spr[(i64)t * M + c] : 0.0f;
+            }
+            if (wid == 0) {
+                const int c0 = (int)FSEL(A.adm, f)[(i64)t * M + ((i64)j0 << k)];
+                const float* zr = A.kb + ((i64)t * M + c0) * DH;
+                const unsigned lo = __ballot_sync(FULL, sgn(zr[lane]));
+                const unsigned hi = DH == 64 ? __ballot_sync(FULL, sgn(zr[lane + (DH == 64 ? 32 : 0)])) : 0u;
+                if (lane == 0) S.zb[0] = (u64)lo | ((u64)hi << 32);
+            }
+            __syncthreads();
+            load_rows(S, kt, tid);
+            __syncthreads();
+        }
+#pragma unroll
+        for (int r = 0; r < 32; r++)
+#pragma unroll
+            for (int i = 0; i < PER; i++) x[r][i] = S.Xs[(32 * wid + r) * XS + lane + 32 * i];
+        c_phase(lc, x, S, R, kt, tid, lane, wid, fold, hsp);
+        gs0 = 32 * wid;
+        if (gs0 >= nrow) return;
+        cell = S.cell[gs0 + lane];
+        ce = S.ce[gs0 + lane]; sp = S.sp[gs0 + lane];
+#pragma unroll
+        for (int i = 0; i < PER; i++) {
+            const u64 bit = (S.zb[gs0 >> zshift] >> (lane + 32 * i)) & 1ull;
+#pragma unroll
+            for (int r = 0; r < 32; r++) zb |= bit << (r * PER + i);
+        }
+        lv0 = 5;
+    }
+    DBG_MARK(1);
+    int org = lane;                                         // S.cell's warp slice is free now: the org list
+    w_phase(lv0, x, cell, ce, sp, org, zb, S.Xs + wid * 32 * XS, S.pw + wid * 32, S.cell + 32 * wid, R, lane, gs0, fold,
+            hsp);
+}
+#define BUILD_TASK build_task_u
+#else
+#define BUILD_TASK build_task
+#endif
+
+#if !BUILD_UNIFORM
 extern "C" __global__ void __launch_bounds__(256)
 fsb_prep_lean_tasks(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
                     i64* __restrict__ JB0, const i64* __restrict__ MT0,
@@ -1993,6 +2190,7 @@ fsb_forest_build(const int* __restrict__ TASKS, const int* __restrict__ LAY,
                       LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
     DBG_END();
 }
+#endif
 
 // fsb_forest_build with the split destination table instead of the packed rows: the same task records and input
 // strides, with means landing in an unsigned-short bf16 slab and aggregates in a 9-wide fp32 slab; every store keying
@@ -2009,11 +2207,12 @@ fsb_forest_build16(const int* __restrict__ TASKS, const int* __restrict__ LAY,
                    const int has_sp, const int nbig, const int T) {
     extern __shared__ float smem[];
     DBG_START();
-    build_task<false>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, nullptr, nullptr, MU0, MU1, AX0, AX1,
+    BUILD_TASK<false>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, nullptr, nullptr, MU0, MU1, AX0, AX1,
                       LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
     DBG_END();
 }
 
+#if !BUILD_UNIFORM
 extern "C" __global__ void __launch_bounds__(512, 1)
 fsb_forest_build_lean(const int* __restrict__ TASKS, const int* __restrict__ LAY,
                       const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
@@ -2039,6 +2238,7 @@ fsb_forest_build_lean(const int* __restrict__ TASKS, const int* __restrict__ LAY
     build_task<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, nullptr, nullptr, nullptr, nullptr,
                      LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
 }
+#endif
 
 // fsb_forest_build_lean with the split destination table: means land in an unsigned-short bf16 slab (rows centred on
 // the stored mean, so the radius a writer records covers exactly what a beam reads), aggregates in a 9-wide fp32 slab
@@ -2066,10 +2266,11 @@ fsb_forest_build_lean16(const int* __restrict__ TASKS, const int* __restrict__ L
             }
         }
     }
-    build_task<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, nullptr, nullptr, MU0, MU1, AX0, AX1,
+    BUILD_TASK<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, nullptr, nullptr, MU0, MU1, AX0, AX1,
                      LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
 }
 
+#if !BUILD_UNIFORM
 // fsb_spine_lean over the split table (bf16 means upcast, fp32 aggregates) for head t, one warp; the spine rows stay
 // packed fp32
 __device__ __forceinline__ void spine_lean16_row(const unsigned short* __restrict__ NMU0, const float* __restrict__ NAX0,
@@ -2263,6 +2464,7 @@ fsb_spine_lean16_many(const LeanDesc* __restrict__ D, const int T, const int nb)
     if (t >= T) return;
     spine_lean16_row(d.mu, d.ax, d.mt, d.sp_node, d.sp_root, d.sp_hgt, d.Ntot, d.kmax, t);
 }
+#endif
 
 // >>> SECTION: _SMALL <<<
 

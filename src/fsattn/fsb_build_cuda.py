@@ -16,7 +16,9 @@ group build's signed zeros (folded once per sum), first-index argmax, and torch'
 -0 == +0, ties by slot). The source is compiled at first use with NVRTC through fsb_beam_cuda's loader; without
 NVRTC, or for shapes it does not cover, the existing builder runs. With FSB_BUILD_SMALL=1 (the default; 0 keeps the
 build kernel) a short or mid prefill's trimmed build runs its chunks (all at most 2^8 cells high) in
-fsb_forest_build_small instead, with the same bits (small_on, _small_units).
+fsb_forest_build_small instead, with the same bits (small_on, _small_units). With FSB_BUILD_UNIFORM=1 the split-table
+build kernels (the prefill's fsb_forest_build16 and the decode ingest's fsb_forest_build_lean16) come from a second
+module compiled with warp-uniform branches, again with the same bits (uniform_on).
 """
 from __future__ import annotations
 
@@ -53,6 +55,8 @@ _pinned: dict = {}                                        # shape -> task table 
 _failed: dict = {}                                        # kernel variant -> its setup error (that variant falls back)
 _small_fns: dict = {}                                     # kernel variant -> fsb_forest_build_small
 _small_failed: dict = {}                                  # kernel variant -> its setup error (FSB_BUILD_SMALL off)
+_uniform_fns: dict = {}                                   # kernel variant -> (fsb_forest_build16, _lean16), uniform
+_uniform_failed: dict = {}                                # kernel variant -> its setup error (FSB_BUILD_UNIFORM off)
 _warned: set = set()                                      # per-call failures already reported
 _ONLY_K = None                                            # debug: restrict the task table to these heights
 
@@ -70,6 +74,17 @@ def small_on() -> bool:
     # and their long per-warp chains set the time. Taller builds are throughput-bound and stay in the build kernel, as
     # do decode builds. 0: the build kernel builds every chunk
     return os.environ.get("FSB_BUILD_SMALL", "1") == "1"
+
+
+def uniform_on() -> bool:
+    # FSB_BUILD_UNIFORM=1: the split-table build kernels (fsb_forest_build16 of every whole-forest build, the prefill's,
+    # and fsb_forest_build_lean16 of the decode ingest's chunk builds) run from a module compiled with BUILD_UNIFORM:
+    # every branch around shuffle code tests a value ptxas can prove warp-uniform (no divergence-checked second copy
+    # that runs each shuffle through a WARPSYNC call), and every task kind reaches the C levels and the per-warp levels
+    # from one call site (one copy of the level code instead of up to three): a third of the instructions and far
+    # fewer spills. The same task tables and the same arithmetic in the same order: the same bits. 0 (the default):
+    # the build module's kernels
+    return os.environ.get("FSB_BUILD_UNIFORM", "0") == "1"
 
 
 def _small_fits(M: int, mb_max) -> bool:
@@ -171,13 +186,17 @@ def forest_layout(M: int) -> dict:
 _DEBUG_DEFS: dict = {}                                    # debug: extra #defines (e.g. DBG_TIME)
 
 
-def _defines(Dh: int) -> str:
+def _defines(Dh: int, uniform: bool = False) -> str:
     defs = {"DH": Dh, "PER": Dh // 32, "NC": Dh + _NC_EXTRA, "NA": _NC_EXTRA, "XS": Dh + 4, **_DEBUG_DEFS}
+    if uniform:
+        defs["BUILD_UNIFORM"] = 1
     return "".join(f"#define {k} {v}\n" for k, v in defs.items())
 
 
-def _source(Dh: int) -> str:
-    return _defines(Dh) + _bc._HELPERS + _COMMON + _PROLOGUE + _WPHASE + _CPHASE + _GPHASE + _BHELPERS + _BUILD
+def _source(Dh: int, uniform: bool = False) -> str:
+    # the build module; uniform: the module of FSB_BUILD_UNIFORM (only the split-table build kernels)
+    return (_defines(Dh, uniform) + _bc._HELPERS + _COMMON + _PROLOGUE + _WPHASE + _CPHASE + _GPHASE + _BHELPERS
+            + _BUILD)
 
 
 def _small_source(Dh: int) -> str:
@@ -269,6 +288,39 @@ def _small_function(dev: torch.device, Dh: int):
             return None
         _small_fns[key] = fn
     return fn
+
+
+def _uniform_functions(dev: torch.device, Dh: int):
+    # (fsb_forest_build16, fsb_forest_build_lean16) of the FSB_BUILD_UNIFORM module of a variant, compiled at first use;
+    # None when uniform_on() is off or the module cannot be set up (FSB_BUILD_UNIFORM then turns off for the variant,
+    # with one warning, and the build module's kernels run). Never compiles inside a graph capture.
+    if not uniform_on():
+        return None
+    key = _variant(dev.index, Dh)
+    fns = _uniform_fns.get(key)
+    if fns is None:
+        if key in _uniform_failed:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("fsb_build_cuda: kernels must be compiled before graph capture")
+        try:
+            src = _source(Dh, uniform=True)
+            fns = tuple(_bc.load_function(dev, src, n) for n in ("fsb_forest_build16", "fsb_forest_build_lean16"))
+            _, cuda = _bc._libraries()
+            cuda.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            for fn in fns:
+                _bc._check(cuda.cuFuncSetAttribute(fn, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:
+            if "CUDA error 2 (" in str(e):
+                raise torch.cuda.OutOfMemoryError(f"fsb_build_cuda: {e}") from e
+            _uniform_failed[key] = repr(e)
+            warnings.warn(f"FS-B uniform forest build unavailable on cuda:{dev.index} for head size {Dh}, using the "
+                          f"build module's kernels: {e!r}")
+            return None
+        _uniform_fns[key] = fns
+    return fns
 
 
 def _launch(fn, grid: int, block: int, smem: int, dev: torch.device, args, grid_y: int = 1) -> None:
@@ -668,6 +720,9 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
             _tasks(T, M, nf, g, dev, kmax_cuda, only_layv=True)
         _functions(dev, Dh)
         _, _, _, prep_lean, _, bld_lean16, sp_lean16 = _fns[_variant(dev.index, Dh)][:7]
+        uni = _uniform_functions(dev, Dh)
+        if uni is not None:
+            bld_lean16 = uni[1]
         amu0, anx0, leaf0, _, _, jb0, Kmax_lean, _ = lean[:8]
         sp_node, sp_root, sp_hgt = lean[8:11] if len(lean) >= 11 else (None, None, None)
         task_buf = lean[11] if len(lean) >= 12 else None
@@ -826,6 +881,9 @@ def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: 
     _functions(dev, Dh)
     fns = _fns[_variant(dev.index, Dh)]
     bld_lean16, sp_lean16, prep_dirty, prep_tall = fns[5], fns[6], fns[8], fns[9]
+    uni = _uniform_functions(dev, Dh)
+    if uni is not None:
+        bld_lean16 = uni[1]
     Kbar, ceil_c, sp, adm0, mt0, M_kb, M_ce, M_spr, M_adm0 = _lean_operands(Kbar, ceil_c, spread, lean)
     P, I32 = ctypes.c_void_p, ctypes.c_int
     nrec = nk * T
@@ -990,6 +1048,7 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
         if capturing and _variant(dev.index, Dh) not in _fns:
             raise RuntimeError("fsb_build_cuda: kernels must be compiled before graph capture")
         pro = _functions(dev, Dh)[0]
+        uni = _uniform_functions(dev, Dh)
     Kbar = Kbar.contiguous(); ceil_c = ceil_c.contiguous()
     sp = spread.contiguous() if spread is not None else ceil_c
     E = E.contiguous()
@@ -1008,7 +1067,7 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
         t0, t1 = _tau32(taus[0]), _tau32(taus[-1])
         P, I32 = ctypes.c_void_p, ctypes.c_int
         (a0, m0, b0, u0, x0, l0), (a1, m1, b1, u1, x1, l1) = outs
-        bld16 = _fns[_variant(dev.index, Dh)][7]
+        bld16 = _fns[_variant(dev.index, Dh)][7] if uni is None else uni[0]
         # this call's int32 work buffer, from the caching allocator like the outputs (a graph capture owns its own, and
         # calls on different streams never share one): the build kernel's control words (the completion flags of the G
         # nodes), cleared by the prologue, then the slot lists of the chunks of height >= 10
