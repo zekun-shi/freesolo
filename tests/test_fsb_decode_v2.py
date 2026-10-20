@@ -558,8 +558,8 @@ def test_static_tables_from_a_side_stream_reach_the_others_in_order(monkeypatch)
 
 @gpu
 @torch.no_grad()
-@pytest.mark.parametrize("base", [1016, 2040])
-def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base):
+@pytest.mark.parametrize("base,zeros", [(1016, False), (2040, False), (1016, True)])
+def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base, zeros):
     # FSB_DECODE_ASYNC: an ingest during which a head's admitted count may cross a multiple of 1024 decides it on the
     # device too: the host proposes the one chunk each such head completes if it gets there (height 10 when the count
     # passes 1024 or 3072, 11 at 2048, ...), fsb_prep_lean_tall keeps the completed ones and the empty chunks of the
@@ -567,12 +567,18 @@ def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base):
     # reach of the boundary without crossing it and heads that cross a block later. base: the visible cells of the first
     # (host-decided) ingest, below 1024 or 2048. From 1016, the ingest at 1028 cells lays the forest out for 2048
     # (height 10's fold flag turns on) while heads that crossed earlier hold height-10 chunks built without it: the host
-    # proposes those for rebuilding too, which happens where height 10 is dirty, as the host-decided ingest does
+    # proposes those for rebuilding too, which happens where height 10 is dirty, as the host-decided ingest does.
+    # zeros: head 0's first dimension is -0 in every cell but the first (+0), as in
+    # test_async_ingest_rebuilds_chunks_under_a_new_fold_flag, so the flag changes the rows of the height-10 chunk head 0
+    # completes at 1024 cells and keeps at 1028: rows kept from the old flag would differ from the host's rebuild
     from src.fsattn import fsb_build_cuda as fbc
     T, Dh, dev = 16, 64, torch.device("cuda")
     M_cap = base + 64
     g = torch.Generator(device="cuda").manual_seed(11)
     Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
+    if zeros:
+        Kbar[0, 0, :, 0] = -0.0
+        Kbar[0, 0, 0, 0] = 0.0
     ceil = torch.rand(1, T, M_cap, device=dev, generator=g) + 0.5
     for t in range(1, T):                                   # head t drops t cells: counts spread around the boundary
         ceil[0, t, torch.randperm(base, generator=torch.Generator().manual_seed(t))[:t].to(dev)] = -1.0
@@ -594,22 +600,35 @@ def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base):
     assert on_dev == list(seq[1:]) and len(talls) == len(on_dev), (on_dev, len(talls))
     assert sum(t is not None and len(t[0]) > 0 for t in talls) >= 3
     assert (base == 1016) == any(t is not None and t[1] > 0 for t in talls), [t and t[1] for t in talls]
+    if zeros:
+        # the flag matters for this input: the host rebuild at 1028 cells changed head 0's unmoved height-10 rows
+        i0, i1 = seq.index(1024), seq.index(1028)
+        assert t0[i1][4][0].item() == 1028 and t0[i1][4][1].item() == 1027, t0[i1][4][:2].tolist()
+        nb, nodes = 2 * (1 << 10) - 10 - 2, 2 * (1 << 10) - 1
+        assert not all(torch.equal(_bits(t0[i0][i][0, nb:nb + nodes]), _bits(t0[i1][i][0, nb:nb + nodes]))
+                       for i in (0, 1))
 
 
 @gpu
 @torch.no_grad()
-def test_batched_async_ingests_match_host_decided(monkeypatch):
+@pytest.mark.parametrize("zeros", [False, True])
+def test_batched_async_ingests_match_host_decided(monkeypatch, zeros):
     # FSB_DECODE_ASYNC's batched block change outside a decode graph (_ingest_async_many -> lean_dirty_build_many: one
     # append, record, build and spine launch for all forests) against each forest's own host-decided ingests: three
     # forests with different thresholds (different counts per head, heights and Kmax) through ingests that pass 512
     # visible cells, where height 9's fold flag turns on while forest 0's head 0 keeps its 512-cell chunk and head 1
     # completes one; every table after each ingest and the settled host state equal bit for bit, every ingest after
-    # the first in one batch of all three forests
+    # the first in one batch of all three forests. zeros: head 0's first dimension is -0 in every cell but the first
+    # (+0), as in test_async_ingest_rebuilds_chunks_under_a_new_fold_flag, so the flag changes the rows of forest 0's
+    # unmoved chunk: a batch that kept them would differ from the host's rebuild
     from src.fsattn import fsb_build_cuda as fbc
     from src.fsattn.fsb_tree import ForestCache, _async_readback, _ingest_async_many
     T, Dh, M_cap, dev = 16, 64, 544, torch.device("cuda")
     g = torch.Generator(device="cuda").manual_seed(13)
     Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
+    if zeros:
+        Kbar[0, 0, :, 0] = -0.0
+        Kbar[0, 0, 0, 0] = 0.0
     ceil = torch.rand(1, T, M_cap, device=dev, generator=g)
     ceil[0, 1, 100] = -1.0                                  # forest 0's head 1 admits 511 of the first 512 cells
     taus = [torch.full((T,), q, device=dev) for q in (0.0, 0.25, 0.5)]
@@ -660,6 +679,12 @@ def test_batched_async_ingests_match_host_decided(monkeypatch):
             assert all(torch.equal(_bits(x), _bits(y)) for x, y in zip(fa, fb))
     assert h0 == h1 and h1[0][3][9] == 1
     assert len({h[2] and max(h[2]) for h in h1}) > 1          # the forests' heights differ
+    if zeros:
+        # the flag matters for this input: the host rebuild at 516 cells changed forest 0's unmoved height-9 rows
+        assert t0[2][0][4][0].item() == 516 and t0[2][0][4][1].item() == 515, t0[2][0][4][:2].tolist()
+        nb, nodes = 2 * (1 << 9) - 9 - 2, 2 * (1 << 9) - 1
+        assert not all(torch.equal(_bits(t0[1][0][i][0, nb:nb + nodes]), _bits(t0[2][0][i][0, nb:nb + nodes]))
+                       for i in (0, 1))
 
 
 @gpu
