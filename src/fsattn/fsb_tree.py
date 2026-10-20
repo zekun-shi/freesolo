@@ -2714,6 +2714,16 @@ def _forest_token(attn, q_t, cache, sigma, pos, fc, c_h=None, pos_f=None, sr=Non
             else:
                 q = qr = q_t[:, :, 0, :].float().reshape(T, 1, Dh)
         rq = q if (getattr(attn, "fsb_read_top", 0) > 0 and getattr(attn, "fsb_rerank_query", "route") == "raw" and qr is not q) else None
+        if rq is None and not ro and os.environ.get("FSB_DECODE_V2", "0") == "1":
+            # FSB_DECODE_V2: the plain path's beams, re-rank and readout in one kernel (same read cells), else the chain
+            from .fsb_decode_cuda import decode_read_fused
+            got = decode_read_fused(attn, fc, tk, cache, q_t, qr, qpos, lam, sigv, rc, rr, tokK, ukw, sr, pos_t, d_eff)
+            if got is not None:
+                out, fc._last_sel, pv = got
+                if prov is not None:
+                    prov.append(pv)
+                    fc._last_prov = pv
+                return out
         sel = _forest_token_plain(attn, fc, tk, qr, qr if rq is None else rq, qpos, lam, sigv, rc, rr, tokK, ukw, prov,
                                   d_eff=d_eff)
     if sel is None:
