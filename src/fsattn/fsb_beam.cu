@@ -1497,6 +1497,20 @@ __device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
 }
 
+// mma16816_tc without the volatile ordering (registers only), so independent n-tiles' chains interleave
+__device__ __forceinline__ void mma_bf16(float (&d)[4], const unsigned (&a)[4], const unsigned b0, const unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// pack_bf16x2 in one instruction: x rounded to bf16 in the low half, y in the high half (round to nearest even)
+__device__ __forceinline__ unsigned pack2_bf16(const float x, const float y) {
+    unsigned r;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(y), "f"(x));
+    return r;
+}
+
 // the selection key of a child with score s and child index c, or 0 when it has no child (exists false) or its score is
 // not above the reference's -5e8 (NaN included): the order-preserving bits of s (sign bit set for s >= 0, every bit
 // flipped below) with the low 5 bits replaced by 31 - c, so equal tops rank the earlier child first. A mean score can
@@ -1530,19 +1544,33 @@ __device__ __forceinline__ void chunk_keys(skey (&key)[16], const unsigned* s_mu
     const unsigned pm = CHUNKED ? 0x3f3f3f3fu : 0x1f1f1f1fu;              // pair indices below UC2 / 2 (DCH / 2)
     const unsigned pv_lo = (bv_lo >> 1) & pm, pv_hi = (bv_hi >> 1) & pm;
 #pragma unroll
-    for (int nt = 0; nt < DCH / 8; nt++) {
-        if (cd + 8 * nt < Pc) {
-            const int u_row = min(cd + 8 * nt + (lane & 7), Pc - 1);
-            const unsigned ra = (unsigned)__cvta_generic_to_shared(s_mu + u_row * 32);
-            unsigned b[8];
-            ldsm_x4(b[0], b[1], b[2], b[3], ra + 16u * ((unsigned)(lane >> 3) ^ (unsigned)(u_row & 7)));
-            ldsm_x4(b[4], b[5], b[6], b[7], ra + 16u * ((unsigned)((lane >> 3) + 4) ^ (unsigned)(u_row & 7)));
-            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int grp = 0; grp < DCH / 16; grp++) {
+        if (cd + 16 * grp < Pc) {
+            // two n-tiles at once, so their mma chains interleave
+            unsigned b[2][8];
 #pragma unroll
-            for (int ks = 0; ks < 4; ks++) mma16816_tc(acc, qa[ks], b[2 * ks], b[2 * ks + 1]);
-            const int pr = 4 * nt + t4;
-            s_dw[g * (DCH / 2) + (pr ^ dswz(g))] = pack_bf16x2(f_mul(acc[0], scale), f_mul(acc[1], scale));
-            s_dw[(g + 8) * (DCH / 2) + (pr ^ dswz(g + 8))] = pack_bf16x2(f_mul(acc[2], scale), f_mul(acc[3], scale));
+            for (int n2 = 0; n2 < 2; n2++) {
+                const int u_row = min(cd + 16 * grp + 8 * n2 + (lane & 7), Pc - 1);
+                const unsigned ra = (unsigned)__cvta_generic_to_shared(s_mu + u_row * 32);
+                ldsm_x4(b[n2][0], b[n2][1], b[n2][2], b[n2][3],
+                        ra + 16u * ((unsigned)(lane >> 3) ^ (unsigned)(u_row & 7)));
+                ldsm_x4(b[n2][4], b[n2][5], b[n2][6], b[n2][7],
+                        ra + 16u * ((unsigned)((lane >> 3) + 4) ^ (unsigned)(u_row & 7)));
+            }
+            float acc[2][4];
+#pragma unroll
+            for (int n2 = 0; n2 < 2; n2++) acc[n2][0] = acc[n2][1] = acc[n2][2] = acc[n2][3] = 0.0f;
+#pragma unroll
+            for (int ks = 0; ks < 4; ks++)
+#pragma unroll
+                for (int n2 = 0; n2 < 2; n2++) mma_bf16(acc[n2], qa[ks], b[n2][2 * ks], b[n2][2 * ks + 1]);
+#pragma unroll
+            for (int n2 = 0; n2 < 2; n2++) {
+                const int pr = 4 * (2 * grp + n2) + t4;
+                s_dw[g * (DCH / 2) + (pr ^ dswz(g))] = pack2_bf16(f_mul(acc[n2][0], scale), f_mul(acc[n2][1], scale));
+                s_dw[(g + 8) * (DCH / 2) + (pr ^ dswz(g + 8))] =
+                    pack2_bf16(f_mul(acc[n2][2], scale), f_mul(acc[n2][3], scale));
+            }
         }
     }
     __syncwarp();
@@ -1721,11 +1749,10 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
             n = __popc(lo & 0xccccccccu) + __popc(hi & 0xccccccccu);
             const int ncarry = __popc(lo & 0x22222222u) + __popc(hi & 0x22222222u);
             const int cbase = ncar + (h ? __popc(lo & 0x22222222u) : 0);
-#pragma unroll
-            for (int jj = 0; jj < 8; jj++) {
-                const int pos = cbase + __popc(pk & 0x22222222u & ((1u << (4 * jj)) - 1u));
-                if (((pk >> (4 * jj + 1)) & 1u) && pos < wl)
-                    s_car[qi * 16 + pos] = __float_as_int(um_cur[byte8(o_lo, o_hi, jj) & (UC2 - 1)].x);
+            for (unsigned cm = pk & 0x22222222u; cm != 0u; cm &= cm - 1u) {      // this lane's carried entries
+                const int b = __ffs(cm) - 1, jj = b >> 2;
+                const int pos = cbase + __popc(pk & 0x22222222u & ((1u << b) - 1u));
+                if (pos < wl) s_car[qi * 16 + pos] = __float_as_int(um_cur[byte8(o_lo, o_hi, jj) & (UC2 - 1)].x);
             }
             // the level selects (ranks children by score) when a query has more children than free slots, the vote of
             // fsb_beam_rows, which also counts a query whose frontier is not yet at its fixed point (open entries,
