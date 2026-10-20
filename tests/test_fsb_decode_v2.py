@@ -29,6 +29,8 @@ def _model(monkeypatch, L, n_layers=1, seed=41):
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
     monkeypatch.setenv("FS_KV_INT8", "1")
     monkeypatch.setenv("FSB_DECODE_FORK", "0")         # the serial step; test_forked_read_matches_serial_step forks it
+    monkeypatch.setenv("FSB_DECODE_JOIN", "0")         # torch's combine; test_forked_join_matches_torch_combine joins
+    monkeypatch.setenv("FSB_DECODE_V3", "0")           # the second version; the prefix tests build the third
     torch.manual_seed(seed)
     m = FreeSoloLM(vocab_size=512, d_model=1024, n_layers=n_layers, n_heads=16, d_ff=1024, max_seq_len=L + 1024,
                    attn_type="fsattn", **be.serve_kwargs("fsb", 0.5)).cuda().to(torch.bfloat16).eval()

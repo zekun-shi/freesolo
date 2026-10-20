@@ -35,13 +35,13 @@ def attn_flags():
 FSB_FLAGS = {"FSB_FAST_BEAM": "1", "FSB_BEAM_CUDA": "1", "FSB_BEAM_ROWS": "1", "FSB_TRAVERSE_TRITON": "1",
              "FSB_FAST_RERANK": "1", "FSB_FAST_CACHE": "1", "FSB_FAST_BUILD": "1", "FSB_BUILD_CUDA": "1", "FSB_FAST_ROWS": "1",
              "FSB_DECODE_WHOLE": "1", "FSB_DECODE_GRAPH": "1", "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1",
-             "FSB_DECODE_FORK": "1", "FSB_DECODE_JOIN": "0", "FSB_DECODE_ASYNC": "0", "FSB_DECODE_V3": "0",
+             "FSB_DECODE_FORK": "1", "FSB_DECODE_JOIN": "1", "FSB_DECODE_ASYNC": "0", "FSB_DECODE_V3": "1",
              "FSB_TRAIN_GRAPH": "0",
              "FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP": "1", "FSB_ROWS_LSE_SPLIT": "4",
              "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
              "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
              "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
-             "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "0"}
+             "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "1"}
 
 
 def fsb_flags():

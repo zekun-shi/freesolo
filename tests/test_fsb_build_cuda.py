@@ -27,6 +27,13 @@ if _HAVE_TRITON:
         tl.store(S + i, tl.sqrt_rn(tl.abs(x)))
 
 
+@pytest.fixture(autouse=True)
+def _build_kernel_first(monkeypatch):
+    # a short or mid prefill's trimmed build runs fsb_forest_build_small by default (FSB_BUILD_SMALL=1, the same bits):
+    # the tests here build with the build kernel, and the small kernel's tests switch FSB_BUILD_SMALL on themselves
+    monkeypatch.setenv("FSB_BUILD_SMALL", "0")
+
+
 def _bc():
     from src.fsattn import fsb_build_cuda as bc
     return bc

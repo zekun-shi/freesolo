@@ -1405,9 +1405,9 @@ class FSAttn(nn.Module):
                 out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f)
             out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
             cur.wait_stream(side)
-            if os.environ.get("FSB_DECODE_JOIN", "0") == "1":
-                # FSB_DECODE_JOIN: the join is the one kernel after both branches, so torch's scale and add (and the
-                # transpose into W_o's input) run as one launch with the same values
+            if os.environ.get("FSB_DECODE_JOIN", "1") == "1":
+                # FSB_DECODE_JOIN (default 1; 0 keeps torch's ops): the join is the one kernel after both branches,
+                # so torch's scale and add (and the transpose into W_o's input) run as one launch with the same values
                 from ..utils import trunk_triton as _tt
                 if _tt.lr_scale_combine_ok(out_short, self.long_range_scale, out_long):
                     return self.W_o(_tt.lr_scale_combine(out_short, self.long_range_scale, out_long))

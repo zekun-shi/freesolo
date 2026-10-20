@@ -14,9 +14,9 @@ tl.math.div_rn / tl.sqrt_rn compile, the mean as mul.rn.ftz by 2^-p, which is
 bit-identical to div.rn.ftz by 2^p for every float), with the same pairwise-halving reduction trees, the padded
 group build's signed zeros (folded once per sum), first-index argmax, and torch's stable sort order (value order with
 -0 == +0, ties by slot). The source is compiled at first use with NVRTC through fsb_beam_cuda's loader; without
-NVRTC, or for shapes it does not cover, the existing builder runs. With FSB_BUILD_SMALL=1 a short or mid prefill's
-trimmed build runs its chunks (all at most 2^8 cells high) in fsb_forest_build_small instead, with the same bits
-(small_on, _small_units).
+NVRTC, or for shapes it does not cover, the existing builder runs. With FSB_BUILD_SMALL=1 (the default; 0 keeps the
+build kernel) a short or mid prefill's trimmed build runs its chunks (all at most 2^8 cells high) in
+fsb_forest_build_small instead, with the same bits (small_on, _small_units).
 """
 from __future__ import annotations
 
@@ -64,12 +64,12 @@ _SMALL_SM_SHARE = 0.5
 
 
 def small_on() -> bool:
-    # FSB_BUILD_SMALL=1: a trimmed prefill build (mb_max) whose chunks are all at most _SMALL_KMAX high runs them in
-    # fsb_forest_build_small (two warps per 32-slot tile, the CTAs spread over the GPU; the same records bit for bit):
-    # the short and mid prefills, where the build kernel's 512-slot batches leave most of the GPU idle and their long
-    # per-warp chains set the time. Taller builds are throughput-bound and stay in the build kernel, as do decode
-    # builds. 0 (the default): the build kernel builds every chunk
-    return os.environ.get("FSB_BUILD_SMALL", "0") == "1"
+    # FSB_BUILD_SMALL=1 (the default): a trimmed prefill build (mb_max) whose chunks are all at most _SMALL_KMAX high
+    # runs them in fsb_forest_build_small (two warps per 32-slot tile, the CTAs spread over the GPU; the same records
+    # bit for bit): the short and mid prefills, where the build kernel's 512-slot batches leave most of the GPU idle
+    # and their long per-warp chains set the time. Taller builds are throughput-bound and stay in the build kernel, as
+    # do decode builds. 0: the build kernel builds every chunk
+    return os.environ.get("FSB_BUILD_SMALL", "1") == "1"
 
 
 def _small_fits(M: int, mb_max) -> bool:

@@ -9,11 +9,11 @@ prefetches the next level's candidates into L2 while it scores, and the chain's 
 become one. It covers the int8 long-range KV store at head dim 64, cells of 32 tokens, beams of at most 16 slots
 (2^delta cells each, 32 per beam at most) and 1, 2, 4 or 8 read cells; anything else returns None and the chain runs.
 
-FSB_DECODE_V3=1 (default 0) builds the kernel's third version (DEC_V3 in fsb_decode.cu): the same read cells and outputs
-bit for bit with a shorter chain per descent. While a level keeps every child it visits, its nodes follow from the tree's
-shape alone; those top levels are batched (one round of loads, one pass of scores, the frontier order replayed), the
-shape walk is cached per row in the forest's plan buffer (ForestCache._plan) and reused while the row's shape holds, and
-the preamble issues the query's load first.
+FSB_DECODE_V3=1 (the default; 0 builds the second version) builds the kernel's third version (DEC_V3 in
+fsb_decode.cu): the same read cells and outputs bit for bit with a shorter chain per descent. While a level keeps every
+child it visits, its nodes follow from the tree's shape alone; those top levels are batched (one round of loads, one
+pass of scores, the frontier order replayed), the shape walk is cached per row in the forest's plan buffer
+(ForestCache._plan) and reused while the row's shape holds, and the preamble issues the query's load first.
 """
 from __future__ import annotations
 
@@ -40,8 +40,9 @@ def v2_on() -> bool:
 
 
 def v3_on() -> bool:
-    # FSB_DECODE_V3=1: the kernel's third version (fsb_decode.cu, DEC_V3): the same read cells and outputs bit for bit
-    return os.environ.get("FSB_DECODE_V3", "0") == "1"
+    # FSB_DECODE_V3=1 (the default): the kernel's third version (fsb_decode.cu, DEC_V3), the same read cells and
+    # outputs bit for bit; 0 builds the second version
+    return os.environ.get("FSB_DECODE_V3", "1") == "1"
 
 
 class _DecBeam(ctypes.Structure):
