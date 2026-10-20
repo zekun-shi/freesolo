@@ -3,7 +3,8 @@ stage loop (FSB_FAST_PREFILL=0): output, selected cells, statistics and read acc
 lengths, batch, both forests or one, re-rank overflow, stage sizes and both readouts; no host sync when no row can
 overflow; the per-layer launch count; the shared pieces it must use (fsb_rows.union_rerank_rows with the deferred
 flags and bf16 queries, both beams in one forest_beam_pair launch in the compact layout, the cell statistics handed to
-the KV cache, the fused readout's hand-off across an overflow redo)."""
+the KV cache, the fused readout's hand-off across an overflow redo); the window branch forked next to the long-range
+branch (FSB_WINDOW_OVERLAP) against the serial prefill, eager and CUDA-graph captured."""
 import os
 import sys
 
@@ -598,6 +599,60 @@ def test_overflow_redo_with_in_place_window_output(monkeypatch):
     assert forced[0], "no deferred flag was forced"
     assert _same(out[True], out[False])
 
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("fast", ["0", "1"])
+def test_overflow_redo_with_forked_window_output(monkeypatch, fast):
+    # FSB_WINDOW_OVERLAP: the window branch writes its output on the side stream while the long-range branch runs, and
+    # hands it over in place; the overflow redo's snapshot of that output must wait for the branch's event. The branch
+    # is held back (a sleep before its write) until well after the snapshot is queued, and a flag forced on the first
+    # stage (the redo repeats the same selection) must leave the layer output unchanged, in the fast path and in the
+    # stage loop (which snapshots before its stages)
+    attn = _attn(blkchunk=2)
+    N = 16384 + 1024                                      # M = 544 > UCAP: the stages raise deferred flags
+    Q, K, V, sigma = _inputs(43, 1, 4, N)
+    _set_tau(attn, K)
+    for k, v in (("FS_FUSED_ATTN", "1"), ("FSL_READOUT_FUSED", "1"), ("FSB_FAST_PREFILL", fast),
+                 ("FSB_ROWS_DEFER", "1")):
+        monkeypatch.setenv(k, v)
+    real = rows.union_rerank_rows
+    forced = []
+
+    def force(*a, **k):
+        r = real(*a, **k)
+        flags = k.get("ovf_out")
+        if forced and flags is not None and not forced[0]:
+            flags.append(torch.ones((), dtype=torch.bool, device="cuda"))
+            forced[0] = True
+        return r
+
+    monkeypatch.setattr(rows, "union_rerank_rows", force)
+    sr0 = torch.randn(1, N, 4, 64, generator=torch.Generator().manual_seed(3)).to("cuda", torch.bfloat16)
+    out = {}
+    for f in (False, True):                               # (the first run also compiles the kernels)
+        forced[:] = [False] if f else []
+        buf = torch.zeros(1, N, 4, 64, device="cuda", dtype=torch.bfloat16)
+
+        def window():
+            torch.cuda._sleep(1 << 30)                    # about 0.7 s on an A100
+            buf.copy_(sr0)
+            return buf.transpose(1, 2)                    # the window kernel's (B, H, N, D) view of (B, N, H, D)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            sr, ev = FSAttn._window_fork(window, Q.device)
+            attn._begin_lr(sr, want_cell_stats=True, sr_event=ev, inplace_sr=True)
+            assert attn._lr_inplace_sr
+            try:
+                y = ft.fsb_long_range(attn, Q, K, V, sigma, N)
+            finally:
+                fused, _ = attn._end_lr()
+        assert fused
+        out[f] = y.clone()
+    assert forced[0], "no deferred flag was forced"
+    assert _same(out[True], out[False])
+
+
 @gpu
 def test_log_stats_after_lean_eval_prefill(monkeypatch):
     # fsb_log_stats after an eval prefill on the fast path: without FSB_PREFILL_STATS the per-query statistics are not
@@ -823,6 +878,86 @@ def test_graphed_prefiller_matches_eager(monkeypatch, serve):
         for cg, ce in zip(gp.cache, cs):
             assert _same(cg._k_hist, ce._k_hist) and _same(cg._v_hist, ce._v_hist)
             assert _same(cg._kbar, ce._kbar) and _same(cg._ceil, ce._ceil)
+
+
+@gpu
+@pytest.mark.parametrize("pipe", ["0", "1"])
+def test_window_overlap_matches_serial(monkeypatch, pipe):
+    # FSB_WINDOW_OVERLAP=1 forks every layer's window branch onto a side stream next to the long-range branch
+    # (FSAttn._window_fork), with the stage pipe's own side stream on top when a layer has several stages: the eager
+    # prefill and the CUDA-graph prefill (per-layer KV and the bench's shared K / V buffers, which the next layer
+    # overwrites) equal the serial path's bit for bit, and no record_stream is issued (under capture it would keep each
+    # layer's window output out of the graph pool)
+    import bench_efficiency as be
+    from decode_graph import GraphedPrefiller
+    from experiments.scaling.model import FreeSoloLM
+    from kv_cache import _trunk_cached, make_caches
+    from longctx_infer import _lm_head_fp32, extend_rope_cache
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
+    monkeypatch.setenv("FSB_STAGE_PIPE", pipe)
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "2")      # 8 query blocks of 128: four stages per layer
+    kw = be.serve_kwargs("fsb", 0.5)
+    torch.manual_seed(13)
+    L, n_layers = 1024, 3
+    m = FreeSoloLM(vocab_size=512, d_model=256, n_layers=n_layers, n_heads=4, d_ff=512, max_seq_len=L + 64,
+                   attn_type="fsattn", **kw).cuda().to(torch.bfloat16).eval()
+    extend_rope_cache(m, L + 256)                             # the prefiller's rope tables, for the eager runs too
+    g = torch.Generator().manual_seed(23)
+    x1 = torch.randint(0, 512, (1, L), generator=g).cuda()
+    x2 = torch.randint(0, 512, (1, L), generator=g).cuda()
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        cs = make_caches(m)
+        _trunk_cached(m, x1, cs)
+        for blk, c in zip(m.blocks, cs):
+            blk.attn.fsattn.fsb_tau.fill_(0.0)
+            blk.attn.fsattn.fsb_tau_union.copy_(c._ceil[0].float().median(dim=-1).values)
+    forks, rs = [0], [0]
+    real_fork, real_rs = FSAttn._window_fork, torch.Tensor.record_stream
+
+    def spy_fork(fn, dev):
+        forks[0] += 1
+        return real_fork(fn, dev)
+
+    def spy_rs(t, s):
+        # only the window branch's calls (FSAttn's hand-off) count: the forest build's task tables record every new
+        # stream that reads them (fsb_build_cuda._tasks), as the first capture of a shape in a process does on either
+        # path
+        if sys._getframe(1).f_globals.get("__name__", "").endswith(".attention"):
+            rs[0] += 1
+        return real_rs(t, s)
+
+    monkeypatch.setattr(FSAttn, "_window_fork", staticmethod(spy_fork))
+    monkeypatch.setattr(torch.Tensor, "record_stream", spy_rs)
+    res = {}
+    for ov in ("0", "1"):
+        monkeypatch.setenv("FSB_WINDOW_OVERLAP", ov)
+        forks[0] = 0
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            h = _trunk_cached(m, x2, make_caches(m))
+            out = {"eager_h": h, "eager_tail": _lm_head_fp32(m, h[:, -64:, :], 4096)}
+        for retain in (True, False):
+            gp = GraphedPrefiller(m, L, B=1, device="cuda", dtype=torch.bfloat16, tail_tokens=64, retain_kv=retain)
+            gp.capture(x1)
+            for i, x in enumerate((x1, x2)):
+                out[f"last{i}_{retain}"] = gp.run(x).clone()
+                out[f"tail{i}_{retain}"] = gp.tail_logits().clone()
+                if retain:
+                    for j, c in enumerate(gp.cache):
+                        for name in ("_k_hist", "_v_hist", "_kbar", "_ceil"):
+                            out[f"{name}{i}_{j}"] = getattr(c, name).clone()
+            del gp
+        # one fork per layer and forward: the eager prefill, then each prefiller's warm-up pass and its capture
+        assert forks[0] == (5 * n_layers if ov == "1" else 0), (ov, forks[0])
+        res[ov] = out
+    assert rs[0] == 0, rs[0]
+    assert res["0"].keys() == res["1"].keys()
+    for k in res["0"]:
+        assert _same(res["0"][k], res["1"][k]), k
+    # the replays agree with the eager prefill of the same prompt
+    assert torch.isfinite(res["1"]["eager_tail"]).all()
+    for retain in (True, False):
+        assert _same(res["1"][f"tail1_{retain}"], res["1"]["eager_tail"]), retain
 
 
 @gpu

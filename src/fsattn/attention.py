@@ -28,6 +28,11 @@ def _window_stream(dev):
     return s
 
 
+class _ForkEvent(torch.cuda.Event):
+    """Completion of a window branch forked by FSAttn._window_fork: its consumers only wait for it (_await_window),
+    the stream order makes record_stream unnecessary there."""
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-8):
         super().__init__()
@@ -221,12 +226,39 @@ class FSAttn(nn.Module):
         ev.record(side)
         return out, ev
 
+    def _window_overlap_on(self) -> bool:
+        # FSB_WINDOW_OVERLAP=1: an FS-B prefill's chunked-RoPE window branch runs concurrently with the long-range
+        # branch (_window_fork), which does not read the window output
+        return self.fsb_enabled and os.environ.get("FSB_WINDOW_OVERLAP", "0") == "1"
+
+    @staticmethod
+    def _window_fork(fn, dev):
+        # Runs the window branch fn() on the side stream, forked from the caller's stream, and returns its output and
+        # the event its consumers wait for (_await_window: the readout's hand-off or _combine), so it overlaps the
+        # long-range branch queued next on the caller's stream; the same kernels on the same inputs, so the same
+        # values. Under CUDA-graph capture the fork (side stream waits on the capturing stream) and the join make
+        # the side stream part of the capture, so the graph holds both branches. Buffers without record_stream
+        # (under capture it would keep every layer's window output out of the graph pool until the capture ends):
+        # the side stream reads Q, K, V and the rope tables, which the caller keeps referenced until after the join
+        # (layers that share one K / V buffer write it after the previous layer's join), and allocates its output
+        # and scratch from its own stream's pool; a block the caller frees after the join returns to that pool, and
+        # every fork waits on the caller's stream before its first allocation, so the side stream reuses a block only
+        # after its last reader.
+        side = _window_stream(dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side):
+            out = fn()
+        ev = _ForkEvent()
+        ev.record(side)
+        return out, ev
+
     @staticmethod
     def _await_window(out_short, ev):
         if ev is not None:
             main = torch.cuda.current_stream(out_short.device)
             main.wait_event(ev)
-            out_short.record_stream(main)
+            if not isinstance(ev, _ForkEvent):
+                out_short.record_stream(main)
 
     def _begin_lr(self, out_short, want_cell_stats=False, sr_event=None, inplace_sr=False):
         # Prefill only. Hand the window output to the cell readout, which may return W_o's input with the combine
@@ -898,10 +930,15 @@ class FSAttn(nn.Module):
                 if (tt.rope_ok(Q, cos) and tt.rope_ok(K, cos) and sin.stride(-1) == 1 and sin.shape == cos.shape
                         and D <= 128 and D % 8 == 0 and self.window_size % T_blk == 0 and N >= self.window_size
                         and dt_sr in (torch.bfloat16, torch.float16) and V.stride(-1) == 1):
-                    out_short = self.dropout(_batched_sliding_window_rope(
-                        Q, K, V, cos, sin, adt, self.window_size, self.scale, T=T_blk
-                    ))
-                    ev = None
+                    def window():
+                        return self.dropout(_batched_sliding_window_rope(
+                            Q, K, V, cos, sin, adt, self.window_size, self.scale, T=T_blk
+                        ))
+                    if self._window_overlap_on():
+                        out_short, ev = self._window_fork(window, Q.device)
+                    else:
+                        out_short, ev = window(), None
+                    sr_inplace = True                   # (a forked window too: the readout writes after the join)
                     Q_lr, K_lr = Q, K
                     used_chunk_rope = True
             if not used_chunk_rope:
@@ -918,6 +955,7 @@ class FSAttn(nn.Module):
                 Q_lr = Q_sr if _rope_lr else Q
                 K_lr = K_sr if _rope_lr else K
                 out_short, ev = self._short_range_prefill(Q_sr, K_sr, V, sigma)
+                sr_inplace = ev is None
                 if not _rope_lr and ev is None and not torch.is_grad_enabled():
                     del Q_sr, K_sr
             if self._lr_handoff_off():
@@ -928,7 +966,7 @@ class FSAttn(nn.Module):
                 self._begin_lr(out_short, want_cell_stats=(os.environ.get("FSL_PREFILL_CELL_REUSE", "1") != "0"
                                                            and not torch.is_grad_enabled()
                                                            and getattr(cache, "retain_kv", True)),
-                               sr_event=ev, inplace_sr=(ev is None and not torch.is_grad_enabled()))
+                               sr_event=ev, inplace_sr=(sr_inplace and not torch.is_grad_enabled()))
                 try:
                     out_long = self._long_range(Q_lr, K_lr, V, sigma, N)
                 finally:
