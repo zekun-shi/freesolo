@@ -207,6 +207,40 @@ def _window_args(N, seed):
     return a, st, (qk, qv, sk, sv, kh, vh, nq_t), q, k, v, pos_t
 
 
+def _bf(x):
+    return x.bfloat16().float()
+
+
+def _rope_bf16(x, c, sn):
+    # _apply_rotary_emb with every product, difference and sum rounded to bf16 (x fp32 values, c / sn bf16 rows)
+    h = D // 2
+    x1, x2, c, sn = x[..., :h], x[..., h:], c[:, :h].float(), sn[:, :h].float()
+    return torch.cat([_bf(_bf(x1 * c) - _bf(x2 * sn)), _bf(_bf(x2 * c) + _bf(x1 * sn))], dim=-1)
+
+
+def _window_ref(a, q, k, v, qk, sk, qv, sv, kh, vh, nq, pos):
+    # torch reference of the int8 window decode (uniform window, RoPE, bf16 autocast): rows below n_q are int8 *
+    # scale in fp32, the open cell's rows and the new token bf16; keys rotated in bf16 steps, values rounded to bf16,
+    # then _sr_decode_from_buf's scores, softmax and readout
+    idx = torch.arange(pos - W, pos + 1, device="cuda")
+    q8 = idx < nq
+    i8, cl, ih = idx.clamp(max=nq - 1), (idx // S).clamp(max=nq // S - 1), (idx - nq).clamp(min=0)
+
+    def rows(qx, sx, hot, cur):
+        x = torch.where(q8[None, None, :, None], qx[:, :, i8].float() * sx[:, :, cl].float()[..., None],
+                        hot[:, :, ih].float())
+        return torch.where((idx == pos)[None, None, :, None], cur.float(), x)
+
+    cos, sin = a.rope.cos_cached, a.rope.sin_cached
+    kw = _rope_bf16(rows(qk, sk, kh, k), cos[idx], sin[idx]).bfloat16()
+    vw = rows(qv, sv, vh, v).bfloat16()
+    qr = _rope_bf16(q.float(), cos[pos:pos + 1], sin[pos:pos + 1]).bfloat16()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        scores = torch.einsum("bhd,bhld->bhl", qr[:, :, 0], kw).float() * a.scale
+        w = torch.softmax(scores, dim=-1).to(vw.dtype)
+        return torch.einsum("bhl,bhld->bhd", w, vw).unsqueeze(2)
+
+
 @pytest.mark.parametrize("N", [4096, 4096 + 77, 9000 + 31])
 @torch.no_grad()
 def test_window_decode_through_slots_matches_full_int8_store(N):
@@ -225,6 +259,10 @@ def test_window_decode_through_slots_matches_full_int8_store(N):
         hots.append((khot, vhot))
     assert torch.equal(outs[0], outs[1])
     assert torch.equal(hots[0][0], hots[1][0]) and torch.equal(hots[0][1], hots[1][1])
+    nq = int(nq_t)
+    ref = _window_ref(a, q, k, v, qk, sk, qv, sv, kh, vh, nq, N)
+    assert torch.equal(outs[1], ref)
+    assert torch.equal(hots[1][0][:, :, N - nq], k[:, :, 0]) and torch.equal(hots[1][1][:, :, N - nq], v[:, :, 0])
 
 
 @pytest.mark.parametrize("N", [4096 + 77, 9000 + 31])
@@ -246,12 +284,34 @@ def test_long_range_decode_through_slots_matches_full_int8_store(N, ln_f32):
         assert out is not None
         outs.append(out)
     assert torch.equal(outs[0], outs[1])
-    # the bf16 reference kernel on the dequantized history reads the same cells: only int8 rounding may differ
-    Kd = kv_int8.dequant_cells(qk[:, :, :N // S * S], sk, S)
-    Vd = kv_int8.dequant_cells(qv[:, :, :N // S * S], sv, S)
+    # the bf16 kernel on the dequantized history (int8 * scale rounded to bf16, the values the int8 reads produce)
+    Kd = kv_int8.dequant_cells(qk[:, :, :N // S * S], sk, S).contiguous()
+    Vd = kv_int8.dequant_cells(qv[:, :, :N // S * S], sv, S).contiguous()
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        ref = tt.fsl_lr_decode_combine(a, q, Kd.contiguous(), Vd.contiguous(), sr, pool, pos_t, a.sigma)
+        ref = tt.fsl_lr_decode_combine(a, q, Kd, Vd, sr, pool, pos_t, a.sigma)
     assert torch.equal(outs[1], ref)
+    # and the torch path (_lr_decode_from_pool_buf's cell scores, top 4, masked token softmax, lr_norm, then the
+    # window combine): the same cells, up to the online softmax's summation order
+    B = 1
+    C = pool["C"]
+    lam = a.sel_scale.float().view(1, H, 1)
+    sig = a.sigma.float().view(1, H, 1)
+    content = torch.einsum("bhd,bhcd->bhc", q[:, :, 0].float(), pool["Kbar_cand"]) * a.scale
+    score = content + lam * pool["ceil_cand"] * torch.erf((float(N) - pool["cen_cand"]).abs() / (2.0 * sig))
+    sel = score.masked_fill(~pool["ok_cell"], -1e9).topk(4, dim=-1).indices
+    cellmask = torch.zeros(B, H, C, dtype=torch.bool, device="cuda").scatter_(-1, sel, True) & pool["ok_cell"]
+    tok = (pool["cand_c"][..., None] * S + torch.arange(S, device="cuda")).reshape(B, H, C * S)
+    Kc = Kd.gather(2, tok[..., None].expand(B, H, C * S, D))
+    Vc = Vd.gather(2, tok[..., None].expand(B, H, C * S, D))
+    allow = cellmask.repeat_interleave(S, dim=-1) & (tok < N)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        sc = torch.einsum("bhd,bhkd->bhk", q[:, :, 0], Kc).float() * a.scale
+        w = sc.masked_fill(~allow, -1e9).softmax(-1).to(Vc.dtype)
+        ob = torch.einsum("bhk,bhkd->bhd", w, Vc).unsqueeze(2)
+        out = sr + a.long_range_scale.unsqueeze(0) * a.lr_norm(ob.to(q.dtype))
+    out = out.transpose(1, 2).reshape(B, 1, H * D).float()
+    o = outs[1].float()
+    assert ((o - out).norm() / out.norm()).item() < 1e-2
 
 
 def _model(d_ff=512, n_layers=2, vocab=512, serve="sparse"):
