@@ -769,3 +769,184 @@ def test_rows_cuda_on_captured_stages(monkeypatch, name):
         assert _same(ref, o)
     assert bool((st["q"] == st["q"].bfloat16().float()).all())          # eager prefill's re-rank query: bf16 values
     assert _same(ref, _rows_call(st, st["score"], prov=st["prov"], q_bf16=True))
+
+
+def _v3_ok():
+    from src.fsattn.fsb_beam_cuda import _sm80
+    return _nvrtc_ok(2048) and _sm80(torch.device("cuda", torch.cuda.current_device()))
+
+
+def _bf16_stage(st):
+    # the fused re-rank kernels take bf16 queries (the prefill stage loop's Q; _stage's queries are bf16-exact fp32) and
+    # at least 8 heads (the stages below use H=8)
+    st["q"] = st["q"].to(torch.bfloat16)
+    return st
+
+
+def _rows_v3_pair(monkeypatch, st, score="lse_pos", prov=True, **kw):
+    # union_rerank_rows on the fused path with fsb_rows_fused2 (FSB_ROWS_V3=0) and with fsb_rows_v3 (=1); asserts that
+    # each ran the kernel it should
+    from src.fsattn import fsb_rows_cuda as rc
+    seen = []
+    real = rc._v3_function
+    monkeypatch.setattr(rc, "_v3_function", lambda *a: seen.append(1) or real(*a))
+    out = {}
+    for v in ("0", "1"):
+        monkeypatch.setenv("FSB_ROWS_V3", v)
+        seen.clear()
+        kv = {k: (x.clone() if torch.is_tensor(x) else x) for k, x in kw.items()}       # fresh output buffers
+        res = _rows_call(st, score, prov=prov, **kv)
+        out[v] = None if res is None else tuple(None if x is None else x.clone() for x in res)
+        assert seen == ([1] if v == "1" else [])
+    assert rc._v3_fns and not rc._v3_failed
+    return out["0"], out["1"]
+
+
+@gpu
+@pytest.mark.parametrize("score", ["lse_pos", "lse", "max"])
+@pytest.mark.parametrize("M,layout", [(512, "compact"), (2048, "compact"), (2048, "compact_a_only")])
+@pytest.mark.parametrize("prov", [True, False])
+def test_rows_v3_matches_fused2(monkeypatch, score, M, layout, prov):
+    # FSB_ROWS_V3=1 (fsb_rows_v3) == fsb_rows_fused2 bit for bit: read cells and provenance, every score, the compact
+    # 16 + 16 layout and beam a alone, provenance on and off
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    st = _bf16_stage(_layout(_stage(53 + M, M, H=8), layout))
+    ref, got = _rows_v3_pair(monkeypatch, st, score, prov=prov and not layout.endswith("a_only"))
+    assert ref is not None and int((ref[0] >= 0).sum()) > 0
+    assert _same(ref, got)
+
+
+@gpu
+@pytest.mark.parametrize("K", [1, 3, 8])
+@pytest.mark.parametrize("width", [4, 10])
+def test_rows_v3_slot_counts(monkeypatch, K, width):
+    # other read-top counts and beam widths (narrower beams leave fewer slots per query): v3 == fused2, int32 and int64
+    # outputs
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    st = _bf16_stage(_layout(_stage(61 + width, 2048, H=8), "compact"))
+    st["sel_a"] = st["sel_a"][..., :width].contiguous()
+    st["sel_b"] = st["sel_b"][..., :width].contiguous()
+    st["K"] = K
+    for dt in (torch.int64, torch.int32):
+        out = torch.empty(st["sel_a"].shape[:2] + (K,), dtype=dt, device="cuda")
+        pv = torch.empty(st["sel_a"].shape[:2] + (K,), dtype=torch.int8, device="cuda")
+        ref, got = _rows_v3_pair(monkeypatch, st, prov=True, out=out.clone(), pv_out=pv.clone())
+        assert _same(ref, got)
+
+
+@gpu
+@pytest.mark.parametrize("score", ["lse_pos", "lse"])
+def test_rows_v3_strided_stage_view(monkeypatch, score):
+    # fsb_rows_v3 on the prefill stage loop's strided query view (q_nq real rows in a wider buffer, the pad rows
+    # poisoned with NaNs) == fsb_rows_fused2 on the zero-padded packed copy, bitwise
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    st = _layout(_stage(17, 512, H=8), "compact")
+    Tp, Bq, Dh = st["q"].shape
+    nq = 100
+    qbig = torch.randn(Tp, 3 * Bq, Dh, generator=torch.Generator().manual_seed(5)).to("cuda", torch.bfloat16)
+    qbig[:, nq:Bq].fill_(float("nan"))
+    qref = torch.zeros(Tp, Bq, Dh, device="cuda", dtype=torch.bfloat16)
+    qref[:, :nq] = qbig[:, :nq]
+    args = (st["sel_a"], st["sel_b"])
+    rest = (st["qpos"], st["lam"], st["sigv"], st["cellA"], st["t_idx"], 0.125, st["s"], 4, score, st["tokK"])
+    monkeypatch.setenv("FSB_ROWS_V3", "0")
+    ref = rows.union_rerank_rows(*args, qref, *rest, prov=True)
+    monkeypatch.setenv("FSB_ROWS_V3", "1")
+    got = rows.union_rerank_rows(*args, qbig[:, :Bq], *rest, prov=True, q_nq=nq)
+    assert ref is not None and got is not None
+    assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
+
+
+@gpu
+def test_rows_v3_ties_follow_slot_order(monkeypatch):
+    # cells with identical keys tie exactly ("lse": no position term); v3 keeps fused2's first-slot winner
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    st = _bf16_stage(_layout(_stage(41, 512, H=8), "compact"))
+    tk = st["tokK"].clone()
+    kv = tk.view(1, tk.shape[1], -1, st["s"], tk.shape[-1])
+    kv[:, :, 1::2] = kv[:, :, 0:-1:2]
+    st["tokK"] = tk
+    ref, got = _rows_v3_pair(monkeypatch, st, "lse")
+    sel = ft.union_candidates(st["sel_a"], st["sel_b"])
+    u = cell_token_scores(st["q"].float(), sel, st["tokK"], st["t_idx"], 0.125, st["s"], "lse").masked_fill(sel < 0,
+                                                                                                         float("-inf"))
+    top = u.topk(5, dim=-1).values
+    assert bool((top[..., 3] == top[..., 4]).any())                    # the tie-break is exercised
+    assert _same(ref, got)
+
+
+@gpu
+@pytest.mark.parametrize("ucap", [8, 40, 512])
+def test_rows_v3_capacity_flag(monkeypatch, ucap):
+    # rows over capacity raise the deferred flag exactly as fused2 does (the stage is then redone off the fast path);
+    # within capacity the cells agree bitwise
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    from src.fsattn import fsb_rows_cuda as rc
+    monkeypatch.setattr(rows, "UCAP", ucap)
+    monkeypatch.setenv("FSB_ROWS_DEFER", "1")
+    st = _bf16_stage(_layout(_stage(43, 2048, H=8), "compact"))
+    seen = []
+    real = rc.rows_fused_cuda
+    monkeypatch.setattr(rc, "rows_fused_cuda", lambda *a, **k: seen.append(1) or real(*a, **k))
+    res, fl = {}, {}
+    for v in ("0", "1"):
+        monkeypatch.setenv("FSB_ROWS_V3", v)
+        f = []
+        res[v] = _rows_call(st, ovf_out=f)
+        fl[v] = bool(f[0])
+    assert seen == [1, 1]
+    assert fl["0"] == fl["1"]
+    if not fl["0"]:
+        assert _same(res["0"], res["1"])
+    if ucap == 8:
+        assert fl["1"]
+
+
+@gpu
+def test_rows_v3_graph_capture(monkeypatch):
+    # a CUDA-graph capture of the stage's re-rank replays fsb_rows_v3 (compiled before the capture) with the eager
+    # result
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    from src.fsattn import fsb_rows_cuda as rc
+    monkeypatch.setenv("FSB_ROWS_V3", "1")
+    st = _bf16_stage(_layout(_stage(71, 2048, H=8), "compact"))
+    Tp, Bq = st["sel_a"].shape[:2]
+    eager = _rows_call(st, out=torch.empty((Tp, Bq, 4), dtype=torch.int32, device="cuda"),
+                       pv_out=torch.empty((Tp, Bq, 4), dtype=torch.int8, device="cuda"))   # compiles the int32 config
+    assert rc._v3_fns
+    seen = []
+    real = rc._v3_function
+    monkeypatch.setattr(rc, "_v3_function", lambda *a: seen.append(1) or real(*a))
+    out = torch.full((Tp, Bq, 4), -7, dtype=torch.int32, device="cuda")
+    pv = torch.full((Tp, Bq, 4), -7, dtype=torch.int8, device="cuda")
+    flags = []
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        res = rows.union_rerank_rows(st["sel_a"], st["sel_b"], st["q"], st["qpos"], st["lam"], st["sigv"],
+                                     st["cellA"], st["t_idx"], 0.125, st["s"], 4, "lse_pos", st["tokK"],
+                                     prov=True, out=out, pv_out=pv, ovf_out=flags)
+    assert res is not None and seen == [1]
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.long(), eager[0].long()) and torch.equal(pv, eager[1])
+
+
+@gpu
+@pytest.mark.skipif(not _captures(), reason="set FSB_ROWS_CAPTURES to a directory of captured prefill stages")
+@pytest.mark.parametrize("name", _captures())
+def test_rows_v3_on_captured_stages(monkeypatch, name):
+    # captured FS-B bench-config prefill stages: fsb_rows_v3 == fsb_rows_fused2, bitwise
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    st = _load_capture(name)
+    st["sel_a"], st["sel_b"] = st["sel_a"].contiguous(), st["sel_b"].contiguous()
+    if st["sel_a"].shape[-1] + st["sel_b"].shape[-1] > 32:
+        st = _layout(st, "compact")
+    ref, got = _rows_v3_pair(monkeypatch, st, st["score"], prov=st["prov"])
+    assert ref is not None and _same(ref, got)

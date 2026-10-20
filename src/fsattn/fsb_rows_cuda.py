@@ -8,6 +8,10 @@ scan of the bitmap words' popcounts gives each present cell its rank in the asce
 the list, its count and the positions are the torch glue's, exactly. A row with more than `ud` distinct cells raises
 a device flag that the caller reads when it chooses (fsb_rows defers it to once per layer). Compiled with NVRTC at
 first use and launched through fsb_beam_cuda's driver-API helpers; without NVRTC fsb_rows keeps its Triton path.
+
+rows_fused_cuda runs the whole re-rank of a stage in one launch: fsb_rows_fused2, or with FSB_ROWS_V3=1 (contexts of
+up to V3_MC_MAX cells) fsb_rows_v3, which computes every (query, cell) score with fused2's arithmetic in fused2's
+order, so both give the same cells and provenance bit for bit, at about 0.7 of fused2's time on A100 prefill stages.
 """
 from __future__ import annotations
 
@@ -124,7 +128,60 @@ def rows_fused_ok(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tensor,
         return False
     cfg = (sel_a.device.index, Ca, Cb, K, score != "max", score == "lse_pos", bool(prov), int(prov_bit),
            out.dtype == torch.int32)
-    return not torch.cuda.is_current_stream_capturing() or cfg in _fused_fns
+    return (not torch.cuda.is_current_stream_capturing()
+            or (cfg in _v3_fns if _v3_cfg_ok(Mc, Ca, Cb) else cfg in _fused_fns))
+
+
+_v3_fns: dict = {}
+_v3_failed: list = []
+V3_MC_MAX = 1 << 14                                # cells per context fsb_rows_v3's presence bytes and rank map hold
+# fsb_rows_v3's ring (NST stages of NC key cells: one 4 KB cell per barrier, double-buffered), score window (UTILE
+# cells per top-k pass) and CTAs per SM: 34 KB of shared memory and 128 registers at 131k tokens, 4 CTAs per SM
+_V3 = dict(NC=1, NST=2, UTILE=32, MINB=4)
+
+
+def rows_v3_on() -> bool:
+    # FSB_ROWS_V3=1: fsb_rows_v3 instead of fsb_rows_fused2 (the same cells and provenance bit for bit)
+    return os.environ.get("FSB_ROWS_V3", "0") == "1" and not _v3_failed
+
+
+def _v3_cfg_ok(Mc: int, Ca: int, Cb: int) -> bool:
+    return rows_v3_on() and Mc <= V3_MC_MAX and Ca + Cb <= 32
+
+
+def _v3_source(CA: int, CB: int, KK: int, lse_mode: bool, pos_mode: bool, prov_on: bool, prov_bit: int,
+               out_i32: bool) -> str:
+    defs = dict(CA=CA, CB=CB, NT=_NT, MCW=MC_MAX // 32, KK=KK, LSE_MODE=int(lse_mode), POS_MODE=int(pos_mode),
+                PROV_ON=int(prov_on), PROV_BIT=int(prov_bit), OUT_I32=int(out_i32), V3=1, **_V3)
+    return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _SRC
+
+
+def _v3_smem(C: int, Mc: int) -> int:
+    # fsb_rows_v3's dynamic shared memory: cell list 1 KB, need bits 512 B, slot ranks C x 256 B, scan totals 64 B, then
+    # the larger of the union scratch (presence bytes and cell -> rank map of Mcp cells, need bytes 4 KB) and the key
+    # ring (+ the cells' cellA values) with the score window
+    Mcp = (Mc + 2047) // 2048 * 2048
+    ring = _V3["NST"] * _V3["NC"] * (4096 + 16) + _V3["UTILE"] * 512
+    return 1024 + 512 + C * 256 + 64 + max(3 * Mcp + 4096, ring)
+
+
+def _v3_function(dev, cfg):
+    # the compiled fsb_rows_v3 of a configuration (preferring the largest shared-memory carveout: 4 CTAs per SM take
+    # about 140 KB), None when it cannot be built (the caller then runs fsb_rows_fused2)
+    fn = _v3_fns.get(cfg)
+    if fn is None and not torch.cuda.is_current_stream_capturing():
+        from .fsb_beam_cuda import _libraries, load_function
+        try:
+            fn = load_function(dev, _v3_source(*cfg[1:]), "fsb_rows_v3")
+            _libraries()[1].cuFuncSetAttribute(fn, 9, 100)       # CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+            _v3_fns[cfg] = fn
+        except Exception as e:
+            if not _v3_failed:
+                _v3_failed.append(repr(e))
+                import warnings
+                warnings.warn(f"FS-B fsb_rows_v3 unavailable, using fsb_rows_fused2: {e!r}")
+            fn = None
+    return fn
 
 
 @torch.no_grad()
@@ -140,7 +197,10 @@ def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tenso
     Cb = 0 if sel_b is None else sel_b.shape[-1]
     cfg = (dev.index, Ca, Cb, K, score != "max", score == "lse_pos", bool(prov), int(prov_bit),
            out.dtype == torch.int32)
-    fn = _fused_fns.get(cfg)
+    fn = _v3_function(dev, cfg) if _v3_cfg_ok(Mc, Ca, Cb) else None
+    smem = _v3_smem(Ca + Cb, Mc) if fn is not None else 0
+    if fn is None:
+        fn = _fused_fns.get(cfg)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             return None
@@ -176,6 +236,6 @@ def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tenso
             P(out.data_ptr()), P(pv.data_ptr()), P(ovf.data_ptr()),
             I32(Mc), I32(ucap), I32(K4.shape[1]), I64(K4.stride(0)), I64(K4.stride(1)), I64(K4.stride(2)),
             F32(float(scale)), I64(qst0), I64(qst1), I32(nq)]
-    launch(fn, Tp, _NT, dev, args)
+    launch(fn, Tp, _NT, dev, args, smem=smem)
     return ovf
 
