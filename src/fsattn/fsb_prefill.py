@@ -83,13 +83,16 @@ def prefill_stats_on() -> bool:
 def fast_status() -> dict:
     """What the FS-B CUDA paths did in this process, for run metadata (bench_efficiency rows): the build failure that
     turned one off for the rest of the process (None: none; the CUDA beam then runs the Triton kernel, the row beam the
-    warp kernel, the row union the Triton rows path), and whether the fast prefill met a forest its fused beam does
-    not take (it then ran the stage loop's stages)."""
+    warp kernel, the lean row beam of FSB_BEAM_V2 fsb_beam_rows, the row union the Triton rows path, the re-rank of
+    FSB_ROWS_V3 fsb_rows_fused2), and whether the fast prefill met a forest its fused beam does not take (it then ran
+    the stage loop's stages)."""
     from . import fsb_beam_cuda as bc
     from . import fsb_rows_cuda as rc
     return {"beam_cuda_failure": bc._failed[0] if bc._failed else None,
             "beam_rows_failure": bc._rows_failed[0] if bc._rows_failed else None,
+            "beam_rows2_failure": bc._rows2_failed[0] if bc._rows2_failed else None,
             "rows_union_failure": rc._failed[0] if rc._failed else None,
+            "rows_v3_failure": rc._v3_failed[0] if rc._v3_failed else None,
             "fast_prefill_unfused": bool(_warned)}
 
 

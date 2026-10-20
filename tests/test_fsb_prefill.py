@@ -785,10 +785,13 @@ def test_bench_rows_record_fsb_switches_and_latches(monkeypatch):
     assert be.fsb_flags() == dict(be.FSB_FLAGS, FSB_FAST_PREFILL="0")
     monkeypatch.setattr(fsb_beam_cuda, "_failed", [])
     monkeypatch.setattr(fsb_beam_cuda, "_rows_failed", ["OSError('simulated')"])
+    monkeypatch.setattr(fsb_beam_cuda, "_rows2_failed", [])
     monkeypatch.setattr(fsb_rows_cuda, "_failed", [])
+    monkeypatch.setattr(fsb_rows_cuda, "_v3_failed", ["RuntimeError('simulated')"])
     monkeypatch.setattr(fp, "_warned", [1])
     assert be.fsb_fast_status() == {"beam_cuda_failure": None, "beam_rows_failure": "OSError('simulated')",
-                                    "rows_union_failure": None, "fast_prefill_unfused": True}
+                                    "beam_rows2_failure": None, "rows_union_failure": None,
+                                    "rows_v3_failure": "RuntimeError('simulated')", "fast_prefill_unfused": True}
 
 
 def test_scratch_budget_counts_the_layer_tables(monkeypatch):

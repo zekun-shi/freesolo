@@ -35,7 +35,8 @@ FSB_FLAGS = {"FSB_FAST_BEAM": "1", "FSB_BEAM_CUDA": "1", "FSB_BEAM_ROWS": "1", "
              "FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP": "1", "FSB_ROWS_LSE_SPLIT": "4",
              "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
              "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
-             "FSB_WINDOW_OVERLAP": "0"}
+             "FSB_WINDOW_OVERLAP": "0", "FSB_BUILD_PREFILL_TRIM": "0", "FSB_PREFILL_NOCOPY": "0", "FSB_ROWS_V3": "0",
+             "FSB_BEAM_V2": "0", "FSB_BEAM_V2_EXACT": "0"}
 
 
 def fsb_flags():
