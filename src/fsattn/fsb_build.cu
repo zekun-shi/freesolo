@@ -1825,6 +1825,58 @@ fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
     }
 }
 
+// fsb_prep_lean_dirty's counterpart for the chunks of height KLO .. KHI (>= 10) of such an ingest: TASKS holds NREC
+// _chunk_rows records, from the host, of the one chunk each head completes if its count crosses a multiple of 2^KLO
+// (the most cells the append can admit is short of 2^KLO, so a head completes at most that chunk); the records of a
+// chunk the append did complete (the head holds it after the append and did not before) stay, the others become
+// type-0 records of no chunk, which write nothing. Then NKEPT records of chunks the host found built with another fold
+// flag than this launch's: such a chunk is rebuilt where its height is dirty and the head still holds it (the
+// host-decided ingest rebuilds every chunk of a dirty height with the current flag), else nothing. After them come
+// T (KHI - KLO + 1) records, one per head and height: the empty chunk where the height is dirty (as in
+// fsb_prep_lean_dirty) and the head holds no chunk of it, which is what the host-decided ingest writes there, else
+// nothing. Every other chunk that stays in place keeps its rows (built with this layout's fold flags). Clears the
+// NFLAG completion flags of CTL the G-node records signal. One CTA.
+extern "C" __global__ void __launch_bounds__(256)
+fsb_prep_lean_tall(int* __restrict__ TASKS, int* __restrict__ CTL, const i64* __restrict__ MT0,
+                   const i64* __restrict__ NN, const int NREC, const int NKEPT, const int NFLAG, const int T,
+                   const int KLO, const int KHI) {
+    __shared__ int s_now[16], s_was[16], s_moved[16];
+    const int tid = threadIdx.x;
+    if (tid < 16) { s_now[tid] = 0; s_was[tid] = 0; s_moved[tid] = 0; }
+    for (int e = tid; e < NFLAG; e += 256) CTL[e] = 0;
+    __syncthreads();
+    const int nk = KHI - KLO + 1;
+    for (int r = tid; r < nk * T; r += 256) {
+        const int k = KLO + r / T, t = r - (r / T) * T;
+        const i64 m1 = MT0[t], m0 = m1 - NN[t];
+        const bool h1 = ((m1 >> k) & 1ll) != 0, h0 = ((m0 >> k) & 1ll) != 0;
+        const i64 j1 = h1 ? ((m1 >> (k + 1)) << 1) : 0ll, j0 = h0 ? ((m0 >> (k + 1)) << 1) : 0ll;
+        if (h1) atomicOr(&s_now[k], 1);
+        if (h0) atomicOr(&s_was[k], 1);
+        if (h1 != h0 || j1 != j0) atomicOr(&s_moved[k], 1);
+    }
+    __syncthreads();
+    for (int r = tid; r < NREC + NKEPT; r += 256) {
+        int* tk = TASKS + 10 * r;
+        const int t = tk[2], k = tk[3];
+        const i64 j = (i64)tk[4], m1 = MT0[t], m0 = m1 - NN[t];
+        const bool now = ((m1 >> k) & 1ll) != 0 && ((m1 >> (k + 1)) << 1) == j;
+        const bool was = ((m0 >> k) & 1ll) != 0 && ((m0 >> (k + 1)) << 1) == j;
+        const bool dirty = s_now[k] != 0 && (s_was[k] == 0 || s_moved[k] != 0);
+        if (r < NREC ? (!now || was) : !(dirty && now && was)) {
+            tk[0] = 0; tk[5] = 0; tk[6] = 0; tk[7] = 0; tk[8] = -1; tk[9] = -1;
+        }
+    }
+    for (int r = tid; r < nk * T; r += 256) {
+        const int k = KLO + r / T, t = r - (r / T) * T;
+        const i64 m1 = MT0[t];
+        const bool dirty = s_now[k] != 0 && (s_was[k] == 0 || s_moved[k] != 0);
+        int* tk = TASKS + 10 * (NREC + NKEPT + r);
+        tk[0] = 0; tk[1] = 0; tk[2] = t; tk[3] = k; tk[4] = (int)(m1 >> k) + 1;
+        tk[5] = (dirty && ((m1 >> k) & 1ll) == 0) ? 1 : 0; tk[6] = 0; tk[7] = 0; tk[8] = -1; tk[9] = -1;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(512)
 fsb_spine_lean(const float* __restrict__ NODE0, const i64* __restrict__ MT0,
                float* __restrict__ SP_NODE, i64* __restrict__ SP_ROOT,

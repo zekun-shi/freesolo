@@ -222,6 +222,7 @@ def _functions(dev: torch.device, Dh: int):
             sp_lean16 = _bc.load_function(dev, src, "fsb_spine_lean16")
             bld16 = _bc.load_function(dev, src, "fsb_forest_build16")
             prep_dirty = _bc.load_function(dev, src, "fsb_prep_lean_dirty")
+            prep_tall = _bc.load_function(dev, src, "fsb_prep_lean_tall")
             _, cuda = _bc._libraries()
             cuda.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             _bc._check(cuda.cuFuncSetAttribute(bld, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
@@ -237,7 +238,7 @@ def _functions(dev: torch.device, Dh: int):
             warnings.warn(f"FS-B CUDA forest build unavailable on cuda:{dev.index} for head size {Dh}, using the "
                           f"Triton builder: {e!r}")
             raise _Unavailable(repr(e)) from e
-        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16, prep_dirty)
+        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16, prep_dirty, prep_tall)
     return fn[:2]
 
 
@@ -792,7 +793,7 @@ DIRTY_KMAX = 9                                            # tallest chunk lean_d
 
 @torch.no_grad()
 def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, nn: torch.Tensor,
-                     lean, skip_mask: int = 0) -> bool:
+                     lean, skip_mask: int = 0, tall=None) -> bool:
     # _chunks_build's lean single-forest path for a decode ingest whose dirty chunk heights the device decides from the
     # append's admitted counts nn (fsb_prep_lean_dirty): records for every height up to min(Kmax, DIRTY_KMAX), the
     # clean ones empty, then the build and the spines; three launches and no host read, so a block change can be
@@ -801,6 +802,11 @@ def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: 
     # arena's rows of height k were built with this layout's fold flag (lean_fold_mask of M = lean[7]): there a chunk
     # that stays in place keeps its rows, elsewhere it is rebuilt as the host-decided path rebuilds it. Kbar, ceil_c,
     # spread, taus, E and lean as forests_cuda gets them for that path (lean with its spine outputs and task buffer).
+    # tall = (rows, kept, nflag): _chunk_rows records of the taller chunks the append may complete and of the unmoved
+    # tall chunks whose rows another fold flag built (kept: how many of the rows, at their end), nflag completion
+    # flags; fsb_prep_lean_tall keeps the completed chunks and those unmoved ones where their height is dirty, adds the
+    # empty chunks of the dirty tall heights, and one more build launch writes them (with a transient flag and
+    # slot-list buffer, as the host-decided build has).
     # False (nothing launched) where the CUDA build does not cover the inputs.
     T, _, Dh = Kbar.shape
     M = lean[7]
@@ -815,7 +821,7 @@ def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: 
     _, fold_mask, nbig = _lean_layout_info(M, _group())
     _functions(dev, Dh)
     fns = _fns[_variant(dev.index, Dh)]
-    bld_lean16, sp_lean16, prep_dirty = fns[5], fns[6], fns[8]
+    bld_lean16, sp_lean16, prep_dirty, prep_tall = fns[5], fns[6], fns[8], fns[9]
     Kbar, ceil_c, sp, adm0, mt0, M_kb, M_ce, M_spr, M_adm0 = _lean_operands(Kbar, ceil_c, spread, lean)
     P, I32 = ctypes.c_void_p, ctypes.c_int
     nrec = nk * T
@@ -832,6 +838,27 @@ def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: 
              P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(0),
              P(0), I32(M), I32(amu0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)), I32(nbig),
              I32(T), P(0), P(0)])
+    if tall is not None and int(Kmax_lean) > DIRTY_KMAX:
+        rows, nkept, nflag = tall
+        klo, khi = DIRTY_KMAX + 1, int(Kmax_lean)
+        nrow, ntot = len(rows), len(rows) + (khi - klo + 1) * T
+        recs = torch.empty((ntot, 10), dtype=torch.int32, device=dev)
+        if rows:
+            recs[:nrow].copy_(torch.tensor(rows, dtype=torch.int32).pin_memory(), non_blocking=True)
+        # the G nodes' completion flags (cleared by fsb_prep_lean_tall) and the slot lists of chunks of height >= 10,
+        # laid out as _chunks_build's (only f = 0)
+        nctl = (nflag + 3) // 4 * 4
+        work = torch.empty((nctl + (khi - klo + 1) * T * M,), dtype=torch.int32, device=dev)
+        _launch(prep_tall, 1, 256, 0, dev,
+                [P(recs.data_ptr()), P(work.data_ptr()), P(mt0.data_ptr()), P(nn.data_ptr()), I32(nrow - nkept),
+                 I32(nkept), I32(nflag), I32(T), I32(klo), I32(khi)])
+        _launch(bld_lean16, ntot, _THREADS, _smem_bytes(Dh), dev,
+                [P(recs.data_ptr()), P(lay_ptr), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
+                 P(sp.data_ptr()), P(adm0.data_ptr()), P(0), P(mt0.data_ptr()), P(mt0.data_ptr()),
+                 P(amu0.data_ptr()), P(amu0.data_ptr()), P(anx0.data_ptr()), P(anx0.data_ptr()),
+                 P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(work.data_ptr() + 4 * nctl),
+                 P(work.data_ptr()), I32(M), I32(amu0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)),
+                 I32(nbig), I32(T), P(0), P(0)])
     _launch(sp_lean16, (T + 15) // 16, _THREADS, 0, dev,
             [P(amu0.data_ptr()), P(anx0.data_ptr()), P(mt0.data_ptr()), P(sp_node.data_ptr()),
              P(sp_root.data_ptr()), P(sp_hgt.data_ptr()), I32(T), I32(amu0.shape[1]), I32(int(Kmax_lean))])

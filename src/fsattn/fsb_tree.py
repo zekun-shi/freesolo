@@ -1447,6 +1447,9 @@ class ForestCache:
         self._fold_rows = {}              # height -> the fold flag the arena's rows of that height were built with
         self._fold_pend = None            # (fold mask, heights) of an async ingest, applied to _fold_rows when settled
         self._meta_m = None               # settled counts whose chunk metadata _meta_now derives when needed
+        self._async_dm = 0                # _async_ready's bound on the new cells of the coming ingest
+        self._async_tall = False          # and whether a head's count may cross a multiple of 2^(DIRTY_KMAX + 1)
+        self._async_stale = []            # the tall heights such a crossing may dirty whose chunks another fold built
         self._plan = None                 # the V3 fused read's per-row cache of its prefix walk (fsb_decode_cuda)
 
     def _get_tau32(self, tau):
@@ -1802,9 +1805,12 @@ class ForestCache:
         # whether this block's ingest can decide its dirty chunks on the device (_ingest_async): the host knows m_tot
         # before the append (the previous ingest's counts), and every host-side value the host-decided ingest derives
         # from the new counts is the same for every count the append can produce (each head gains at most the
-        # M_vis - n_seen new cells): Kmax, no chunk taller than DIRTY_KMAX moves and, where it decides whether the
-        # layer reads (need_live), the forest is live already. Called before the append.
-        from .fsb_build_cuda import DIRTY_KMAX, _failed, _variant, build_cuda_on
+        # M_vis - n_seen new cells): Kmax and, where it decides whether the layer reads (need_live), the forest is live
+        # already. A chunk taller than DIRTY_KMAX moves only where a head's count may cross a multiple of
+        # 2^(DIRTY_KMAX + 1); there each such head completes at most one known chunk (_tall_rows), built on the device
+        # if it does, and the unmoved tall chunks keep their rows, which needs their rows built with this layout's fold
+        # flags. Called before the append.
+        from .fsb_build_cuda import DIRTY_KMAX, _failed, _variant, build_cuda_on, lean_fold_mask
         m = self._m_known
         if (m is None or self.F is None or not (self.fast and self.lean) or self._task_buf is None
                 or self._sp_stable is None or self._jbase_buf is None or self._rb is not None):
@@ -1822,8 +1828,44 @@ class ForestCache:
             return False
         if self._sp_stable["node"].shape != (self.T, k_prev + 1, self.Dh + _NA):
             return False
-        return not (k_prev > DIRTY_KMAX
-                    and any((a >> (DIRTY_KMAX + 1)) != (b >> (DIRTY_KMAX + 1)) for a, b in zip(m, hi)))
+        sh = DIRTY_KMAX + 1
+        cross = [(a >> sh) + 1 for a, b in zip(m, hi) if (a >> sh) != (b >> sh)] if k_prev > DIRTY_KMAX else []
+        stale = []
+        if cross:
+            if dm >= 1 << sh:
+                return False
+            # a crossing head's chunks change from height sh up to its completed chunk's height (that of c's lowest
+            # set bit for the boundary c 2^sh): only those heights can be dirty, and where one is, the host-decided
+            # ingest rebuilds the unmoved chunks there too, so those whose rows another fold flag built are proposed
+            # for rebuilding (_tall_rows)
+            top = max(sh + (c & -c).bit_length() - 1 for c in cross)
+            fold = lean_fold_mask(max(512, 1 << (M_vis - 1).bit_length()))
+            stale = [k for k in range(sh, top + 1)
+                     if any((mi >> k) & 1 for mi in m) and self._fold_rows.get(k) != (fold >> k) & 1]
+        self._async_dm, self._async_tall, self._async_stale = dm, bool(cross), stale
+        return True
+
+    def _tall_rows(self):
+        # the chunks taller than DIRTY_KMAX this ingest's append can complete, from m_tot before it and its most new
+        # cells: a head whose count may reach c 2^(DIRTY_KMAX + 1) completes exactly the chunk of the lowest set bit of
+        # c there, if it gets that far; then the unmoved chunks of the heights _async_ready found built with another
+        # fold flag. -> (_chunk_rows' records of each, completion flags contiguous per chunk; how many of them are the
+        # unmoved ones, at the end; the flag count)
+        from .fsb_build_cuda import DIRTY_KMAX, _chunk_rows
+        sh = DIRTY_KMAX + 1
+        rows, nflag = [], 0
+        for t, mi in enumerate(self._m_known):
+            if (mi >> sh) == ((mi + self._async_dm) >> sh):
+                continue
+            c = (mi >> sh) + 1
+            k = sh + (c & -c).bit_length() - 1
+            nflag += _chunk_rows(rows, 0, t, k, ((c << sh) >> (k + 1)) << 1, nflag)
+        nnew = len(rows)
+        for k in self._async_stale:
+            for t, mi in enumerate(self._m_known):
+                if (mi >> k) & 1:
+                    nflag += _chunk_rows(rows, 0, t, k, (mi >> (k + 1)) << 1, nflag)
+        return rows, len(rows) - nnew, nflag
 
     def _eff_could_change(self, M_vis: int, eff) -> bool:
         # whether eff(height), the per-head budget key _forest_budgets compares, can differ between m_tot now and after
@@ -1852,6 +1894,7 @@ class ForestCache:
         # host-decided ingest rebuilds every chunk of a dirty height with the current flag)
         fold, nk = lean_fold_mask(M_pad), min(Kmax, DIRTY_KMAX) + 1
         skip = sum(1 << k for k in range(nk) if self._fold_rows.get(k) == (fold >> k) & 1)
+        tall = self._tall_rows() if self._async_tall else None
         lean_arg = (self._arena_mu, self._arena_aux, self._leaf_arena, self.adm, self.m_tot, self._jbase_buf, Kmax,
                     M_pad, sp_out["node"], sp_out["root"], sp_out["height"], self._task_buf)
         Kbar, ceil_c, spread_c = self._forest_inputs(Kbar_all, ceil_all, M_vis, spread_all, lean_arg)
@@ -1859,7 +1902,7 @@ class ForestCache:
             self._zero_e = torch.zeros(1, dtype=torch.long, device=dev)
         try:
             ok = lean_dirty_build(Kbar, ceil_c, spread_c, [self._get_tau32(tau)], self._zero_e, self._mc_nn, lean_arg,
-                                  skip_mask=skip)
+                                  skip_mask=skip, tall=tall)
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:                                  # the host-decided path builds this block instead
@@ -1868,7 +1911,7 @@ class ForestCache:
             return False
         if not ok:
             return False
-        self._fold_pend = (fold, nk)
+        self._fold_pend = (fold, Kmax + 1 if tall is not None else nk)
         sp_out["m_b"] = self.m_tot
         sp_out["t_idx"] = self._t_idx_rows()
         F = dict(self.F)

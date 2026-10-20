@@ -318,7 +318,9 @@ def _budget_tables(fc):
 @pytest.mark.parametrize("L,uq,dev_budgets,busy,mix", [(1024, 0.5, True, True, None), (4096, 0.5, True, True, None),
                                                        (1024, 0.97, True, True, None), (1024, 0.97, False, True, None),
                                                        (1024, 0.5, True, False, None),
-                                                       (1024, 0.5, True, True, "decline")])
+                                                       (1024, 0.5, True, True, "decline"),
+                                                       (1024, 0.97, True, True, "kmax3"),
+                                                       (4096, 0.5, True, True, "kmax3")])
 def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets, busy, mix):
     # FSB_DECODE_ASYNC=1: a block change whose counts the host provably does not need appends, decides the dirty chunk
     # heights on the device and rebuilds them with no synchronizing call (checked with torch's sync debug mode, with
@@ -330,7 +332,9 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
     # heights are a block old, so they are recomputed from the spines' heights on the device, never from the stale host
     # heights. busy False: the stream is idle at every block change (a loop that synchronises every token). mix
     # "decline": every other device-decided ingest declines (its forest reads its counts and takes the host-decided
-    # path inside a block whose other forests stay on the device), so blocks mix the two paths (no sync guard then)
+    # path inside a block whose other forests stay on the device), so blocks mix the two paths (no sync guard then);
+    # "kmax3": chunks taller than 8 cells count as tall, so heads cross their boundaries every few blocks and the
+    # device completes those chunks from the host's proposals
     from src.fsattn import fsb_build_cuda as fbc
     from src.fsattn import fsb_tree as ft
     m = _model(monkeypatch, L, n_layers=2)
@@ -338,12 +342,15 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
     forced = torch.randint(0, 512, (700,), generator=torch.Generator().manual_seed(103)).cuda()
     monkeypatch.setenv("FSB_DECODE_V2", "1")
     monkeypatch.setenv("FSB_DECODE_FORK", "1")
-    ran, real = [], fbc.lean_dirty_build
+    ran, talls, real = [], [], fbc.lean_dirty_build
 
     def spy_build(*a, **k):
+        talls.append(k.get("tall") is not None and len(k["tall"][0]) > 0)
         ran.append(False if mix == "decline" and len(ran) % 2 else real(*a, **k))
         return ran[-1]
     monkeypatch.setattr(fbc, "lean_dirty_build", spy_build)
+    if mix == "kmax3":
+        monkeypatch.setattr(fbc, "DIRTY_KMAX", 3)
     opened, real_bud = [], ft._forest_budgets
 
     def spy_budgets(attn, fc, *a):
@@ -358,6 +365,7 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
     for asy in ("0", "1"):
         monkeypatch.setenv("FSB_DECODE_ASYNC", asy)
         ran.clear()
+        talls.clear()
         opened.clear()
         restore()
         gd = _decoder(m, prompt, len(forced))
@@ -397,6 +405,8 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets
             assert (asy == "1") == (any(ran) and not all(ran)), (asy, ran)
         else:
             assert (len(ran) > 0 and all(ran)) == (asy == "1"), (asy, ran)
+        if mix == "kmax3":
+            assert (sum(talls) > 0) == (asy == "1"), (asy, talls)
         assert any(opened) if (asy == "1" and uq == 0.97) else (asy == "1" or not any(opened)), opened
     (l0, s0, t0, h0), (l1, s1, t1, h1) = runs["0"], runs["1"]
     assert len(t0) == len(t1) >= 5
@@ -530,6 +540,46 @@ def test_static_tables_from_a_side_stream_reach_the_others_in_order(monkeypatch)
     ft._SIDE_PHASE[0] = False
     ft._static_put(("y",), 0)
     assert ("t",) not in ft._STATIC_CACHE and not ft._STATIC_EVENTS
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("base", [1016, 2040])
+def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base):
+    # FSB_DECODE_ASYNC: an ingest during which a head's admitted count may cross a multiple of 1024 decides it on the
+    # device too: the host proposes the one chunk each such head completes if it gets there (height 10 when the count
+    # passes 1024 or 3072, 11 at 2048, ...), fsb_prep_lean_tall keeps the completed ones and the empty chunks of the
+    # heights they leave, and every table equals the host-decided ingest's bit for bit, including heads that come within
+    # reach of the boundary without crossing it and heads that cross a block later. base: the visible cells of the first
+    # (host-decided) ingest, below 1024 or 2048. From 1016, the ingest at 1028 cells lays the forest out for 2048
+    # (height 10's fold flag turns on) while heads that crossed earlier hold height-10 chunks built without it: the host
+    # proposes those for rebuilding too, which happens where height 10 is dirty, as the host-decided ingest does
+    from src.fsattn import fsb_build_cuda as fbc
+    T, Dh, dev = 16, 64, torch.device("cuda")
+    M_cap = base + 64
+    g = torch.Generator(device="cuda").manual_seed(11)
+    Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
+    ceil = torch.rand(1, T, M_cap, device=dev, generator=g) + 0.5
+    for t in range(1, T):                                   # head t drops t cells: counts spread around the boundary
+        ceil[0, t, torch.randperm(base, generator=torch.Generator().manual_seed(t))[:t].to(dev)] = -1.0
+    ceil[0, 3, base + 7:] = -1.0                            # head 3 stops 4 short of the boundary: in reach, never over
+    tau = torch.zeros(T, device=dev)
+    talls, real = [], fbc.lean_dirty_build
+    monkeypatch.setattr(fbc, "lean_dirty_build", lambda *a, **k: talls.append(k.get("tall")) or real(*a, **k))
+    seq = tuple(base + 4 * i for i in range(10))
+    t0, h0, _ = _ingests(Kbar, ceil, tau, M_cap, seq, False)
+    t1, h1, on_dev = _ingests(Kbar, ceil, tau, M_cap, seq, True)
+    for a, b in zip(t0, t1):
+        assert all(torch.equal(_bits(x), _bits(y)) for x, y in zip(a, b))
+    assert h0 == h1
+    bound = (base + 8) // 1024 * 1024
+    m0, m1 = t0[0][4], t0[-1][4]
+    crossed = (m0 < bound) & (m1 >= bound)
+    assert int(crossed.sum()) >= 3 and bool((m0 < bound).any() & (m1 < bound).any()), (m0.tolist(), m1.tolist())
+    # every ingest after the first decides on the device, several of them with tall chunks proposed
+    assert on_dev == list(seq[1:]) and len(talls) == len(on_dev), (on_dev, len(talls))
+    assert sum(t is not None and len(t[0]) > 0 for t in talls) >= 3
+    assert (base == 1016) == any(t is not None and t[1] > 0 for t in talls), [t and t[1] for t in talls]
 
 
 @gpu
