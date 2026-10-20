@@ -331,7 +331,7 @@ if _HAVE_TRITON:
         cmask = c < C
 
         topp_val = tl.load(TOPP + bh * Pk + c, mask=c < Pk, other=0).to(tl.int64)
-        near_val = hi.to(tl.int64) - (c - Pk).to(tl.int64)
+        near_val = (hi - (c - Pk)).to(tl.int64)
         cand = tl.where(c < Pk, topp_val, near_val)
         cand_valid = (cand >= 0) & cmask
         cc = tl.maximum(cand, 0)

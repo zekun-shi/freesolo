@@ -26,12 +26,13 @@ if not kvb._HAVE_TRITON:
 H, D, S, W, P, WC, BQ = 16, 64, 32, 512, 64, 8, 128
 
 
-def _attn(seed=3, w_dtype=torch.bfloat16):
+def _attn(seed=3, w_dtype=torch.bfloat16, cfg=(S, W, P, WC)):
     from src.fsattn.attention import FSAttn
     torch.manual_seed(seed)
-    a = FSAttn(d_model=H * D, n_heads=H, window_size=W, causal=True, use_rope=True, rope_long_range=False,
-               fs_uniform_sr=True, max_seq_len=16384, cell_stride=S, cell_topk=4, sel_strict_causal=1,
-               cell_prune_kernel=1, cell_prune_pool=P, cell_prune_window=WC).cuda().to(w_dtype).eval()
+    s, w, p, wc = cfg
+    a = FSAttn(d_model=H * D, n_heads=H, window_size=w, causal=True, use_rope=True, rope_long_range=False,
+               fs_uniform_sr=True, max_seq_len=16384, cell_stride=s, cell_topk=4, sel_strict_causal=1,
+               cell_prune_kernel=1, cell_prune_pool=p, cell_prune_window=wc).cuda().to(w_dtype).eval()
     with torch.no_grad():
         a.lr_norm.scale.copy_(0.8 + 0.4 * torch.randn(D, device="cuda"))
         a.long_range_scale.copy_(0.2 * torch.randn(H, 1, 1, device="cuda"))
@@ -52,26 +53,29 @@ def _kv(N, seed, ties=False, B=1):
     return K, V
 
 
-def _stats(K, ncell):
+def _stats(K, ncell, s=S):
     B = K.shape[0]
-    Kc = K[:, :, :ncell * S].reshape(B, H, ncell, S, D)
+    Kc = K[:, :, :ncell * s].reshape(B, H, ncell, s, D)
     return Kc.mean(dim=3).float(), Kc.float().norm(dim=-1).amax(dim=-1)
 
 
-def _readable(ceil, ncell, blk):
-    # the cells the block at blk (and every later step) can read: its top P and the cells from the window start on
+def _readable(ceil, ncell, blk, cfg=(S, W, P, WC)):
+    # the cells the block at blk (and every later step) can read: its top P, and every cell from the first one its
+    # window or its newest-cell candidates reach
+    s, w, p, wc = cfg
     B = ceil.shape[0]
-    m = min(blk // S, ncell)
+    m = min(blk // s, ncell)
     want = torch.zeros(B, H, ncell, dtype=torch.bool, device="cuda")
-    want[:, :, max(0, min((blk - W) // S, m - WC)) if m > 0 else 0:] = True
+    want[:, :, max(0, min((blk - w) // s, m - wc)) if m > 0 else 0:] = True
     if m > 0:
-        want.scatter_(2, ceil[:, :, :m].topk(min(P, m), dim=-1).indices, True)
+        want.scatter_(2, ceil[:, :, :m].topk(min(p, m), dim=-1).indices, True)
     return want
 
 
 def _check_held(st, K, V, kbar, ncell, want):
     # the held set is exactly want, every held cell's slot carries its int8 rows, scales and mean key
     B = K.shape[0]
+    S = st.s
     held = st.slot_of[:, :, :ncell] >= 0
     assert torch.equal(held, want)
     assert (st.slot_of[:, :, ncell:] < 0).all()
@@ -124,16 +128,21 @@ def test_prefill_holds_the_readable_cells_as_the_int8_store(N, ties):
 
 
 @pytest.mark.parametrize("ties", [False, True])
-def test_blocks_refresh_like_the_reference_pool_and_drop_unreadable_cells(ties):
-    # prompt, then 40 decode blocks of 4 completed cells each: after every refresh the pool equals
-    # fsl_pool_refresh over the full statistics and the store holds exactly the readable cells
-    a = _attn()
+@pytest.mark.parametrize("cfg", [(S, W, P, WC), (64, 500, 37, 12), (16, 64, 16, 8), (32, 96, 64, 8)])
+def test_blocks_refresh_like_the_reference_pool_and_drop_unreadable_cells(ties, cfg):
+    # prompt, then 40 decode blocks of completed cells: after every refresh the pool equals fsl_pool_refresh over
+    # the full statistics, the store holds exactly the readable cells, and never more than its slots (the released
+    # cell size / window / pool, and others: a window that is not a whole number of cells, newest cells reaching
+    # further back than the window, cells smaller than the window's tile)
+    S, W, P, WC = cfg
+    a = _attn(cfg=cfg)
     N0, nblk = 4096 + 40, 40
     Nmax = N0 + nblk * BQ + BQ
     K, V = _kv(Nmax, seed=7 + ties, ties=ties)
     st = kvb.SlotStore(a, 1, Nmax // S + 1, "cuda")
+    assert st.n_slots == P + max(-(-W // S), WC) + BQ // S + 1
     ncell = N0 // S
-    kbar, ceil = _stats(K, Nmax // S)
+    kbar, ceil = _stats(K, Nmax // S, S)
     st.prefill(K[:, :, :N0], V[:, :, :N0], kbar[:, :, :ncell], ceil[:, :, :ncell], N0)
     pool = None
     peak = 0
@@ -153,7 +162,7 @@ def test_blocks_refresh_like_the_reference_pool_and_drop_unreadable_cells(ties):
             assert torch.equal(pool[k], ref[k]), (blk, k)
         assert pool["M_vis"] == m and pool["C"] == pk + WC
         _check_held(st, K[:, :, :ncell * S], V[:, :, :ncell * S], kbar[:, :, :ncell], ncell,
-                    _readable(ceil, ncell, blk))
+                    _readable(ceil, ncell, blk, cfg))
     assert peak <= st.n_slots
 
 
