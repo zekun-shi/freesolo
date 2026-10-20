@@ -52,7 +52,11 @@ def ruler_driver(monkeypatch):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     for name in (*FAST_FLAGS, *GRAPH_FLAGS, *ROWS_FLAGS, "FSB_DECODE_V2", "FSB_DECODE_FORK", "FS_PRUNE_KERNEL",
                  "FS_FUSED_ATTN"):
-        monkeypatch.delenv(name, raising=False)
+        # set first, then delete: delenv alone records nothing for an unset variable, so the values eval_ruler.py
+        # sets itself (FS_FUSED_ATTN on import, FSB_TRAIN_GRAPH and FSB_DECODE_GRAPH in main) would outlive the test
+        # and reach every later test of the session
+        monkeypatch.setenv(name, "0")
+        monkeypatch.delenv(name)
     monkeypatch.setattr(sys, "path", list(sys.path))
     path = Path(__file__).resolve().parents[1] / "eval_ruler.py"
     spec = importlib.util.spec_from_file_location("ruler_metadata_test", path)
