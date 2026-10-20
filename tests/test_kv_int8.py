@@ -412,6 +412,9 @@ def test_lr_comb_int8_matches_bf16(monkeypatch, serve):
                    attn_type="fsattn", **kw).cuda().to(torch.bfloat16).eval()
     prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(59)).cuda()
     monkeypatch.setenv("FS_KV_INT8", "1")
+    # the full int8 store, whose history and buffers this test reads (the bounded store, FSL_KV_BOUNDED=1, keeps
+    # neither: tests/test_kv_bounded.py checks its reads against this store)
+    monkeypatch.setenv("FSL_KV_BOUNDED", "0")
     gd = GraphedDecoder(m, prompt, Lmax=L + 64, device="cuda", dtype=torch.bfloat16)
     gd.prefill()
     for c in gd.cache:
