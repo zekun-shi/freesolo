@@ -650,10 +650,14 @@ def _rows2(monkeypatch, *args, **kw):
 @gpu
 @pytest.mark.parametrize("Bq", [128, 77, 200])
 @pytest.mark.parametrize("node_score,rc_tensor", [("bound", False), ("bound", True), ("mean", False)])
-def test_rows2_key64_matches_rows(monkeypatch, Bq, node_score, rc_tensor):
-    # the lean kernel with 64-bit keys (every score bit above the child index) == fsb_beam_rows bitwise: both beams'
-    # cells, in order, and visit counts; rows that fill a block partly or need two, and a quarter of the rows with
-    # per-query widths 0..16 and budgets 2^0..2^8 (roots carried at once, width-0 queries)
+@pytest.mark.parametrize("build", ["exact", "key64"])
+def test_rows2_exact_builds_match_rows(monkeypatch, Bq, node_score, rc_tensor, build):
+    # the lean kernel's exact build (FSB_BEAM_V2_EXACT: 32-bit keys, score-bit ties redone on 64-bit keys) and its
+    # 64-bit-key test build == fsb_beam_rows bitwise: both beams' cells, in order, and visit counts; rows that fill a
+    # block partly or need two, and a quarter of the rows with per-query widths 0..16 and budgets 2^0..2^8 (roots
+    # carried at once, width-0 queries)
+    if build == "exact":
+        monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
     beams, q, qpos, lam, sigv = _bf16_pair(51 + Bq, Bq=Bq)
     (F, SP, W, bud, _), (Fu, SPu, Wu, budu, _) = beams
     rows = q.shape[0]
@@ -668,10 +672,35 @@ def test_rows2_key64_matches_rows(monkeypatch, Bq, node_score, rc_tensor):
     monkeypatch.setenv("FSB_BEAM_V2", "0")
     ref = bc.forest_beam_rows_cuda(*args)
     names = _launch_names(monkeypatch)
-    got = _rows2(monkeypatch, *args, key64=True)
+    got = _rows2(monkeypatch, *args, key64=build == "key64")
     assert names() == ["fsb_beam_rows2"]
     assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
     assert bool((W == 0).any()) and bool((got[0][0][W == 0] == -1).all())
+
+
+@gpu
+def test_rows2_exact_build_resolves_score_bit_ties(monkeypatch):
+    # siblings with one mean and one prior and radii a relative 2^-20 apart score a few units in the last place apart,
+    # the right child higher: fsb_beam_rows ranks it first, the 32-bit keys mostly see equal score bits and rank the
+    # left child first. The exact build redoes those levels with 64-bit keys and matches fsb_beam_rows bitwise.
+    beams, q, qpos, lam, sigv = _bf16_pair(81)
+    for F, *_ in beams:
+        mu, aux = fsb_tree._beam_views(F)
+        t, n = ((aux[..., 4] >= 0) & (aux[..., 5] >= 0)).nonzero(as_tuple=True)
+        lc, rc_ = aux[t, n, 4].long(), aux[t, n, 5].long()
+        mu[t, rc_] = mu[t, lc]
+        aux[t, rc_, 1:3] = aux[t, lc, 1:3]
+        aux[t, rc_, 0] = aux[t, lc, 0] * (1.0 + 2.0 ** -20)
+    args = (beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "0")
+    ref = bc.forest_beam_rows_cuda(*args)
+    fast32 = _rows2(monkeypatch, *args)
+    differ = sum(int((r[0] != o[0]).any(-1).sum()) for r, o in zip(ref, fast32))
+    assert differ > q.shape[0] * q.shape[1] // 10, differ
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    got = _rows2(monkeypatch, *args)
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
 
 
 @gpu

@@ -1425,9 +1425,11 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
 // dots and scores, restructured around four changes:
 // - selection by sorting networks on packed keys, key = (order-preserving bits of the score, low 5 bits cleared) |
 //   (31 - child index): each lane sorts the keys of its 8 frontier slots' children (16 keys, Batcher's network) and the
-//   lane pair merges the two sorted halves (bitonic), so lane h ends with ranks 8 h .. 8 h + 7. Two children whose
-//   scores agree in their top 27 bits (relative 2^-18) are ordered by child index, where the rank counting of
-//   fsb_beam_rows orders them by the low bits (the KEY64 test build keeps every bit and matches it exactly);
+//   lane pair merges the two sorted halves (bitonic), so lane h ends with ranks 8 h .. 8 h + 7. The 32-bit order is
+//   fsb_beam_rows' (score desc, child asc) except for two children whose scores agree in their top 27 bits (relative
+//   2^-18), which it orders by child index; the EXACT build (FSB_BEAM_V2_EXACT=1) finds such pairs among a query's
+//   ranks 0..k (k kept) and has the warp select that level again with 64-bit keys, so it selects exactly as
+//   fsb_beam_rows (and so does the KEY64 test build, 64-bit keys at every level);
 // - per-query state in registers: the open frontier (union slots in rank order, a byte each, with 4-bit codes of the
 //   union's nodes staged for the block's budget); carried nodes, which never expand again, leave it for a
 //   shared-memory prefix in carry order;
@@ -1445,26 +1447,23 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
 static_assert(UC2 >= 32 && UC2 <= UMAX && UC2 <= 128 && (UC2 & (UC2 - 1)) == 0 && DCH == 64 && WM == 16 && R <= 4 &&
               DH == 64 && QB == 128, "fsb_beam_rows2's configuration");
 
-// KEY64 (a test build): 64-bit keys holding all 32 order-preserving score bits above the child index, i.e. exactly
-// fsb_beam_rows' (score desc, child asc) order, which shows the 32-bit keys' truncation is their only deviation
-#if KEY64
-typedef unsigned long long skey;
-__device__ __forceinline__ skey kmax(const skey a, const skey b) { return a > b ? a : b; }
-__device__ __forceinline__ skey kmin(const skey a, const skey b) { return a > b ? b : a; }
-#else
-typedef unsigned skey;
-__device__ __forceinline__ skey kmax(const skey a, const skey b) { return umax(a, b); }
-__device__ __forceinline__ skey kmin(const skey a, const skey b) { return umin(a, b); }
-#endif
+// Selection keys: 32-bit (unsigned: the score's top 27 order-preserving bits, then 31 - child index) or 64-bit (u64:
+// all 32 score bits above the child index, exactly fsb_beam_rows' (score desc, child asc) order). The levels select with
+// 32-bit keys; the EXACT build redoes a warp's selection with 64-bit keys when two of a query's ranks 0..k agree in the
+// 32-bit keys' score bits, the only case where the two orders can differ; the KEY64 test build uses 64-bit keys only.
+typedef unsigned long long u64;
 
-__device__ __forceinline__ void ce_desc(skey& a, skey& b) {                  // a <- max, b <- min
-    const skey x = kmax(a, b);
+template <typename K> __device__ __forceinline__ K kmax(const K a, const K b) { return a > b ? a : b; }
+template <typename K> __device__ __forceinline__ K kmin(const K a, const K b) { return a > b ? b : a; }
+
+template <typename K> __device__ __forceinline__ void ce_desc(K& a, K& b) {   // a <- max, b <- min
+    const K x = kmax(a, b);
     b = kmin(a, b);
     a = x;
 }
 
 // Batcher's odd-even merge sort of 16 keys, descending (63 compare-exchanges)
-__device__ __forceinline__ void sort16_desc(skey (&k)[16]) {
+template <typename K> __device__ __forceinline__ void sort16_desc(K (&k)[16]) {
 #define CE(a, b) ce_desc(k[a], k[b])
     CE(0,1); CE(2,3); CE(4,5); CE(6,7); CE(8,9); CE(10,11); CE(12,13); CE(14,15); CE(0,2); CE(1,3); CE(4,6); CE(5,7);
     CE(8,10); CE(9,11); CE(12,14); CE(13,15); CE(1,2); CE(5,6); CE(9,10); CE(13,14); CE(0,4); CE(1,5); CE(2,6);
@@ -1473,6 +1472,31 @@ __device__ __forceinline__ void sort16_desc(skey (&k)[16]) {
     CE(7,15); CE(4,8); CE(5,9); CE(6,10); CE(7,11); CE(2,4); CE(3,5); CE(6,8); CE(7,9); CE(10,12); CE(11,13); CE(1,2);
     CE(3,4); CE(5,6); CE(7,8); CE(9,10); CE(11,12); CE(13,14);
 #undef CE
+}
+
+// the top 16 of a lane pair's 32 keys, ranked: each lane sorts its 16 (lane 0: A, lane 1: B, descending), the first
+// stage of the bitonic merge of A with B reversed keeps c[j] = max(A[j], B[15 - j]) (lane 0 forms j < 8, lane 1 j >= 8:
+// one shuffle each), the second splits c: lane 0 the larger 8 (ranks 0-7), lane 1 the rest (ranks 8-15), each sorted
+// by a bitonic 8-sorter. Returns rank 16 (the largest of the first stage's discarded min(A[j], B[15 - j])).
+template <typename K> __device__ __forceinline__ K pair_top16(K (&key)[16], K (&r8)[8], const int h) {
+    sort16_desc(key);
+    K c[8], d = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const K mine = h ? key[7 - i] : key[i];                     // lane 0: A[i], lane 1: B[7 - i] (j = 8 + i)
+        const K other = __shfl_xor_sync(FULL, h ? key[15 - i] : key[8 + i], 1);   // B[15 - i], A[8 + i]
+        c[i] = kmax(mine, other);
+        d = kmax(d, kmin(mine, other));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const K other = __shfl_xor_sync(FULL, c[i], 1);             // lane 0 gets c[8 + i], lane 1 c[i]
+        r8[i] = h ? kmin(c[i], other) : kmax(c[i], other);
+    }
+    ce_desc(r8[0], r8[4]); ce_desc(r8[1], r8[5]); ce_desc(r8[2], r8[6]); ce_desc(r8[3], r8[7]);
+    ce_desc(r8[0], r8[2]); ce_desc(r8[1], r8[3]); ce_desc(r8[4], r8[6]); ce_desc(r8[5], r8[7]);
+    ce_desc(r8[0], r8[1]); ce_desc(r8[2], r8[3]); ce_desc(r8[4], r8[5]); ce_desc(r8[6], r8[7]);
+    return kmax(d, __shfl_xor_sync(FULL, d, 1));
 }
 
 // slot of the r-th byte of a lane's 8 packed bytes (lo: bytes 0-3, hi: 4-7)
@@ -1513,21 +1537,19 @@ __device__ __forceinline__ unsigned pack2_bf16(const float x, const float y) {
 
 // the selection key of a child with score s and child index c, or 0 when it has no child (exists false) or its score is
 // not above the reference's -5e8 (NaN included): the order-preserving bits of s (sign bit set for s >= 0, every bit
-// flipped below) with the low 5 bits replaced by 31 - c, so equal tops rank the earlier child first. A mean score can
-// be -0 (a -0 dot and a -0 prior), which counts as +0; a bound score never is (with a radius coefficient >= 0 its
-// radius term is +0 or positive).
-__device__ __forceinline__ skey child_key(const float s, const int c, const bool exists) {
+// flipped below) with the low 5 bits replaced by 31 - c (32-bit keys) or followed by 31 - c (64-bit keys), so equal
+// score bits rank the earlier child first. A mean score can be -0 (a -0 dot and a -0 prior), which counts as +0; a
+// bound score never is (with a radius coefficient >= 0 its radius term is +0 or positive). A real child's 32-bit key
+// is at least 32 (its score bits are not all zero).
+template <typename K> __device__ __forceinline__ K child_key(const float s, const int c, const bool exists) {
 #if BOUND
     const unsigned u = __float_as_uint(s);
 #else
     const unsigned u = __float_as_uint(f_add(s, 0.0f));
 #endif
     const unsigned o = u ^ ((unsigned)((int)u >> 31) | 0x80000000u);
-#if KEY64
-    return (exists && s > -5e8f) ? (((skey)o << 32) | (skey)(31 - c)) : (skey)0;
-#else
-    return (exists && s > -5e8f) ? ((o & ~31u) | (unsigned)(31 - c)) : 0u;
-#endif
+    if (sizeof(K) == 8) return (exists && s > -5e8f) ? (K)(((u64)o << 32) | (u64)(31 - c)) : (K)0;
+    return (exists && s > -5e8f) ? (K)((o & ~31u) | (unsigned)(31 - c)) : (K)0;
 }
 
 // one dot chunk of a warp (union slots [cd, cd + DCH), all of the union when !CHUNKED): the mma of its 16 queries with
@@ -1535,8 +1557,8 @@ __device__ __forceinline__ skey child_key(const float s, const int c, const bool
 // second load; rows past the union repeat its last row), bf16 after the scale as fsb_beam_rows, then this lane's
 // children's keys from their dot pair and score-term pair (a frontier slot's two children sit at union slots 2 pi,
 // 2 pi + 1, pi = base / 2 of the slot's base in bv; pk holds the child bits)
-template <bool CHUNKED>
-__device__ __forceinline__ void chunk_keys(skey (&key)[16], const unsigned* s_mu, unsigned* s_dw, const float4* s_ux2,
+template <bool CHUNKED, typename K>
+__device__ __forceinline__ void chunk_keys(K (&key)[16], const unsigned* s_mu, unsigned* s_dw, const float4* s_ux2,
                                            const unsigned (&qa)[4][4], const unsigned bv_lo, const unsigned bv_hi,
                                            const unsigned pk, const float qn, const float scale, const int Pc,
                                            const int cd, const int lane, const int h) {
@@ -1595,11 +1617,52 @@ __device__ __forceinline__ void chunk_keys(skey (&key)[16], const unsigned* s_mu
         const float sr = f_add(dr, tm.w);
 #endif
         const int c = 2 * (8 * h + jj);
-        if (!CHUNKED || (two & 1u)) key[2 * jj] = CHUNKED ? child_key(sl, c, true) : child_key(sl, c, (two & 1u) != 0u);
-        if (!CHUNKED || (two & 2u)) key[2 * jj + 1] = CHUNKED ? child_key(sr, c + 1, true)
-                                                              : child_key(sr, c + 1, (two & 2u) != 0u);
+        if (!CHUNKED || (two & 1u))
+            key[2 * jj] = CHUNKED ? child_key<K>(sl, c, true) : child_key<K>(sl, c, (two & 1u) != 0u);
+        if (!CHUNKED || (two & 2u))
+            key[2 * jj + 1] = CHUNKED ? child_key<K>(sr, c + 1, true) : child_key<K>(sr, c + 1, (two & 2u) != 0u);
     }
     __syncwarp();
+}
+
+// a warp's children's keys (all of the union, or DCH slots at a time) and the lane pair's ranked top 16 (pair_top16);
+// final queries hold no keys. Returns rank 16.
+template <typename K>
+__device__ __forceinline__ K warp_select(K (&r8)[8], const unsigned* s_mu, unsigned* s_dw, const float4* s_ux2,
+                                         const unsigned (&qa)[4][4], const unsigned bv_lo, const unsigned bv_hi,
+                                         const unsigned pk, const float qn, const float scale, const int Pc,
+                                         const int lane, const int h) {
+    K key[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) key[i] = 0;
+    if (Pc <= DCH) {
+        chunk_keys<false>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, 0, lane, h);
+    } else {
+        for (int cd = 0; cd < Pc; cd += DCH)
+            chunk_keys<true>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, cd, lane, h);
+    }
+    return pair_top16(key, r8, h);
+}
+
+// the new open entries from a lane's ranks 8 h .. 8 h + 7: the kept ranks (below k, the free slots after the carried
+// prefix), their union slots from the child index in the key (s_cs: the query's open ranks' left child slots)
+template <typename K>
+__device__ __forceinline__ int open_slots(const K (&r8)[8], const unsigned char* cs, const int k, const int h,
+                                          unsigned& nlo, unsigned& nhi) {
+    nlo = 0u; nhi = 0u;
+    int nv = 0;
+#pragma unroll
+    for (int jj = 0; jj < 8; jj++) {
+        const K kk = r8[jj];
+        const int cix = 31 - (int)(kk & 31u);
+        const unsigned slot = (unsigned)(cs[cix >> 1] + (cix & 1));
+        if (8 * h + jj < k && kk != 0) {
+            if (jj < 4) nlo |= slot << (8 * jj);
+            else nhi |= slot << (8 * (jj - 4));
+            nv++;
+        }
+    }
+    return nv;
 }
 
 extern "C" __global__ void __launch_bounds__(NT, MINB2)
@@ -1929,56 +1992,52 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
             PMARK(7);
         } else {
             // ---- C: the warp's dots with the union, DCH slots at a time (bf16 after the scale, as fsb_beam_rows), and
-            // the keys of this lane's children (frontier slots 8 h + jj, left then right); a slot's two children are
-            // one dot pair and one pair of score terms
+            // the keys of this lane's children (frontier slots 8 h + jj, left then right; a slot's two children are
+            // one dot pair and one pair of score terms); D: the pair's ranks 0-15 (pair_top16) and the new open entries
             *reinterpret_cast<uint2*>(s_cs + qi * 16 + 8 * h) = make_uint2(bv_lo, bv_hi);
-            skey key[16];
-#pragma unroll
-            for (int i = 0; i < 16; i++) key[i] = 0u;
             unsigned* s_dw = s_dot + wid * (16 * (DCH / 2));
             const float4* s_ux2 = reinterpret_cast<const float4*>(s_ux);
-            const bool wact = __any_sync(FULL, !done);
-            if (wact) {
-                if (Pc <= DCH) {
-                    chunk_keys<false>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, 0, lane, h);
-                } else {
-                    for (int cd = 0; cd < Pc; cd += DCH)
-                        chunk_keys<true>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, cd, lane, h);
-                }
-            }
-            PMARK(5);
-            if (wact) {
-                // ---- D: rank the children: each lane sorts its 16 keys, the pair keeps the top 16 of both (the first
-                // stage of the bitonic merge of one list with the other reversed), and the bitonic halves split: lane 0
-                // the larger 8 (ranks 0-7), lane 1 the rest (ranks 8-15). Final queries hold no keys.
-                sort16_desc(key);
-                skey c[16];
+            if (__any_sync(FULL, !done)) {
+                unsigned nlo, nhi;
+                int nv;
+#if KEY64
+                u64 r8[8];
+                warp_select(r8, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, lane, h);
+                PMARK(5);
+                nv = open_slots(r8, s_cs + qi * 16, k, h, nlo, nhi);
+#else
+                unsigned r8[8];
+                const unsigned r16 = warp_select(r8, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, lane, h);
+                PMARK(5);
+                bool redo = false;
+#if EXACT
+                // the 32-bit ranks 0..k are fsb_beam_rows' unless two of them share their score bits (ranks r, r + 1
+                // of real children, keys >= 32): then the warp selects again with 64-bit keys. Ranks 7 / 8 and
+                // 15 / 16 are checked by lane 1.
+                const unsigned r7 = __shfl_xor_sync(FULL, r8[7], 1);
+                bool tie = false;
 #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    const skey mine = h ? key[15 - i] : key[i];
-                    c[i] = kmax(mine, __shfl_xor_sync(FULL, mine, 1));
+                for (int j = 0; j < 7; j++) tie |= 8 * h + j + 1 <= k && r8[j] >= 32u && (r8[j] ^ r8[j + 1]) < 32u;
+                if (h) {
+                    tie |= k >= 8 && r7 >= 32u && (r7 ^ r8[0]) < 32u;
+                    tie |= k >= 16 && r8[7] >= 32u && (r8[7] ^ r16) < 32u;
                 }
-                skey r8[8];
-#pragma unroll
-                for (int i = 0; i < 8; i++) r8[i] = h ? kmin(c[i], c[i + 8]) : kmax(c[i], c[i + 8]);
-                ce_desc(r8[0], r8[4]); ce_desc(r8[1], r8[5]); ce_desc(r8[2], r8[6]); ce_desc(r8[3], r8[7]);
-                ce_desc(r8[0], r8[2]); ce_desc(r8[1], r8[3]); ce_desc(r8[4], r8[6]); ce_desc(r8[5], r8[7]);
-                ce_desc(r8[0], r8[1]); ce_desc(r8[2], r8[3]); ce_desc(r8[4], r8[5]); ce_desc(r8[6], r8[7]);
-                // the new open entries: the kept ranks (below k = the free slots after the carried prefix), their
-                // union slots from the child index in the key
-                unsigned nlo = 0u, nhi = 0u;
-                int nv = 0;
-#pragma unroll
-                for (int jj = 0; jj < 8; jj++) {
-                    const skey kk = r8[jj];
-                    const int cix = 31 - (int)(kk & 31u);
-                    const unsigned slot = (unsigned)(s_cs[qi * 16 + (cix >> 1)] + (cix & 1));
-                    if (8 * h + jj < k && kk != 0u) {
-                        if (jj < 4) nlo |= slot << (8 * jj);
-                        else nhi |= slot << (8 * (jj - 4));
-                        nv++;
-                    }
+                redo = __any_sync(FULL, tie);
+#ifdef PROF
+                if (lane == 0 && FBC != nullptr) {                     // selecting warp-levels, and those redone
+                    atomicAdd(FBC + 121, 1);
+                    if (redo) atomicAdd(FBC + 120, 1);
                 }
+#endif
+                if (redo) {
+                    u64 x8[8];
+                    warp_select(x8, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, lane, h);
+                    nv = open_slots(x8, s_cs + qi * 16, k, h, nlo, nhi);
+                }
+#endif
+                if (!redo) nv = open_slots(r8, s_cs + qi * 16, k, h, nlo, nhi);
+                (void)r16;
+#endif
                 const int nvo = __shfl_xor_sync(FULL, nv, 1);
                 if (!done) {
                     o_lo = nlo; o_hi = nhi;

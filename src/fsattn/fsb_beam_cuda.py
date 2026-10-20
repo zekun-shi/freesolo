@@ -10,8 +10,9 @@ shared tables hands the block's queries to the warp-per-query descent, which con
 fsb_beam_rows2 (FSB_BEAM_V2=1, default 0): the bf16 tensor-core configuration of fsb_beam_rows (128 queries per block,
 width 16) as a lean kernel: per-lane sorting networks on packed (score, child) keys instead of rank counting, register
 frontiers, two block barriers per level and warp-local dots. Its selections match fsb_beam_rows except where two
-children's scores agree in their top 27 bits (they are then ordered by child index); its 64-bit-key test build
-(key64) matches it bitwise.
+children's scores agree in their top 27 bits (they are then ordered by child index). FSB_BEAM_V2_EXACT=1 builds it to
+find such ties among a query's kept ranks and the first dropped one and to select that level again with 64-bit keys
+(fsb_beam_rows' selections exactly); its key64 test build selects with 64-bit keys at every level.
 
 fsb_beam_cuda (decode, small rows): one warp per query, lane l holds child slot l (frontier slot l // 2); each level
 loads the children's node fields once, the dot products of the valid children run as a shuffle reduce-scatter, and
@@ -433,7 +434,8 @@ def rows_source(NC: int, DH: int, WM: int, R: int, BOUND: bool, RC_T: bool, CAP:
 # ---- lean row-cooperative prefill descent (FSB_BEAM_V2=1, default 0): fsb_beam_rows2 takes the bf16 tensor-core
 # configuration of fsb_beam_rows (128 queries per block, head dim 64, frontier width 16, up to 4 cells per frontier
 # node) with sorting-network selection on packed keys, register frontiers and two block barriers per level. Its one
-# semantic deviation: children whose scores agree in the top 27 bits are ordered by child index. Other shapes, the
+# semantic deviation: children whose scores agree in the top 27 bits are ordered by child index; FSB_BEAM_V2_EXACT=1
+# builds it with that case redone on 64-bit keys (fsb_beam_rows' selections exactly, at some speed). Other shapes, the
 # test hooks (cap / umax / qb) and FSB_BEAM_V2=0 keep fsb_beam_rows.
 
 _ROWS2_UC, _ROWS2_DCH = 128, 64        # union slots per level (a larger union falls back); union slots per dot chunk
@@ -441,6 +443,10 @@ _ROWS2_UC, _ROWS2_DCH = 128, 64        # union slots per level (a larger union f
 
 def beam_v2_on() -> bool:
     return os.environ.get("FSB_BEAM_V2", "0") == "1" and not _rows2_failed
+
+
+def beam_v2_exact() -> bool:
+    return os.environ.get("FSB_BEAM_V2_EXACT", "0") == "1"
 
 
 def _rows2_layout(uc: int = _ROWS2_UC):
@@ -459,12 +465,14 @@ def _rows2_layout(uc: int = _ROWS2_UC):
 
 
 def rows2_source(NC: int, DH: int, WM: int, R: int, BOUND: bool, RC_T: bool, key64: bool = False,
-                 uc: int = _ROWS2_UC):
+                 uc: int = _ROWS2_UC, exact: bool = False):
     # -> (source, dynamic shared memory bytes); fsb_beam_rows' sections in their tensor-core configuration supply the
-    # shared helpers and the fallback descent. key64 / uc: test builds (64-bit selection keys; a smaller union table)
+    # shared helpers and the fallback descent. exact: 32-bit keys with their score-bit ties redone on 64-bit keys
+    # (FSB_BEAM_V2_EXACT), two blocks per SM (at three the 64-bit path would spill the level loop's registers).
+    # key64 / uc: test builds (64-bit selection keys at every level; a smaller union table)
     src, _ = rows_source(NC, DH, WM, R, BOUND, RC_T, _ROWS_CAP, _ROWS_UMAX, 128, True)
     off, total = _rows2_layout(uc)
-    defs = dict(MINB2=3, KEY64=int(key64), UC2=uc, DCH=_ROWS2_DCH,
+    defs = dict(MINB2=2 if exact else 3, KEY64=int(key64), EXACT=int(exact), UC2=uc, DCH=_ROWS2_DCH,
                 **{f"OFF2_{k}": v for k, v in off.items()})
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + src + _ROWS2_KERNEL, total
 
@@ -500,8 +508,9 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     # unavailable (the caller then runs the warp-per-query kernel). cap / umax / qb: test hooks for the tile and union
     # sizes and the queries per block. fallback: test / diagnostic hook, 65 int32 counters on the device to which the
     # launch adds the number of its blocks that left the cooperative descent for the warp-per-query fallback ([0]) and
-    # the level at which they did ([1 + level]). FSB_BEAM_V2=1 runs fsb_beam_rows2 where it applies; key64: its test
-    # build with 64-bit selection keys (fsb_beam_rows' exact child order), uc2: its union table size (32, 64 or 128).
+    # the level at which they did ([1 + level]). FSB_BEAM_V2=1 runs fsb_beam_rows2 where it applies (its exact build
+    # with FSB_BEAM_V2_EXACT=1); key64: its test build with 64-bit selection keys at every level, uc2: its union table
+    # size (32, 64 or 128).
     v2 = (cap is None and umax is None and qb is None and q.dtype == torch.bfloat16 and delta_max <= 2
           and beams[0][4] == 16 and beam_v2_on())
     cap, umax, qb = cap or _ROWS_CAP, umax or _ROWS_UMAX, qb or (128 if q.dtype == torch.bfloat16 else _ROWS_QB)
@@ -533,11 +542,13 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     q_bf16 = q.dtype == bf16
     ent = None
     if v2:
-        cfg2 = ("rows2", dev.index, Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC)
+        exact = beam_v2_exact()
+        cfg2 = ("rows2", dev.index, Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC, exact)
         ent = _beam_fns.get(cfg2)
         if ent is None and not torch.cuda.is_current_stream_capturing():
             try:
-                src, smem = rows2_source(Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC)
+                src, smem = rows2_source(Dh + 9, Dh, WM, R, node_score == "bound", rc_t, key64, uc2 or _ROWS2_UC,
+                                         exact)
                 ent = _beam_fns[cfg2] = (load_function(dev, src, "fsb_beam_rows2"), smem)
             except Exception as e:                                           # its own latch: fsb_beam_rows runs
                 import warnings
