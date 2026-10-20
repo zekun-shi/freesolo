@@ -21,7 +21,8 @@ def _fsb_execution_env():
                 "FSB_DECODE_GRAPH": "1", "FSB_DECODE_GRAPH_CHECK": "0", "FSB_TRAIN_GRAPH": "0",
                 "FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP": "1", "FSB_ROWS_LSE_SPLIT": "4",
                 "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
-                "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0"}
+                "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
+                "FSB_WINDOW_OVERLAP": "0"}
     return {name: os.environ.get(name, default) for name, default in defaults.items()}
 
 def _attn_execution_env():

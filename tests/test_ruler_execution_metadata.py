@@ -15,7 +15,8 @@ FAST_FLAGS = ("FSB_FAST_BEAM", "FSB_FAST_RERANK", "FSB_FAST_CACHE",
 GRAPH_FLAGS = ("FSB_DECODE_GRAPH", "FSB_DECODE_GRAPH_CHECK", "FSB_TRAIN_GRAPH")
 ROWS_FLAGS = {"FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP": "1", "FSB_ROWS_LSE_SPLIT": "4",
               "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
-              "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0"}
+              "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
+              "FSB_WINDOW_OVERLAP": "0"}
 
 
 @pytest.fixture
@@ -72,6 +73,7 @@ def ruler_driver(monkeypatch):
      "FSB_BEAM_COMPACT": "0", "FSB_CHECK_COMPACT": "1"},
     {"FSB_FAST_PREFILL": "0", "FSB_FAST_PREFILL_BLKCHUNK": "32", "FSB_FAST_PREFILL_SCRATCH_MB": "512",
      "FSB_PREFILL_STATS": "1"},
+    {"FSB_WINDOW_OVERLAP": "1"},
 ])
 def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, tmp_path, capsys, overrides):
     for name, value in overrides.items():
