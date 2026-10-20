@@ -269,17 +269,22 @@ __device__ int team_prefix(const DecBeam& B, TeamS& S, PrefS& P, const int tt, c
 #define PSTAMP(k) do { } while (0)
 #endif
     PSTAMP(0);
-    // the key of the shape this row's walk depends on: the cached plan (loaded with the spine rows) holds if it matches
+    // the key of the shape this row's walk depends on: the cached plan (loaded with the spine rows) holds if it matches.
+    // Only the first warp reads the cached key (it alone walks on a miss, and its lane 0 then rewrites the key)
     int key[8];
     key[0] = PLAN_MARK; key[1] = root;
     key[2] = __float_as_int(root <= -2 && -root - 2 < nsp ? S.spn[-root - 2][DH + 3] : 0.0f);
     key[3] = __float_as_int(bud); key[4] = wbeam; key[5] = B.KMAXP1; key[6] = nsp; key[7] = (int)hgt;
-    bool hit = B.PLAN != nullptr;
+    bool hit = false;
+    if (tt < 32) {
+        hit = B.PLAN != nullptr;
 #pragma unroll
-    for (int i = 0; i < 8; i++) hit = hit && P.key[i] == key[i];
+        for (int i = 0; i < 8; i++) hit = hit && P.key[i] == key[i];
+    }
     // ---- the prefix levels' node sets from the shape (the team's first warp; lane j: member j of the walk's frontier,
     // carried members first, then the new children in member order) ----
     if (tt < 32 && !hit) {
+        __syncwarp();                                   // every lane's key read before lane 0 writes the plan
         int p = -1, ref = 0, kh = -1, bad = 0;
         float cnt = 0.0f;
         if (lane == 0 && root != -1) {
@@ -413,7 +418,7 @@ __device__ int team_prefix(const DecBeam& B, TeamS& S, PrefS& P, const int tt, c
             const int kk = P.kh[m] >> 16, h = P.kh[m] & 0xffff, l = 31 - __clz(h + 1);
             const bool ok = ax[3] == P.cnt[m] && (l < kk ? (ax[4] == (float)(ref + h + 1) && ax[5] == (float)(ref + h + 2))
                                                          : (ax[4] == -1.0f && ax[5] == -1.0f));
-            if (!ok) P.bad = 1;
+            if (!ok && g == 0) atomicOr(&P.bad, 1);         // one lane per member; members may flag at once
         } else if (has) {
             const float* sp32 = S.spn[-ref - 2];
 #pragma unroll
