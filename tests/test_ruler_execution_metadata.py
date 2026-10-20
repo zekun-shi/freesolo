@@ -50,8 +50,8 @@ def ruler_driver(monkeypatch):
     route.router_key_check = lambda *args, **kwargs: (None, set())
     for module in (torch, transformers, infer, cache, tree, route):
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    for name in (*FAST_FLAGS, *GRAPH_FLAGS, *ROWS_FLAGS, "FSB_DECODE_V2", "FSB_DECODE_FORK", "FS_PRUNE_KERNEL",
-                 "FS_FUSED_ATTN"):
+    for name in (*FAST_FLAGS, *GRAPH_FLAGS, *ROWS_FLAGS, "FSB_DECODE_V2", "FSB_DECODE_FORK", "FSB_DECODE_JOIN",
+                 "FSB_DECODE_ASYNC", "FSB_DECODE_V3", "FS_PRUNE_KERNEL", "FS_FUSED_ATTN"):
         # set first, then delete: delenv alone records nothing for an unset variable, so the values eval_ruler.py
         # sets itself (FS_FUSED_ATTN on import, FSB_TRAIN_GRAPH and FSB_DECODE_GRAPH in main) would outlive the test
         # and reach every later test of the session
@@ -72,6 +72,7 @@ def ruler_driver(monkeypatch):
     {"FSB_DECODE_GRAPH_CHECK": "1"},
     {"FSB_DECODE_V2": "0"},
     {"FSB_DECODE_V2": "0", "FSB_DECODE_FORK": "0"},
+    {"FSB_DECODE_JOIN": "1", "FSB_DECODE_ASYNC": "1", "FSB_DECODE_V3": "1"},
     {"FSB_BEAM_CUDA": "0"},
     {"FSB_BEAM_ROWS": "0"},
     {"FSB_TRAVERSE_TRITON": "0"},
@@ -103,8 +104,8 @@ def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, t
     assert report["results"]["niah_single_1"]["n"] == 1
     flags = report["meta"]["fsb_execution_env"]
     expected = {**dict.fromkeys(FAST_FLAGS, "1"), "FSB_DECODE_GRAPH": "1",
-                "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1", "FSB_TRAIN_GRAPH": "0",
-                **ROWS_FLAGS, **overrides}
+                "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1", "FSB_DECODE_JOIN": "0",
+                "FSB_DECODE_ASYNC": "0", "FSB_DECODE_V3": "0", "FSB_TRAIN_GRAPH": "0", **ROWS_FLAGS, **overrides}
     assert flags == expected
     env_line = next(line for line in capsys.readouterr().out.splitlines() if "FS-B eval env:" in line)
     for name, value in expected.items():
