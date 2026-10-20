@@ -453,8 +453,12 @@ fsb_rows_fused2(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
 // the key ring filled one cell ahead by all threads, per (cell, 16-query tile) need flags so a warp skips the tiles
 // whose queries do not have the cell as a candidate, and each lane finishing one (query, cell) score (log2, prior)
 // instead of a quarter of the lanes finishing four.
-__device__ __forceinline__ void cp4(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(smem_addr(dst)), "l"(src));
+// cp.async to a shared-space address
+__device__ __forceinline__ void cp16s(const unsigned dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src));
+}
+__device__ __forceinline__ void cp4s(const unsigned dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dst), "l"(src));
 }
 __device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -593,14 +597,16 @@ __device__ __forceinline__ void v3_insert(float (&bv)[KK], int (&bs)[KK], const 
     bs[0] = gt[0] ? c  : bs[0];
 }
 
-// shared memory (dynamic; fsb_rows_cuda._v3_smem): the cell list, the per-rank tile need bits, the slot ranks, the
-// scan totals, then region R: during the union the presence bytes [Mcp], the cell -> rank map [Mcp] and the
+// shared memory (dynamic; fsb_rows_cuda._v3_smem): the cell list, the per-rank tile need bits, the slot ranks (query
+// major, two 16-bit slots per word, an odd word stride per query so a warp's 32 queries hit 32 banks), the scan
+// totals, then region R: during the union the presence bytes [Mcp], the cell -> rank map [Mcp] and the
 // (rank, tile) need bytes [UCAP][8]; afterwards the key ring (NST stages of NC cells, 4 KB each, and their cellA
 // values), then the score window lse[UTILE][128] (each warp reads and writes only its own 32 query columns)
 #define C_ALL (CA + CB)
+#define SPW ((C_ALL / 2) | 1)
 #define V3_OFF_NEED 1024
 #define V3_OFF_PU (V3_OFF_NEED + 512)
-#define V3_OFF_MISC (V3_OFF_PU + C_ALL * 256)
+#define V3_OFF_MISC (V3_OFF_PU + ((128 * SPW * 4 + 63) & ~63))
 #define V3_OFF_R (V3_OFF_MISC + 64)
 #define V3_RING (NST * NC * (4096 + 16))
 
@@ -616,7 +622,8 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
     extern __shared__ __align__(16) unsigned char smem[];
     unsigned short* s_cells = reinterpret_cast<unsigned short*>(smem);
     unsigned char* s_need = smem + V3_OFF_NEED;
-    short (*s_pu)[128] = reinterpret_cast<short (*)[128]>(smem + V3_OFF_PU);
+    unsigned* s_pw = reinterpret_cast<unsigned*>(smem + V3_OFF_PU);    // query q's slots 2j, 2j + 1: word q SPW + j
+    const short* s_ph = reinterpret_cast<const short*>(smem + V3_OFF_PU);
     int* s_misc = reinterpret_cast<int*>(smem + V3_OFF_MISC);
     unsigned char* R = smem + V3_OFF_R;
     const int Mcp = (Mc + 2047) & ~2047;
@@ -668,8 +675,7 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
             const int c0 = (int)v.x, c1 = (int)v.y;
             if (c0 >= 0) s_pres[c0] = 1;
             if (c1 >= 0) s_pres[c1] = 1;
-            s_pu[k][q] = (short)c0;
-            s_pu[k + 1][q] = (short)c1;
+            s_pw[q * SPW + (k >> 1)] = (unsigned)(c0 & 0xffff) | ((unsigned)c1 << 16);
         }
 #if CB > 0
         const longlong2* pb = reinterpret_cast<const longlong2*>(SELB + (i64)r * 128 * CB);
@@ -680,8 +686,7 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
             const int c0 = (int)v.x, c1 = (int)v.y;
             if (c0 >= 0) s_pres[c0] = 1;
             if (c1 >= 0) s_pres[c1] = 1;
-            s_pu[k][q] = (short)c0;
-            s_pu[k + 1][q] = (short)c1;
+            s_pw[q * SPW + (k >> 1)] = (unsigned)(c0 & 0xffff) | ((unsigned)c1 << 16);
         }
 #endif
     }
@@ -738,10 +743,16 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
         // a row of at most 128 cells tests them on a 128-bit rank set, larger rows compare the cells as fused2), and
         // the (rank, tile of 16 queries) need bytes
         int ac[CA], ra[CA];
+        unsigned* my = s_pw + tid * SPW;
         unsigned am0 = 0u, am1 = 0u, am2 = 0u, am3 = 0u;
 #pragma unroll
+        for (int c = 0; c < CA; c += 2) {
+            const unsigned w = my[c >> 1];
+            ac[c] = (int)(short)(w & 0xffffu);
+            ac[c + 1] = (int)(short)(w >> 16);
+        }
+#pragma unroll
         for (int c = 0; c < CA; c++) {
-            ac[c] = (int)s_pu[c][tid];
             ra[c] = ac[c] >= 0 ? (int)s_rank[ac[c]] : -1;
             if (ra[c] >= 0) {
                 const unsigned bit = 1u << (ra[c] & 31);
@@ -751,31 +762,38 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
         }
         const int tb = tid >> 4;
 #pragma unroll
-        for (int c = 0; c < CA; c++) {
-            s_pu[c][tid] = (short)ra[c];
+        for (int c = 0; c < CA; c += 2) {
+            my[c >> 1] = (unsigned)(ra[c] & 0xffff) | ((unsigned)ra[c + 1] << 16);
             if (ra[c] >= 0) s_nb[ra[c] * 8 + tb] = 1;
+            if (ra[c + 1] >= 0) s_nb[ra[c + 1] * 8 + tb] = 1;
         }
 #if CB > 0
         const bool small = U_raw <= 128;
 #pragma unroll
-        for (int j = 0; j < CB; j++) {
-            const int cid = (int)s_pu[CA + j][tid];
-            int rb = cid >= 0 ? (int)s_rank[cid] : -1;
-            if (rb >= 0) {
-                bool dup;
-                if (small) {
-                    const int w = rb >> 5;
-                    const unsigned wd = w == 0 ? am0 : (w == 1 ? am1 : (w == 2 ? am2 : am3));
-                    dup = (wd >> (rb & 31)) & 1u;
-                } else {
-                    dup = false;
+        for (int j = 0; j < CB; j += 2) {
+            const unsigned w = my[(CA + j) >> 1];
+            int rb2[2];
 #pragma unroll
-                    for (int i = 0; i < CA; i++) dup |= (ac[i] == cid);
+            for (int h = 0; h < 2; h++) {
+                const int cid = (int)(short)(h ? (w >> 16) : (w & 0xffffu));
+                int rb = cid >= 0 ? (int)s_rank[cid] : -1;
+                if (rb >= 0) {
+                    bool dup;
+                    if (small) {
+                        const int ww = rb >> 5;
+                        const unsigned wd = ww == 0 ? am0 : (ww == 1 ? am1 : (ww == 2 ? am2 : am3));
+                        dup = (wd >> (rb & 31)) & 1u;
+                    } else {
+                        dup = false;
+#pragma unroll
+                        for (int i = 0; i < CA; i++) dup |= (ac[i] == cid);
+                    }
+                    if (dup) rb = -1;
                 }
-                if (dup) rb = -1;
+                if (rb >= 0) s_nb[rb * 8 + tb] = 1;
+                rb2[h] = rb;
             }
-            s_pu[CA + j][tid] = (short)rb;
-            if (rb >= 0) s_nb[rb * 8 + tb] = 1;
+            my[(CA + j) >> 1] = (unsigned)(rb2[0] & 0xffff) | ((unsigned)rb2[1] << 16);
         }
 #endif
     }
@@ -821,25 +839,34 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
     }
 
     const int NS = (U + NC - 1) / NC;
-    // stage sg's NC cells into ring slot sg % NST: each thread copies 2 of a cell's 256 16-byte chunks, thread 0 the
-    // cell's cellA value
+    // the thread's two 16-byte chunks of a cell: key rows kr0 = tid / 8 and kr0 + 16, chunk tid % 8 (swizzled in the
+    // ring); their sources at cell 0 and the cell stride in bytes, so a cell costs one 32 x 32 -> 64-bit multiply-add
+    // per chunk
+    const int kr0 = tid >> 3, ch0 = tid & 7;
+    const char* ksrc0 = reinterpret_cast<const char*>(kb + (i64)kr0 * sl + ch0 * 8);
+    const char* ksrc1 = reinterpret_cast<const char*>(kb + (i64)(kr0 + 16) * sl + ch0 * 8);
+    const unsigned cbytes = (unsigned)(64 * sl);                                 // 32 key rows of sl bf16 elements
+    const char* ca0p = reinterpret_cast<const char*>(ca_row);
+    const unsigned cabytes = (unsigned)(4 * ca1);
+    const unsigned dsth0 = smem_addr(ring + kr0 * 64 + ((ch0 ^ (kr0 & 7)) << 3));
+    const unsigned dsth1 = dsth0 + 16 * 128;                                      // row kr0 + 16: the same swizzle
+    const unsigned rca_a = smem_addr(s_rca);
+    // stage sg's NC cells into ring slot sg % NST; thread 0 also copies each cell's cellA value
 #define V3_ISSUE(sg_)                                                                                                 \
     do {                                                                                                              \
         const int sgi = (sg_);                                                                                        \
         if (sgi < NS) {                                                                                               \
-            unsigned short* dst0 = ring + (sgi % NST) * (NC * 2048);                                                  \
+            const int slot = (sgi % NST) * NC;                                                                        \
             _Pragma("unroll")                                                                                         \
             for (int j = 0; j < NC; j++) {                                                                            \
                 const int uu = sgi * NC + j;                                                                          \
                 if (uu < U) {                                                                                         \
-                    const int cell_ = (int)s_cells[uu];                                                               \
-                    const unsigned short* ksrc = kb + (i64)cell_ * 32 * sl;                                           \
-                    _Pragma("unroll")                                                                                 \
-                    for (int t = 0; t < 2; t++) {                                                                     \
-                        const int v = tid + 128 * t, kr = v >> 3, ch = v & 7;                                         \
-                        cp16(dst0 + j * 2048 + kr * 64 + ((ch ^ (kr & 7)) << 3), ksrc + kr * sl + ch * 8);            \
-                    }                                                                                                 \
-                    if (POS_MODE && tid == 0) cp4(s_rca + (sgi % NST) * NC + j, ca_row + (i64)cell_ * ca1);           \
+                    const unsigned cell_ = (unsigned)s_cells[uu];                                                     \
+                    const unsigned long long co = (unsigned long long)cell_ * cbytes;                                 \
+                    cp16s(dsth0 + (slot + j) * 4096, ksrc0 + co);                                                     \
+                    cp16s(dsth1 + (slot + j) * 4096, ksrc1 + co);                                                     \
+                    if (POS_MODE && tid == 0)                                                                         \
+                        cp4s(rca_a + (slot + j) * 4, ca0p + (unsigned long long)cell_ * cabytes);                     \
                 }                                                                                                     \
             }                                                                                                         \
         }                                                                                                             \
@@ -877,19 +904,28 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
                 __syncwarp();
                 const int u1 = u + 1;
                 const float* lt = lse + tid;
+                const unsigned* my = s_pw + tid * SPW;
                 if (u0 == 0) {
 #pragma unroll
-                    for (int c = 0; c < C_ALL; c++) {
-                        const int pu = (int)s_pu[c][tid];
-                        const bool in = (unsigned)(pu - u0) < (unsigned)(u1 - u0);
-                        v3_insert<true>(bv, bs, lt[(in ? pu - u0 : 0) * 128], c, in);
+                    for (int c = 0; c < C_ALL; c += 2) {
+                        const unsigned w = my[c >> 1];
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            const int pu = (int)(short)(h ? (w >> 16) : (w & 0xffffu));
+                            const bool in = (unsigned)(pu - u0) < (unsigned)(u1 - u0);
+                            v3_insert<true>(bv, bs, lt[(in ? pu - u0 : 0) * 128], c + h, in);
+                        }
                     }
                 } else {
 #pragma unroll
-                    for (int c = 0; c < C_ALL; c++) {
-                        const int pu = (int)s_pu[c][tid];
-                        const bool in = (unsigned)(pu - u0) < (unsigned)(u1 - u0);
-                        v3_insert<false>(bv, bs, lt[(in ? pu - u0 : 0) * 128], c, in);
+                    for (int c = 0; c < C_ALL; c += 2) {
+                        const unsigned w = my[c >> 1];
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            const int pu = (int)(short)(h ? (w >> 16) : (w & 0xffffu));
+                            const bool in = (unsigned)(pu - u0) < (unsigned)(u1 - u0);
+                            v3_insert<false>(bv, bs, lt[(in ? pu - u0 : 0) * 128], c + h, in);
+                        }
                     }
                 }
                 __syncwarp();
@@ -903,7 +939,7 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
 #pragma unroll
     for (int k = 0; k < KK; k++) {
         const bool ok = bv[k] > __int_as_float(0xff800000);
-        const out_t val = ok ? (out_t)s_cells[s_pu[bs[k]][tid]] : (out_t)-1;
+        const out_t val = ok ? (out_t)s_cells[s_ph[tid * SPW * 2 + bs[k]]] : (out_t)-1;
         OUT[row * KK + k] = val;
 #if PROV_ON
         PROV[row * KK + k] = (signed char)(!ok ? -1 : (bs[k] >= CA ? PROV_BIT : 0));

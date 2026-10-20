@@ -11,7 +11,7 @@ first use and launched through fsb_beam_cuda's driver-API helpers; without NVRTC
 
 rows_fused_cuda runs the whole re-rank of a stage in one launch: fsb_rows_fused2, or with FSB_ROWS_V3=1 (contexts of
 up to V3_MC_MAX cells) fsb_rows_v3, which computes every (query, cell) score with fused2's arithmetic in fused2's
-order, so both give the same cells and provenance bit for bit, at about 0.7 of fused2's time on A100 prefill stages.
+order, so both give the same cells and provenance bit for bit, at about 0.68 of fused2's time on A100 prefill stages.
 """
 from __future__ import annotations
 
@@ -136,8 +136,8 @@ _v3_fns: dict = {}
 _v3_failed: list = []
 V3_MC_MAX = 1 << 14                                # cells per context fsb_rows_v3's presence bytes and rank map hold
 # fsb_rows_v3's ring (NST stages of NC key cells: one 4 KB cell per barrier, double-buffered), score window (UTILE
-# cells per top-k pass) and CTAs per SM: 34 KB of shared memory and 128 registers at 131k tokens, 4 CTAs per SM
-_V3 = dict(NC=1, NST=2, UTILE=32, MINB=4)
+# cells per top-k pass) and CTAs per SM: 38 KB of shared memory and 128 registers at 131k tokens, 4 CTAs per SM
+_V3 = dict(NC=1, NST=2, UTILE=40, MINB=4)
 
 
 def rows_v3_on() -> bool:
@@ -157,12 +157,13 @@ def _v3_source(CA: int, CB: int, KK: int, lse_mode: bool, pos_mode: bool, prov_o
 
 
 def _v3_smem(C: int, Mc: int) -> int:
-    # fsb_rows_v3's dynamic shared memory: cell list 1 KB, need bits 512 B, slot ranks C x 256 B, scan totals 64 B, then
-    # the larger of the union scratch (presence bytes and cell -> rank map of Mcp cells, need bytes 4 KB) and the key
-    # ring (+ the cells' cellA values) with the score window
+    # fsb_rows_v3's dynamic shared memory: cell list 1 KB, need bits 512 B, slot ranks (128 queries x an odd number of
+    # words, 64-byte aligned), scan totals 64 B, then the larger of the union scratch (presence bytes and cell -> rank
+    # map of Mcp cells, need bytes 4 KB) and the key ring (+ the cells' cellA values) with the score window
     Mcp = (Mc + 2047) // 2048 * 2048
+    pu = (128 * ((C // 2) | 1) * 4 + 63) // 64 * 64
     ring = _V3["NST"] * _V3["NC"] * (4096 + 16) + _V3["UTILE"] * 512
-    return 1024 + 512 + C * 256 + 64 + max(3 * Mcp + 4096, ring)
+    return 1024 + 512 + pu + 64 + max(3 * Mcp + 4096, ring)
 
 
 def _v3_function(dev, cfg):
