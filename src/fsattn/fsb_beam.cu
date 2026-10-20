@@ -245,7 +245,10 @@ __device__ __forceinline__ void warp_descend(WarpS& S, const int lane, const flo
         if (in_w) { f_ref = S.nref[slot]; f_cnt = S.ncnt[slot]; f_chl = S.nchl[slot]; f_chr = S.nchr[slot]; }
         __syncwarp();
     }
-    // cells epilogue: src/off/len of each frontier node, then the cell ids from the leaf (src == 1) or admission table
+    // cells epilogue: src/off/len of each frontier node, then the cell ids from the leaf (src == 1) or admission table.
+    // The warp's previous query read S.nref in its own epilogue, and a descent that runs no level reaches this write
+    // past no __syncwarp: order those reads first
+    __syncwarp();
     if (in_w && side == 0) S.nref[slot] = f_ref;
     __syncwarp();
 #pragma unroll
