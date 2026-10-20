@@ -811,3 +811,53 @@ def test_rows2_compact_and_full_layout(monkeypatch):
     ref = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0)
     got = _rows2(monkeypatch, beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0, key64=True)
     assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
+
+
+def _split_stage(seed, M=512, H=16, nbc=32, Bq=128, D=64, s=32):
+    # _forest_stage's keys over the CUDA build's split forests (all cells; cells above the head's median norm), as the
+    # prefill builds them, with the last nbc blocks' m_b rows (head-major)
+    from src.fsattn.fsb_build_cuda import build_forests_cuda
+    g = torch.Generator().manual_seed(seed)
+    centers = torch.randn(H, 64, D, generator=g)
+    keys = (centers[:, torch.randint(0, 64, (M * s,), generator=g)] + 0.6 * torch.randn(H, M * s, D, generator=g)) * 0.5
+    keys = keys.to("cuda", torch.bfloat16).float().view(H, M, s, D)
+    kbar, ceil = keys.mean(2), keys.norm(dim=-1).amax(-1)
+    nb = M * s // Bq
+    E = (torch.arange(nb, device="cuda", dtype=torch.float32) * Bq / s).floor().long()
+    taus = [torch.zeros(H, device="cuda"), ceil.median(dim=-1).values]
+    (F, mba), (Fu, mbua) = build_forests_cuda(kbar, ceil, None, taus, E)
+    mb, mbu = mba[:, nb - nbc:].reshape(-1).contiguous(), mbua[:, nb - nbc:].reshape(-1).contiguous()
+    return F, Fu, mb, mbu, torch.arange(H, device="cuda").repeat_interleave(nbc)
+
+
+@gpu
+@pytest.mark.parametrize("utau,union,delta,uwidth", [(True, True, 0, 16), (False, True, 1, 8), (False, False, 0, 16)])
+def test_spines_tables_cuda_bitwise(monkeypatch, utau, union, delta, uwidth):
+    # one fsb_spines2 launch == build_spines of each forest (the Triton spine kernel) and fsb_prefill._row_tables:
+    # spine rows, roots, heights, both beams' width / budget tables and the rows' lambda / sigma, bitwise, for rows from
+    # the first block (m_b = 0) to the last; FSB_BEAM_V2=0 leaves them to those
+    from types import SimpleNamespace
+    from src.fsattn import fsb_prefill
+    F, Fu, mb, mbu, t_idx = _split_stage(5 + delta, nbc=128)
+    H, Bq = 16, 128
+    head_rows = t_idx % H
+    g = torch.Generator().manual_seed(3)
+    sel_scale = torch.rand(H, generator=g).to("cuda", torch.bfloat16)
+    sigma = (torch.rand(H, generator=g) * 500 + 10).cuda()
+    F2, mb2 = (Fu, mbu) if utau else (None, None)
+    uw = uwidth if union else 0
+    attn = SimpleNamespace(fsb_delta=delta, fsb_width=16, fsb_union_width=uw)
+    SP = fsb_tree.build_spines(F, mb, t_idx)
+    SP2 = fsb_tree.build_spines(F2, mb2, t_idx) if F2 is not None else None
+    ref = fsb_prefill._row_tables(attn, SP, SP2, sel_scale, sigma, head_rows, Bq, union)
+    args = (F, mb, F2, mb2, t_idx, head_rows, sel_scale, sigma, Bq, delta, 16, uw, union)
+    monkeypatch.setenv("FSB_BEAM_V2", "1")
+    got = bc.spines_tables_cuda(*args)
+    assert got is not None and (got[1] is None) == (SP2 is None)
+    assert bool((mb == 0).any()) and bool((SP["root"] == -1).any())
+    for mine, theirs in ((got[0], SP), (got[1], SP2)):
+        if theirs is not None:
+            assert all(torch.equal(mine[k], theirs[k]) for k in ("node", "root", "height", "m_b", "t_idx"))
+    assert all(torch.equal(a, b) for a, b in zip(got[2:], ref))
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    assert bc.spines_tables_cuda(*args) is None

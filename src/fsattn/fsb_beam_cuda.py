@@ -55,6 +55,7 @@ _KERNEL = _BEAM_CU["_KERNEL"]
 _WARP_KERNEL = _BEAM_CU["_WARP_KERNEL"]
 _ROWS_KERNEL = _BEAM_CU["_ROWS_KERNEL"]
 _ROWS2_KERNEL = _BEAM_CU["_ROWS2_KERNEL"]
+_SPINES_KERNEL = _BEAM_CU["_SPINES_KERNEL"]
 
 _NWARP = 4                                               # queries (warps) per block
 _lock = threading.Lock()
@@ -597,3 +598,83 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
             I64(qst_t), I64(qst_b), I32(nq), P(fallback.data_ptr() if fallback is not None else 0)]
     launch(fn, Tp * len(beams) * (-(-Bq // qb)), 2 * qb, dev, args, smem=smem)
     return outs
+
+
+# ---- the fast prefill stage's spines and row tables (FSB_BEAM_V2=1): one launch of fsb_spines2 replaces the stage's
+# build_spines (one Triton _spine_kernel launch per forest) and _row_tables, with the same outputs bitwise
+
+
+class _SpinesP(ctypes.Structure):
+    # struct SpinesP of _SPINES_KERNEL (one forest's stage spines)
+    _fields_ = ([(k, ctypes.c_void_p) for k in ("MB", "TIDX", "CHUNK", "CHUNK_AX", "SPN", "ROOT", "HGT")]
+                + [(k, ctypes.c_longlong) for k in ("Ntot", "M")] + [("S", ctypes.c_int), ("on", ctypes.c_int)])
+
+
+def _spines_forest_ok(F: dict, m_b: torch.Tensor) -> bool:
+    # a split forest in the prefill layout (forest_layout(M): no decode arena), as fsb_build_cuda builds it
+    mu, aux = F.get("node_mu"), F.get("node_aux")
+    return (mu is not None and F.get("jbase") is None and F.get("node") is None and mu.is_cuda
+            and mu.dtype == torch.bfloat16 and aux.dtype == torch.float32 and mu.is_contiguous() and aux.is_contiguous()
+            and mu.shape[-1] == 64 and aux.shape[-1] == 9 and 0 <= F["Kmax"] < 32 and F["Ntot"] == mu.shape[1]
+            and m_b.dtype == torch.int64 and m_b.device == mu.device)
+
+
+@torch.no_grad()
+def spines_tables_cuda(F: dict, m_b: torch.Tensor, F2, m_b2, t_idx: torch.Tensor, head_rows: torch.Tensor, sel_scale,
+                       sigma, Bq: int, delta: int, width: int, uwidth: int, union: bool):
+    # -> (SP, SP2, W, bud, Wu, budu, lam, sig): build_spines(F, m_b, t_idx), build_spines(F2, m_b2, t_idx) (None
+    # without F2) and fsb_prefill._row_tables for them, bitwise, from one launch; None when FSB_BEAM_V2 is off or the
+    # kernel does not take these tables (the caller then runs those)
+    rows = m_b.shape[0]
+    dev = m_b.device
+    if not (beam_v2_on() and beam_cuda_on() and rows > 0 and _spines_forest_ok(F, m_b)
+            and (F2 is None or (_spines_forest_ok(F2, m_b2) and F2["Kmax"] == F["Kmax"] and m_b2.shape == m_b.shape))
+            and t_idx.dtype == head_rows.dtype == torch.int64 and t_idx.shape == head_rows.shape == (rows,)
+            and t_idx.device == head_rows.device == dev and 0 <= delta and width >= 0 and uwidth >= 0):
+        return None
+    fn = _beam_fns.get(("spines2", dev.index))
+    if fn is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None                                                      # never compile inside a graph capture
+        try:
+            src = "#define NC 73\n#define NA 9\n#define DH 64\n" + _HELPERS + _SPINES_KERNEL
+            fn = _beam_fns[("spines2", dev.index)] = load_function(dev, src, "fsb_spines2")
+        except Exception as e:
+            import warnings
+            if not _rows2_failed:
+                _rows2_failed.append(repr(e))
+                warnings.warn(f"FS-B lean row beam (FSB_BEAM_V2) unavailable, using fsb_beam_rows: {e!r}")
+            return None
+    S = F["Kmax"] + 1
+    i64, f32 = torch.int64, torch.float32
+    out, ps = [], []
+    mbs, tis = m_b.contiguous(), t_idx.contiguous()
+    keep = [mbs, tis]
+    for Fx, mx in ((F, mbs), (F2, m_b2)):
+        if Fx is None:
+            ps.append(_SpinesP())
+            out.append(None)
+            continue
+        mx = mx.contiguous()
+        sp = torch.empty((rows, S, 73), dtype=f32, device=dev)
+        root = torch.empty((rows,), dtype=i64, device=dev)
+        height = torch.empty((rows,), dtype=i64, device=dev)
+        keep.append(mx)
+        ps.append(_SpinesP(mx.data_ptr(), tis.data_ptr(), Fx["node_mu"].data_ptr(), Fx["node_aux"].data_ptr(),
+                           sp.data_ptr(), root.data_ptr(), height.data_ptr(), Fx["Ntot"], Fx["M"], S, 1))
+        out.append({"node": sp, "root": root, "height": height, "m_b": mx, "t_idx": tis})
+    W = torch.empty((rows, Bq), dtype=i64, device=dev)
+    bud = torch.empty((rows, Bq), dtype=i64, device=dev)
+    Wu = torch.empty((rows, Bq), dtype=i64, device=dev) if union else W
+    budu = torch.empty((rows, Bq), dtype=i64, device=dev) if union else bud
+    lam = torch.empty((rows,), dtype=f32, device=dev)
+    sig = torch.empty((rows,), dtype=f32, device=dev)
+    sels, sigs, heads = sel_scale.reshape(-1).float().contiguous(), sigma.reshape(-1).float().contiguous(), \
+        head_rows.contiguous()
+    keep += [sels, sigs, heads]
+    P, I32 = ctypes.c_void_p, ctypes.c_int
+    args = [ps[0], ps[1], P(heads.data_ptr()), P(sels.data_ptr()), P(sigs.data_ptr()), P(W.data_ptr()),
+            P(bud.data_ptr()), P(Wu.data_ptr()), P(budu.data_ptr()), P(lam.data_ptr()), P(sig.data_ptr()), I32(Bq),
+            I32(int(delta)), I32(int(width)), I32(int(uwidth)), I32(1 if union else 0)]
+    launch(fn, rows, 64, dev, args)
+    return out[0], out[1], W, bud, Wu, budu, lam, sig

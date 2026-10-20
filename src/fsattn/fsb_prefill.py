@@ -380,6 +380,7 @@ _warned: list = []
 
 def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
     # fsb_long_range for the configurations of prefill_fast_ok; same output, selection and statistics
+    from .fsb_beam_cuda import spines_tables_cuda
     from .fsb_fast_step import fast_beam_ok, forest_beam_fused, forest_beam_pair
     from .fsb_rows import UCAP, union_rerank_rows
     from .fsb_build_cuda import prefill_trim_on
@@ -470,11 +471,19 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                     qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
                     if nq < nbc * Bq:
                         qv[:, :, nq:].zero_()
-                SPc = build_spines(F, mb_rows[r0:r1], cst["t_rows"][r0:r1])
-                SP2c = build_spines(F2, mb2_rows[r0:r1], cst["t_rows"][r0:r1]) if F2 is not None else None
+                # FSB_BEAM_V2: both forests' spines and the row tables from one launch (spines_tables_cuda, bitwise)
+                got = spines_tables_cuda(F, mb_rows[r0:r1], F2, mb2_rows[r0:r1] if F2 is not None else None,
+                                         cst["t_rows"][r0:r1], cst["head_rows"][r0:r1], attn.sel_scale, sigma, Bq,
+                                         int(attn.fsb_delta), int(attn.fsb_width),
+                                         int(getattr(attn, "fsb_union_width", 0) or 0), union)
+                if got is not None:
+                    SPc, SP2c, Wt, bt, Wut, but, lam_r, sig_r = got
+                else:
+                    SPc = build_spines(F, mb_rows[r0:r1], cst["t_rows"][r0:r1])
+                    SP2c = build_spines(F2, mb2_rows[r0:r1], cst["t_rows"][r0:r1]) if F2 is not None else None
+                    Wt, bt, Wut, but, lam_r, sig_r = _row_tables(attn, SPc, SP2c, attn.sel_scale, sigma,
+                                                                 cst["head_rows"][r0:r1], Bq, union)
                 SPuc = SP2c if SP2c is not None else SPc
-                Wt, bt, Wut, but, lam_r, sig_r = _row_tables(attn, SPc, SP2c, attn.sel_scale, sigma,
-                                                             cst["head_rows"][r0:r1], Bq, union)
                 qpos = cst["qpos"][r0:r1]
                 lam = lam_r.view(Tc, 1, 1)
                 sigv = sig_r.view(Tc, 1, 1)

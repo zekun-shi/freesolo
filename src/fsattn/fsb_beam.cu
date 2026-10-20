@@ -2084,3 +2084,145 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
     }
 #endif
 }
+// >>> SECTION: _SPINES_KERNEL <<<
+
+// ---- the fast prefill stage's spines and beam row tables in one launch (FSB_BEAM_V2=1): build_spines of each beam's
+// split forest (fsb_build_fast._spine_kernel) and fsb_prefill._row_tables_kernel, bitwise. One block of two warps per
+// stage row, warp f building forest f's spine; both then write the row's tables.
+
+__device__ __forceinline__ float f_div_rn_ftz(float a, float b) {
+    float r; asm("div.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_max(float a, float b) {
+    float r; asm("max.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_min(float a, float b) {
+    float r; asm("min.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+
+// the row's spine, _spine_kernel instruction for instruction (mul.rn / add.rn / sub.rn, div.rn.ftz, the norms'
+// pairwise halving over the 64 columns, sqrt.rn.ftz, max / min): the chunk roots selected by the bits of m merge low
+// bit first; row k of sp (NC floats) is the merge at height k, or zeros with children -1 where nothing merges. One
+// warp, lane l holding columns l and l + 32; lane k < S loads chunk root k's fields and stages its mean in stg (S rows
+// of 32 words), so the merges wait on no load. -> the root ref (-1 for m = 0) and the height
+__device__ void row_spine(float* sp, unsigned* stg, const i64 m, const unsigned short* cmub, const float* cax,
+                          const i64 M, const i64 Ntot, const int S, const int lane, i64& root, i64& height) {
+    i64 croot = 0, off = 0;
+    bool present = false, bit = false;
+    float c_rad = 0.0f, c_am = 0.0f, c_pm = 0.0f, c_cnt = 0.0f;
+    if (lane < S) {
+        i64 base = 0;                                                   // the nodes of the chunks below height lane
+        for (int k = 0; k < lane; k++) base += (M >> k) * ((2LL << k) - 1);
+        off = m & ~((2LL << lane) - 1);
+        croot = base + (off >> lane) * ((2LL << lane) - 1);
+        bit = ((m >> lane) & 1) != 0;
+        present = bit && (M >> lane) > 0;
+        const i64 gi = min(max(croot, (i64)0), Ntot - 1);
+        const float* pa = cax + gi * NA;
+        c_rad = __ldg(pa); c_am = __ldg(pa + 1); c_pm = __ldg(pa + 2); c_cnt = __ldg(pa + 3);
+        const uint4* src = reinterpret_cast<const uint4*>(cmub + gi * DH);
+#pragma unroll
+        for (int pc = 0; pc < 8; pc++) reinterpret_cast<uint4*>(stg + lane * 32)[pc] = __ldg(src + pc);
+    }
+    __syncwarp();
+    float r0 = 0.0f, r1 = 0.0f, r_rad = 0.0f, r_am = 0.0f, r_pm = 1073741824.0f, r_cnt = 0.0f;
+    i64 r_ref = -1;
+    int pop = 0, hb = 0;
+    for (int k = 0; k < S; k++) {
+        const float k_rad = __shfl_sync(FULL, c_rad, k), k_am = __shfl_sync(FULL, c_am, k);
+        const float k_pm = __shfl_sync(FULL, c_pm, k), k_cnt = __shfl_sync(FULL, c_cnt, k);
+        const i64 k_croot = __shfl_sync(FULL, croot, k), k_off = __shfl_sync(FULL, off, k);
+        const bool k_bit = __shfl_sync(FULL, (int)bit, k) != 0, k_present = __shfl_sync(FULL, (int)present, k) != 0;
+        const unsigned short* row16 = reinterpret_cast<const unsigned short*>(stg + k * 32);
+        const float c0 = __uint_as_float((unsigned)row16[lane] << 16);
+        const float c1 = __uint_as_float((unsigned)row16[lane + 32] << 16);
+        const bool mk = k_present && r_cnt > 0.0f;
+        const float tot = f_max(f_add(k_cnt, r_cnt), 1.0f);
+        const float n0 = f_div_rn_ftz(f_add(f_mul(k_cnt, c0), f_mul(r_cnt, r0)), tot);
+        const float n1 = f_div_rn_ftz(f_add(f_mul(k_cnt, c1), f_mul(r_cnt, r1)), tot);
+        const float a0 = f_sub(c0, n0), a1 = f_sub(c1, n1), b0 = f_sub(r0, n0), b1 = f_sub(r1, n1);
+        float sa = f_add(f_mul(a0, a0), f_mul(a1, a1)), sb = f_add(f_mul(b0, b0), f_mul(b1, b1));
+#pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) {
+            sa = f_add(sa, __shfl_xor_sync(FULL, sa, o));
+            sb = f_add(sb, __shfl_xor_sync(FULL, sb, o));
+        }
+        const float n_rad = f_max(f_add(k_rad, f_sqrt_ftz(sa)), f_add(r_rad, f_sqrt_ftz(sb)));
+        const float n_am = f_max(k_am, r_am), n_pm = f_min(k_pm, r_pm), n_cnt = f_add(k_cnt, r_cnt);
+        float* row = sp + k * NC;
+        row[lane] = mk ? n0 : 0.0f;
+        row[lane + 32] = mk ? n1 : 0.0f;
+        if (lane < 9) {
+            const float v = lane == 0 ? n_rad : lane == 1 ? n_am : lane == 2 ? n_pm : lane == 3 ? n_cnt
+                          : lane == 4 ? (float)k_croot : lane == 5 ? (float)r_ref : lane == 6 ? 2.0f
+                          : lane == 7 ? (float)k_off : n_cnt;
+            row[DH + lane] = mk ? v : ((lane == 4 || lane == 5) ? -1.0f : 0.0f);
+        }
+        r0 = mk ? n0 : (k_present ? c0 : r0);
+        r1 = mk ? n1 : (k_present ? c1 : r1);
+        r_rad = mk ? n_rad : (k_present ? k_rad : r_rad);
+        r_am = mk ? n_am : (k_present ? k_am : r_am);
+        r_pm = mk ? n_pm : (k_present ? k_pm : r_pm);
+        r_cnt = mk ? n_cnt : (k_present ? k_cnt : r_cnt);
+        r_ref = mk ? (i64)(-(k + 2)) : (k_present ? k_croot : r_ref);
+        pop += k_present ? 1 : 0;
+        hb = k_bit ? k : hb;
+    }
+    root = m > 0 ? r_ref : -1;
+    height = m > 1 ? (i64)(hb + (pop >= 2 ? 1 : 0)) : 0;
+}
+
+// one forest's stage spines: m_b and head index per row, the split node tables, the outputs (spine rows (rows, S, NC),
+// root, height); on = 0: no such forest
+struct SpinesP {
+    const i64* MB; const i64* TIDX; const unsigned short* CHUNK; const float* CHUNK_AX; float* SPN; i64* ROOT;
+    i64* HGT; i64 Ntot; i64 M; int S; int on;
+};
+
+extern "C" __global__ void __launch_bounds__(64)
+fsb_spines2(const SpinesP P0, const SpinesP P1, const i64* __restrict__ HEAD, const float* __restrict__ SELS,
+            const float* __restrict__ SIGMA, i64* __restrict__ W1, i64* __restrict__ B1, i64* __restrict__ W2,
+            i64* __restrict__ B2, float* __restrict__ LAM, float* __restrict__ SIG, const int Bq, const int delta,
+            const int width, const int uwidth, const int has_u) {
+    __shared__ __align__(16) unsigned stg[2][32 * 32];
+    __shared__ int hts[2];
+    const i64 r = blockIdx.x;
+    const int lane = threadIdx.x & 31, f = threadIdx.x >> 5;
+    const SpinesP P = f ? P1 : P0;
+    if (P.on) {
+        const i64 tidx = P.TIDX[r];
+        i64 root, height;
+        row_spine(P.SPN + r * (i64)P.S * NC, stg[f], P.MB[r], P.CHUNK + tidx * P.Ntot * DH,
+                  P.CHUNK_AX + tidx * P.Ntot * NA, P.M, P.Ntot, P.S, lane, root, height);
+        if (lane == 0) {
+            P.ROOT[r] = root;
+            P.HGT[r] = height;
+            hts[f] = (int)height;
+        }
+    }
+    __syncthreads();
+    // _row_tables_kernel's integer formulas: the main beam D = max(h - delta, 0), width min(width, 2^D), budget
+    // 2^max(h - D, 0); the second beam with its own forest's height hu (du = hu - max(hu - delta, 0)) or the main
+    // beam's (du = its exponent), Du = max(hu - du, 0), width min(uwidth, 2^Du), budget 2^du
+    const int h1 = hts[0];
+    const int D = max(h1 - delta, 0), dl = max(h1 - D, 0);
+    const i64 w1 = min((i64)width, (i64)1 << D), b1 = (i64)1 << dl;
+    i64 w2 = 0, b2 = 0;
+    if (has_u) {
+        const int hu = P1.on ? hts[1] : h1;
+        const int du = P1.on ? hu - max(hu - delta, 0) : dl;
+        const int Du = max(hu - du, 0);
+        w2 = min((i64)uwidth, (i64)1 << Du);
+        b2 = (i64)1 << du;
+    }
+    for (int qq = threadIdx.x; qq < Bq; qq += 64) {
+        W1[r * Bq + qq] = w1;
+        B1[r * Bq + qq] = b1;
+        if (has_u) {
+            W2[r * Bq + qq] = w2;
+            B2[r * Bq + qq] = b2;
+        }
+    }
+    if (threadIdx.x == 0) {
+        const i64 hd = HEAD[r];
+        LAM[r] = SELS[hd];
+        SIG[r] = SIGMA[hd];
+    }
+}
