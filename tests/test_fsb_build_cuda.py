@@ -81,8 +81,27 @@ def _reference(K, ce, tau, H, E, sp):
 
 
 def _check(F, mb, G, gb):
-    bad = [k for k in ("adm", "m_tot", "node", "leaf", "Ntot", "Ltot", "bases", "nodes_per", "leafbases", "Cmaxs",
+    bad = [k for k in ("adm", "m_tot", "leaf", "Ntot", "Ltot", "bases", "nodes_per", "leafbases", "Cmaxs",
                        "ks", "Kmax", "M", "T", "Dh") if not _same(F[k], G[k])]
+    if G.get("node_mu") is None:
+        if not _same(F["node"], G["node"]):
+            bad.append("node")
+    else:
+        # the split CUDA build: means land in bf16 (cvt.rn.bf16, the exact cast of the packed reference rows), the
+        # aggregates stay fp32 and exact, and each radius carries the mean's bf16 rounding error. The kernels sum that
+        # error in a different reduction order than the reference conversion, so radii agree only up to a bf16-scale
+        # slack on the row's mean norm
+        Dh = F["Dh"]
+        mu_ref = F["node"][..., :Dh].to(torch.bfloat16)
+        if G["node_mu"].dtype != mu_ref.dtype or not torch.equal(_bits(G["node_mu"].float()), _bits(mu_ref.float())):
+            bad.append("node_mu")
+        if not _same(F["node"][..., Dh + 1:], G["node_aux"][..., 1:]):
+            bad.append("node_aux")
+        eps_ref = (F["node"][..., :Dh] - mu_ref.float()).norm(dim=-1)
+        rad_ref = F["node"][..., Dh] + eps_ref
+        slack = mu_ref.float().norm(dim=-1) * (2.0 ** -8) + 1e-6
+        if not bool(((G["node_aux"][..., 0] - rad_ref).abs() <= slack).all()):
+            bad.append("rad")
     if not _same(mb, gb):
         bad.append("m_b")
     return bad
@@ -459,7 +478,8 @@ def test_forests_cuda_fp64_tau_matches_reference():
 
 
 def test_forests_cuda_empty_batch():
-    # T = 0 heads: empty tables of the usual layout, and the CUDA build stays on
+    # T = 0 heads: empty tables of the usual layout (split node tables, as every CUDA build returns them), and the
+    # CUDA build stays on
     bc = _bc()
     M, Dh, H = 100, 64, 4
     E = torch.arange(10, device=DEV).long()
@@ -469,7 +489,9 @@ def test_forests_cuda_empty_batch():
     lay = bc.forest_layout(M)
     for F, mb in got:
         assert F["T"] == 0 and tuple(F["adm"].shape) == (0, M) and tuple(F["m_tot"].shape) == (0,)
-        assert tuple(F["node"].shape) == (0, lay["Ntot"], Dh + 9) and tuple(F["leaf"].shape) == (0, lay["Ltot"])
+        assert tuple(F["node_mu"].shape) == (0, lay["Ntot"], Dh) and F["node_mu"].dtype == torch.bfloat16
+        assert tuple(F["node_aux"].shape) == (0, lay["Ntot"], 9) and F["node_aux"].dtype == torch.float32
+        assert tuple(F["leaf"].shape) == (0, lay["Ltot"])
         assert tuple(mb.shape) == (0, 10) and mb.dtype == torch.long
     K, ce, taus, E, H = _inputs(4, M, Dh, seed=52)
     _exact(K, ce, None, taus, E, H, bc.forests_cuda(K, ce, None, taus, E))
@@ -494,9 +516,10 @@ def test_forests_cuda_padded_M_matches_unpadded(monkeypatch, T, M, Dh):
     spp = torch.zeros(T, M_pad, device=DEV); spp[:, :M] = sp
 
     def rebased(F, t, k, j):
+        # the split node tables hold exactly the packed row's fields: bf16 means (exact upcast) + fp32 aggregates
         size = 1 << k; nodes = 2 * size - 1
         nb, lb = F["bases"][k] + j * nodes, F["leafbases"][k] + j * size
-        row = F["node"][t, nb:nb + nodes].clone()
+        row = torch.cat([F["node_mu"][t, nb:nb + nodes].float(), F["node_aux"][t, nb:nb + nodes]], dim=-1)
         cc = row[:, Dh + 4:Dh + 6]
         row[:, Dh + 4:Dh + 6] = torch.where(cc >= 0, cc - float(nb), cc)
         row[:, Dh + 7] -= float(lb)

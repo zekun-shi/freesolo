@@ -248,9 +248,12 @@ if _HAVE_TRITON:
         tl.store(NSL + base + dest, Ss, mask=Ss >= 0)
 
     @triton.jit
-    def _spine_kernel(MB, TIDX, NODE, BASE, NPR, HASK, JB, SPO, ROOT, HGT, Ntot, S, jb_row,
-                      DH: tl.constexpr, DHP: tl.constexpr, NC: tl.constexpr, HAS_JB: tl.constexpr):
-        # one prefix row: merge the chunk roots selected by the bits of m_b into the spine, low bit first
+    def _spine_kernel(MB, TIDX, NODE_MU, NODE_AX, BASE, NPR, HASK, JB, SPO, ROOT, HGT, Ntot, S, jb_row,
+                      DH: tl.constexpr, DHP: tl.constexpr, NA: tl.constexpr, NC: tl.constexpr, HAS_JB: tl.constexpr,
+                      PK: tl.constexpr):
+        # one prefix row: merge the chunk roots selected by the bits of m_b into the spine, low bit first. PK=1:
+        # the source is the packed fp32 node table (row stride NC, aux at DH..); PK=0: the split lean arena
+        # (bf16 means at stride DH, fp32 aux at stride NA)
         p = tl.program_id(0).to(tl.int64)
         m = tl.load(MB + p)
         t = tl.load(TIDX + p)
@@ -273,12 +276,19 @@ if _HAVE_TRITON:
             croot = tl.load(BASE + kk) + j * tl.load(NPR + kk)
             bit = ((m >> kk) & 1) != 0
             present = bit & (tl.load(HASK + kk) != 0)
-            g = (t * Ntot + tl.minimum(tl.maximum(croot, 0), Ntot - 1)) * NC
-            c_mu = tl.load(NODE + g + d, mask=dm, other=0.0)
-            c_rad = tl.load(NODE + g + DH)
-            c_am = tl.load(NODE + g + DH + 1)
-            c_pm = tl.load(NODE + g + DH + 2)
-            c_cnt = tl.load(NODE + g + DH + 3)
+            g = t * Ntot + tl.minimum(tl.maximum(croot, 0), Ntot - 1)
+            if PK:
+                c_mu = tl.load(NODE_MU + g * NC + d, mask=dm, other=0.0)
+                c_rad = tl.load(NODE_MU + g * NC + DH)
+                c_am = tl.load(NODE_MU + g * NC + DH + 1)
+                c_pm = tl.load(NODE_MU + g * NC + DH + 2)
+                c_cnt = tl.load(NODE_MU + g * NC + DH + 3)
+            else:
+                c_mu = tl.load(NODE_MU + g * DH + d, mask=dm, other=0.0).to(tl.float32)
+                c_rad = tl.load(NODE_AX + g * NA)
+                c_am = tl.load(NODE_AX + g * NA + 1)
+                c_pm = tl.load(NODE_AX + g * NA + 2)
+                c_cnt = tl.load(NODE_AX + g * NA + 3)
             mk = present & (r_cnt > 0)
             tot = tl.maximum(c_cnt + r_cnt, 1.0)
             n_mu = tl.math.div_rn(c_cnt * c_mu + r_cnt * r_mu, tot)
@@ -353,11 +363,12 @@ if _HAVE_TRITON:
         tl.store(MC + T + t, m1)
 
     @triton.jit
-    def _pack_lean_chunks_kernel(MTOT, JBASE, SRC_NODE, SRC_LEAF, EMP, DST_NODE, DST_LEAF,
+    def _pack_lean_chunks_kernel(MTOT, JBASE, SRC_NODE, SRC_AX, SRC_LEAF, EMP, DST_MU, DST_AX, DST_LEAF,
                                  K_N, BASE_N, STR_N, U_N, DST_N,
                                  K_L, BASE_L, STR_L, U_L, DST_L,
                                  jb_s0_e, Kmax_e, Ntot_e, Ltot_e, ncap_e, lcap_e, U_tot_e, V_tot_e, n_leaf_blks_e,
-                                 DH3: tl.constexpr, DHP: tl.constexpr, NC: tl.constexpr):
+                                 DH: tl.constexpr, DH3: tl.constexpr, DHP: tl.constexpr, NA: tl.constexpr,
+                                 NC: tl.constexpr, PK: tl.constexpr):
         jb_s0 = (jb_s0_e >> 2).to(tl.int64)
         Kmax = (Kmax_e >> 2).to(tl.int64)
         Ntot = (Ntot_e >> 2).to(tl.int64)
@@ -386,9 +397,28 @@ if _HAVE_TRITON:
             dn = tl.load(DST_N + p).to(tl.int64)
             d = tl.arange(0, DHP).to(tl.int64)
             dm = d < DH3
-            val = tl.load(SRC_NODE + (t * Ntot + sn) * NC + d, mask=dm & has, other=0.0)
+            if PK:
+                val = tl.load(SRC_NODE + (t * Ntot + sn) * NC + d, mask=dm & has, other=0.0)
+            else:
+                # the split table supplies its bf16 means already rounded: upcasting and re-rounding is the identity,
+                # so the rounding slack this kernel would add is zero and the stored radius passes through
+                val = tl.load(SRC_NODE + (t * Ntot + sn) * DH + d, mask=(d < DH) & has, other=0.0).to(tl.float32)
+                av = tl.load(SRC_AX + (t * Ntot + sn) * NA + (d - DH), mask=dm & (d >= DH) & has, other=0.0)
+                val = tl.where(d < DH, val, av)
             emp_v = tl.load(EMP + t * DH3 + d, mask=dm & (~has), other=0.0)
-            tl.store(DST_NODE + (t * ncap + dn) * NC + d, tl.where(has, val, emp_v), mask=dm)
+            row32 = tl.where(has, val, emp_v)
+            mu_w = row32.to(tl.bfloat16)
+            mu_up = mu_w.to(tl.float32)
+            diff = tl.where(d < DH, row32 - mu_up, 0.0)
+            eps = tl.sqrt_rn(tl.sum(diff * diff, axis=0))
+            row_m = d < DH
+            tl.store(DST_MU + (t * ncap + dn) * DH + d, mu_w, mask=row_m)
+            rad = tl.sum(tl.where(d == DH, row32, 0.0), axis=0)
+            am = tl.sum(tl.where(d == DH + 1, row32, 0.0), axis=0)
+            pm = tl.sum(tl.where(d == DH + 2, row32, 0.0), axis=0)
+            tl.store(DST_AX + (t * ncap + dn) * NA, rad + eps)
+            tl.store(DST_AX + (t * ncap + dn) * NA + 1, am)
+            tl.store(DST_AX + (t * ncap + dn) * NA + 2, pm)
         if p < n_leaf_blks:
             q = p * 64 + tl.arange(0, 64).to(tl.int64)
             qm = q < V_tot
@@ -496,9 +526,16 @@ def build_trees_fast(Kbar: torch.Tensor, ceil_c: torch.Tensor, admit: torch.Tens
 
 
 def fast_spines_ok(F: dict, m_b: torch.Tensor) -> bool:
-    node = F["node"]
-    return (fast_build_on() and m_b.is_cuda and node.is_cuda and node.dtype == torch.float32 and node.is_contiguous()
-            and m_b.dtype == torch.int64 and 1 <= F["Dh"] <= 256)
+    # two exact sources, both read straight from their table so the result never depends on whether a beam call
+    # left views cached on F: the packed fp32 node rows (build_forest / flattened caches) or the split lean arena
+    if not (fast_build_on() and m_b.is_cuda and m_b.dtype == torch.int64 and 1 <= F.get("Dh", 0) <= 256):
+        return False
+    node = F.get("node")
+    if node is not None:
+        return node.is_cuda and node.dtype == torch.float32 and node.is_contiguous()
+    mu = F.get("node_mu")
+    return (mu is not None and mu.is_cuda and mu.dtype == torch.bfloat16 and mu.is_contiguous()
+            and F["node_aux"].dtype == torch.float32 and F["node_aux"].is_contiguous())
 
 
 @torch.no_grad()
@@ -507,7 +544,15 @@ def build_spines_fast(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, consts, o
     Tp = m_b.shape[0]
     Dh = F["Dh"]
     S = F["Kmax"] + 1
-    NC = F["node"].shape[-1]
+    node = F.get("node")
+    pk = node is not None
+    if pk:
+        src_mu = src_ax = node
+        NA = node.shape[-1] - Dh
+    else:
+        src_mu, src_ax = F["node_mu"], F["node_aux"]
+        NA = src_ax.shape[-1]
+    NC = Dh + NA
     _, base_t, npr_t, has_k = consts[:4]
     has_k_i8 = consts[4] if len(consts) > 4 else has_k.to(torch.int8)
     if out is not None and out["node"].shape == (Tp, S, NC):
@@ -518,10 +563,10 @@ def build_spines_fast(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, consts, o
         height = torch.empty((Tp,), dtype=torch.long, device=m_b.device)
     jb = F.get("jbase")
     if Tp > 0:
-        _spine_kernel[(Tp,)](m_b.contiguous(), t_idx.contiguous(), F["node"], base_t, npr_t, has_k_i8,
-                             jb if jb is not None else m_b, sp, root, height, F["Ntot"], S,
-                             jb.stride(0) if jb is not None else 0, DH=Dh, DHP=_pow2(Dh), NC=NC,
-                             HAS_JB=jb is not None, num_warps=1, enable_fp_fusion=False)
+        _spine_kernel[(Tp,)](m_b.contiguous(), t_idx.contiguous(), src_mu, src_ax, base_t, npr_t,
+                             has_k_i8, jb if jb is not None else m_b, sp, root, height, F["Ntot"], S,
+                             jb.stride(0) if jb is not None else 0, DH=Dh, DHP=_pow2(Dh), NA=NA,
+                             NC=NC, HAS_JB=jb is not None, PK=pk, num_warps=1, enable_fp_fusion=False)
     if out is not None and out["node"] is sp:
         out["m_b"] = m_b
         out["t_idx"] = t_idx
@@ -572,18 +617,24 @@ def pack_lean_chunks_fast(fc, F_cuda: dict, emp: torch.Tensor, Kmax: int, idx_c:
     V_tot = k_l.shape[0]
     n_leaf_blks = (V_tot + 63) // 64
     grid_p = max(U_tot, n_leaf_blks, 1)
-    node_src = F_cuda["node"]
+    node_src = F_cuda.get("node")
+    pk = node_src is not None
+    if pk:
+        ax_src = node_src
+    else:
+        node_src = F_cuda["node_mu"]
+        ax_src = F_cuda["node_aux"]
     leaf_src = F_cuda["leaf"]
     NC = node_src.shape[-1]
     DH3 = Dh + 3
     DHP = _pow2(DH3)
     _pack_lean_chunks_kernel[(grid_p, T)](
-        fc.m_tot, jb, node_src, leaf_src, emp, fc._node_arena, fc._leaf_arena,
+        fc.m_tot, jb, node_src, ax_src, leaf_src, emp, fc._arena_mu, fc._arena_aux, fc._leaf_arena,
         k_n, base_n, str_n, u_n, dst_n,
         k_l, base_l, str_l, u_l, dst_l,
         _enc_i(jb.stride(0)), _enc_i(Kmax), _enc_i(F_cuda["Ntot"]), _enc_i(F_cuda["Ltot"]),
-        _enc_i(fc._node_arena.shape[1]), _enc_i(fc._leaf_arena.shape[1]),
+        _enc_i(fc._arena_mu.shape[1]), _enc_i(fc._leaf_arena.shape[1]),
         _enc_i(U_tot), _enc_i(V_tot), _enc_i(n_leaf_blks),
-        DH3=DH3, DHP=DHP, NC=NC, num_warps=2)
+        DH=Dh, DH3=DH3, DHP=DHP, NA=9, NC=NC, PK=pk, num_warps=2)
     return jb
 

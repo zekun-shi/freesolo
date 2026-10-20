@@ -1,5 +1,4 @@
 import ctypes
-import hashlib
 
 import pytest
 import torch
@@ -88,17 +87,6 @@ def test_launch_dynamic_shared_memory():
         bc.launch(fn, 1, 256, x.device, args, smem=1 << 20)                         # 1 MB: past every GPU's limit
 
 
-def test_legacy_source_is_9b4e9ff():
-    # FSB_BEAM_ROWS=0 must restore the CUDA beam of 9b4e9ff exactly: its kernel source, byte for byte (the sha256 of
-    # 9b4e9ff's beam_source for these configurations); the current warp kernel's source differs
-    golden = {(73, 64, 64, 16, 4, True, False, 4): "bc050b301c19451a368e01bd486a9c32587befb03b8500524684542a1814f3b8",
-              (73, 64, 64, 16, 1, True, True, 4): "9448e4479315581d655be1e31038fff6b6920e7fe6b0d2e1140863260dae9cda",
-              (41, 32, 32, 8, 4, False, False, 4): "c69e85a23903529c63179f49b21d5e00ecbc5d98aff921fca384cb43e0aa3e12"}
-    for cfg, h in golden.items():
-        assert hashlib.sha256(bc.beam_source(*cfg, legacy=True).encode()).hexdigest() == h
-        assert bc.beam_source(*cfg) != bc.beam_source(*cfg, legacy=True)
-
-
 def _forest_stage(seed, M, H=16, nbc=32, Bq=128, D=64, s=32, admit_all=True):
     # one prefill stage of a 16k-token forest (65536 descents at Bq=128) with clustered keys and queries
     g = torch.Generator().manual_seed(seed)
@@ -123,13 +111,11 @@ def _forest_stage(seed, M, H=16, nbc=32, Bq=128, D=64, s=32, admit_all=True):
 
 
 @gpu
-@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("width,delta,admit_all,node_score,rc_tensor", [
     (16, 0, True, "bound", False), (4, 2, True, "bound", False), (16, 2, False, "bound", True),
     (8, 0, False, "mean", False), (1, 0, True, "bound", False)])
-def test_cuda_beam_matches_level_kernel(monkeypatch, width, delta, admit_all, node_score, rc_tensor, legacy):
-    # warp-per-query CUDA descent (the current kernel and 9b4e9ff's) == the per-level Triton reference: cells and
-    # visit counts, bitwise
+def test_cuda_beam_matches_level_kernel(monkeypatch, width, delta, admit_all, node_score, rc_tensor):
+    # warp-per-query CUDA descent == the per-level Triton reference: cells and visit counts, bitwise
     F, SP, q, qpos, lam, sigv = _forest_stage(9 + width + delta, 512, admit_all=admit_all)
     s = 32
     rows, Bq = q.shape[:2]
@@ -140,7 +126,7 @@ def test_cuda_beam_matches_level_kernel(monkeypatch, width, delta, admit_all, no
     monkeypatch.setenv("FSB_FAST_BEAM", "0")
     ref = fsb_tree._forest_beam(F, SP, q, qpos, lam, sigv, 0.125, s, W, dl, width, 2, node_score, rc, None)
     bud = torch.bitwise_left_shift(torch.ones_like(dl), dl)
-    got = bc.forest_beam_cuda(F, SP, q, qpos, lam, sigv, 0.125, s, W, bud, width, 2, node_score, rc, legacy=legacy)
+    got = bc.forest_beam_cuda(F, SP, q, qpos, lam, sigv, 0.125, s, W, bud, width, 2, node_score, rc)
     assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
 
 
@@ -148,8 +134,8 @@ def test_cuda_beam_matches_level_kernel(monkeypatch, width, delta, admit_all, no
 @pytest.mark.parametrize("rows", ["1", "0"])
 @pytest.mark.parametrize("Bq", [1, 3])
 def test_cuda_beam_decode_rows(monkeypatch, Bq, rows):
-    # decode-shaped grids (one row per head, a few queries) through forest_beam_fused's dispatch: the current warp
-    # kernel, or 9b4e9ff's with FSB_BEAM_ROWS=0
+    # decode-shaped grids (one row per head, a few queries) through forest_beam_fused's dispatch: the warp
+    # kernel either way (FSB_BEAM_ROWS=0 forces it for prefill rows too)
     monkeypatch.setenv("FSB_BEAM_ROWS", rows)
     F, SP, q, qpos, lam, sigv = _forest_stage(21, 512, nbc=1)
     q, qpos = q[:, :Bq].contiguous(), qpos[:, :Bq].contiguous()
@@ -230,8 +216,7 @@ def test_rows_build_failure_keeps_warp_kernel(monkeypatch):
 
 
 @gpu
-@pytest.mark.parametrize("legacy", [False, True])
-def test_cuda_beam_edge_rows(monkeypatch, legacy):
+def test_cuda_beam_edge_rows(monkeypatch):
     # rows of beam width 0 (the reference drops even a carried root), roots carried at once (large budgets), and an
     # empty grid
     F, SP, q, qpos, lam, sigv = _forest_stage(13, 128, nbc=2)
@@ -242,11 +227,11 @@ def test_cuda_beam_edge_rows(monkeypatch, legacy):
     monkeypatch.setenv("FSB_FAST_BEAM", "0")
     ref = fsb_tree._forest_beam(F, SP, q, qpos, lam, sigv, 0.125, 32, W, dl, 2, 2, "bound", 8.0, None)
     bud = torch.bitwise_left_shift(torch.ones_like(dl), dl)
-    got = bc.forest_beam_cuda(F, SP, q, qpos, lam, sigv, 0.125, 32, W, bud, 2, 2, "bound", 8.0, legacy=legacy)
+    got = bc.forest_beam_cuda(F, SP, q, qpos, lam, sigv, 0.125, 32, W, bud, 2, 2, "bound", 8.0)
     assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
     assert bool((W == 0).any()) and bool((ref[0][W == 0] == -1).all())
     cells, nvis = bc.forest_beam_cuda(F, SP, q[:0], qpos[:0], lam[:0], sigv[:0], 0.125, 32, W[:0], bud[:0], 2, 2,
-                                      "bound", 8.0, legacy=legacy)
+                                      "bound", 8.0)
     assert cells.shape == (0, Bq, 8) and nvis.shape == (0, Bq)
 
 
@@ -321,6 +306,29 @@ def test_rows_pair_one_launch(monkeypatch):
 
 
 @gpu
+@pytest.mark.parametrize("dt", [torch.float32, torch.bfloat16])
+def test_rows_beam_strided_stage_view(monkeypatch, dt):
+    # the prefill stage loop's tail blocks hand the kernel a strided view of the live query tensor with q_nq real
+    # rows: rows at and beyond q_nq must read as a zero query. The same kernel on the zero-padded packed copy gives
+    # the identical traversal, bitwise, in both beams of the pair launch; the pad region is poisoned with NaNs so an
+    # unguarded read changes that row's output
+    F, SP, q, qpos, lam, sigv = _forest_stage(41, 256, admit_all=False)
+    Fu, SPu, *_ = _forest_stage(43, 256, admit_all=False)
+    rows, Bq, Dh = q.shape
+    nq = 3 * Bq // 4
+    qbig = torch.randn(rows, 3 * Bq, Dh, generator=torch.Generator().manual_seed(5)).cuda().to(dt)
+    qbig[:, nq:Bq].fill_(float("nan"))
+    qref = torch.zeros(rows, Bq, Dh, device="cuda", dtype=dt)
+    qref[:, :nq] = qbig[:, :nq]
+    W, dl, bud = _rows_args(F, SP, q, qpos, lam, sigv, 16, 0)
+    Wu, du, budu = _rows_args(Fu, SPu, q, qpos, lam, sigv, 8, 1)
+    beams = [(F, SP, W, bud, 16), (Fu, SPu, Wu, budu, 16)]
+    ref = bc.forest_beam_rows_cuda(beams, qref, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0)
+    got = bc.forest_beam_rows_cuda(beams, qbig[:, :Bq], qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0, q_nq=nq)
+    assert all(torch.equal(a, b) for a, b in zip(ref[0] + ref[1], got[0] + got[1]))
+
+
+@gpu
 @pytest.mark.parametrize("umax", [None, 32])
 @pytest.mark.parametrize("Bq", [128, 77, 32, 200])
 def test_rows_edge_rows(monkeypatch, Bq, umax):
@@ -346,8 +354,8 @@ def test_rows_edge_rows(monkeypatch, Bq, umax):
 @gpu
 def test_rows_ties_and_nonfinite(monkeypatch):
     # exact score ties (cells with duplicated keys, no position term: siblings tie and the slot order decides), and
-    # infinite query entries (inf / NaN scores) against the warp kernels (9b4e9ff's and the current one), which share
-    # the fused kernels' convention
+    # infinite query entries (inf / NaN scores) against the warp kernel, which shares the fused kernels'
+    # convention
     g = torch.Generator().manual_seed(7)
     H, M, s, D, nbc, Bq = 16, 512, 32, 64, 8, 128
     base = (torch.randn(H, M // 2, s, D, generator=g) * 0.5).repeat_interleave(2, 1).to("cuda", torch.bfloat16).float()
@@ -372,9 +380,8 @@ def test_rows_ties_and_nonfinite(monkeypatch):
     qi[::3, ::5, 0] = float("inf")
     qi[1::3, ::7, 3] = -float("inf")
     got = bc.forest_beam_rows_cuda([(F, SP, W, bud, 16)], qi, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0)
-    for legacy in (True, False):
-        warp = bc.forest_beam_cuda(F, SP, qi, qpos, lam, sigv, 0.125, 32, W, bud, 16, 2, "bound", 8.0, legacy=legacy)
-        assert torch.equal(warp[0], got[0][0]) and torch.equal(warp[1], got[0][1])
+    warp = bc.forest_beam_cuda(F, SP, qi, qpos, lam, sigv, 0.125, 32, W, bud, 16, 2, "bound", 8.0)
+    assert torch.equal(warp[0], got[0][0]) and torch.equal(warp[1], got[0][1])
 
 
 @gpu
@@ -430,10 +437,10 @@ def _launch_spy(monkeypatch):
 
 
 @gpu
-def test_rows_flag_restores_9b4e9ff_path(monkeypatch):
-    # FSB_BEAM_ROWS=0 launches 9b4e9ff's warp kernel (its exact source) for prefill and decode rows, one launch per
-    # beam, and traverse_forest does not try the paired launch; the default runs the row kernel (one launch for both
-    # beams) and the current warp kernel for decode rows. Same cells, visit counts and selections either way.
+def test_rows_flag_restores_warp_path(monkeypatch):
+    # FSB_BEAM_ROWS=0 launches the warp-per-query kernel for prefill and decode rows, one launch per beam, and
+    # traverse_forest does not try the paired launch; the default runs the row kernel (one launch for both beams) and
+    # the warp kernel for decode rows. Same cells, visit counts and selections either way.
     F, SP, q, qpos, lam, sigv = _forest_stage(23, 512, nbc=2)
     Fu, SPu, *_ = _forest_stage(23, 512, nbc=2, admit_all=False)
     W, dl, _ = _rows_args(F, SP, q, qpos, lam, sigv, 16, 0)
@@ -445,15 +452,15 @@ def test_rows_flag_restores_9b4e9ff_path(monkeypatch):
     def trav():
         return fsb_tree.traverse_forest(F, SP, q, qpos, lam, sigv, 0.125, 32, W, dl, 16, 2, "bound", 8.0,
                                         union_width=16, union_W_max=16, union_F=Fu, union_SP=SPu, union_delta=du)
-    warp = {lg: bc.beam_source(73, 64, 64, 16, 4, True, False, bc._NWARP, legacy=lg) for lg in (False, True)}
+    warp = bc.beam_source(73, 64, 64, 16, 4, True, False, bc._NWARP)
     rows_src = bc.rows_source(73, 64, 16, 4, True, False)[0]
     pairs = []
     real_pair = fast.forest_beam_pair
     monkeypatch.setattr(fast, "forest_beam_pair", lambda *a: pairs.append(1) or real_pair(*a))
     sources = _launch_spy(monkeypatch)
     got = {}
-    for flag, want in (("0", ([warp[True]], [warp[True]], [warp[True]] * 2)),
-                       ("1", ([rows_src], [warp[False]], [rows_src]))):
+    for flag, want in (("0", ([warp], [warp], [warp] * 2)),
+                       ("1", ([rows_src], [warp], [rows_src]))):
         monkeypatch.setenv("FSB_BEAM_ROWS", flag)
         got[flag] = []
         for run, w in zip((lambda: fast.forest_beam_fused(*pre), lambda: fast.forest_beam_fused(*dec), trav), want):
@@ -526,7 +533,7 @@ def test_beam_cuda_graph_capture(monkeypatch, rows):
 
     eager = [t.clone() for t in run()]                                       # builds the kernels
     sources = _launch_spy(monkeypatch)
-    warp = bc.beam_source(73, 64, 64, 16, 4, True, False, bc._NWARP, legacy=rows == "0")
+    warp = bc.beam_source(73, 64, 64, 16, 4, True, False, bc._NWARP)
     g, out, launched = capture()
     assert launched == ([bc.rows_source(73, 64, 16, 4, True, False)[0], warp] if rows == "1" else [warp] * 3)
     g.replay()
@@ -554,15 +561,16 @@ def test_beam_cuda_graph_capture(monkeypatch, rows):
 @gpu
 def test_nan_counts_dropped_by_every_cuda_beam(monkeypatch):
     # a node whose subtree count is NaN (the forest builders never write one) is neither expanded nor carried: the row
-    # kernel drops it like both warp kernels and the per-level reference (the PyTorch loop, FSB_TRAVERSE_TRITON=0,
-    # carries it, as on 9b4e9ff), also through several tile passes and the warp fallback, and for a NaN root
+    # kernel drops it like the warp kernel and the per-level reference (the PyTorch loop, FSB_TRAVERSE_TRITON=0,
+    # carries it), also through several tile passes and the warp fallback, and for a NaN root
     F, SP, q, qpos, lam, sigv = _forest_stage(41, 512, nbc=4)
     W, dl, bud = _rows_args(F, SP, q, qpos, lam, sigv, 16, 0)
-    D = q.shape[-1]
     clean = _ref_beam(monkeypatch, F, SP, q, qpos, lam, sigv, W, dl, 16, 2, "bound", 8.0)
-    Fn, SPn = dict(F, node=F["node"].clone()), dict(SP, node=SP["node"].clone())
-    Fn["node"][:, 3::7, D + 3] = float("nan")                                # every 7th chunk node
-    SPn["node"][::5, :, D + 3] = float("nan")                                # every spine node (and root) of some rows
+    fsb_tree._beam_views(F)
+    Fn = dict(F, node_mu=F["node_mu"].clone(), node_aux=F["node_aux"].clone())
+    SPn = dict(SP, node=SP["node"].clone())
+    Fn["node_aux"][:, 3::7, 3] = float("nan")                              # every 7th chunk node
+    SPn["node"][::5, :, F["Dh"] + 3] = float("nan")                          # every spine node (and root) of some rows
     ref = _ref_beam(monkeypatch, Fn, SPn, q, qpos, lam, sigv, W, dl, 16, 2, "bound", 8.0)
     assert not torch.equal(ref[0], clean[0]) and bool((ref[0][::5] == -1).all())
     beams = [(Fn, SPn, W, bud, 16)]
@@ -570,10 +578,8 @@ def test_nan_counts_dropped_by_every_cuda_beam(monkeypatch):
            "rows_2node_tile": bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0,
                                                        cap=2)[0],
            "rows_fallback": bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0,
-                                                     umax=32)[0]}
-    for lg in (False, True):
-        got[f"warp_legacy={lg}"] = bc.forest_beam_cuda(Fn, SPn, q, qpos, lam, sigv, 0.125, 32, W, bud, 16, 2, "bound",
-                                                       8.0, legacy=lg)
+                                                     umax=32)[0],
+           "warp": bc.forest_beam_cuda(Fn, SPn, q, qpos, lam, sigv, 0.125, 32, W, bud, 16, 2, "bound", 8.0)}
     for k, v in got.items():
         assert torch.equal(ref[0], v[0]) and torch.equal(ref[1], v[1]), k
 
@@ -584,7 +590,7 @@ def test_nan_counts_dropped_by_every_cuda_beam(monkeypatch):
 @pytest.mark.parametrize("rc_tensor", [False, True])
 def test_decode_pair_one_launch(monkeypatch, Bq, dmax, rc_tensor):
     # decode and small-row beam pairs (Bq < 32): both beams run in one launch of fsb_beam_pair_cuda and match two
-    # reference calls bitwise; FSB_BEAM_ROWS=0 falls back to two single-beam legacy launches
+    # reference calls bitwise; FSB_BEAM_ROWS=0 falls back to two single-beam warp launches
     F, SP, q, qpos, lam, sigv = _forest_stage(37 + Bq + dmax, 512, nbc=1)
     Fu, SPu, *_ = _forest_stage(37 + Bq + dmax, 512, nbc=1, admit_all=False)
     q, qpos = q[:, :Bq].contiguous(), qpos[:, :Bq].contiguous()

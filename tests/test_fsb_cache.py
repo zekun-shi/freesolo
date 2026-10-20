@@ -1,4 +1,5 @@
 import math
+import warnings
 from pathlib import Path
 
 import pytest
@@ -92,21 +93,26 @@ def test_lean_arena_reuses_unchanged_chunks(monkeypatch):
     tau = torch.zeros(rows)
     fast = make_cache(monkeypatch, rows, dim, True, True)
     fast.ingest(keys, ceilings, 12, tau)
-    old_node, old_leaf = fast.F["node"], fast.F["leaf"]
+    old_mu, old_aux, old_leaf = fast.F["node_mu"], fast.F["node_aux"], fast.F["leaf"]
     base, leafbase = fast.F["bases"][3], fast.F["leafbases"][3]
-    unchanged_node = old_node[:, base:base + 15].clone()
+    unchanged_mu = old_mu[:, base:base + 15].clone()
+    unchanged_aux = old_aux[:, base:base + 15].clone()
     unchanged_leaf = old_leaf[:, leafbase:leafbase + 8].clone()
     fast.ingest(keys, ceilings, 13, tau)
-    assert fast.F["node"] is old_node
+    assert fast.F["node_mu"] is old_mu
+    assert fast.F["node_aux"] is old_aux
     assert fast.F["leaf"] is old_leaf
     assert fast.F["bases"][3] == base
     assert fast.F["leafbases"][3] == leafbase
-    assert torch.equal(old_node[:, base:base + 15], unchanged_node)
+    assert torch.equal(old_mu[:, base:base + 15], unchanged_mu)
+    assert torch.equal(old_aux[:, base:base + 15], unchanged_aux)
     assert torch.equal(old_leaf[:, leafbase:leafbase + 8], unchanged_leaf)
     fast.ingest(keys, ceilings, 17, tau)
-    assert fast.F["node"] is not old_node
+    assert fast.F["node_mu"] is not old_mu
+    assert fast.F["node_aux"] is not old_aux
     assert fast.F["leaf"] is not old_leaf
-    assert torch.equal(fast.F["node"][:, base:base + 15], unchanged_node)
+    assert torch.equal(fast.F["node_mu"][:, base:base + 15], unchanged_mu)
+    assert torch.equal(fast.F["node_aux"][:, base:base + 15], unchanged_aux)
     assert torch.equal(fast.F["leaf"][:, leafbase:leafbase + 8], unchanged_leaf)
 
 
@@ -216,19 +222,29 @@ def test_decode_ingest_cuda_matches_lean_reference(monkeypatch, tau_mode, spread
         cache = ForestCache(rows, dim, "cuda", lean=True)
         calls.clear()
         snap = []
-        for visible in steps:
-            cache.ingest(keys, ceilings, visible, tau, spread_all=spread_all)
-            F = cache.F
-            snap.append((F["node"].clone(), F["leaf"].clone(), dict(F["bases"]), dict(F["leafbases"]),
-                         F["jbase"].clone(), cache.m_tot.clone(), cache.adm.clone(),
-                         selections(F, q, visible * 16)))
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            for visible in steps:
+                cache.ingest(keys, ceilings, visible, tau, spread_all=spread_all)
+                F = cache.F
+                snap.append((F["node_mu"].clone(), F["node_aux"].clone(), F["leaf"].clone(), dict(F["bases"]),
+                             dict(F["leafbases"]), F["jbase"].clone(), cache.m_tot.clone(), cache.adm.clone(),
+                             selections(F, q, visible * 16)))
         runs[flag] = snap
         if flag == "1":
             assert len(calls) == len(steps)                # every step built through the CUDA forest
+            assert not [w for w in rec if "forest build failed" in str(w.message)]
     for step, (ref, got) in enumerate(zip(runs["0"], runs["1"])):
-        for name, a, b in zip(("node", "leaf", "bases", "leafbases", "jbase", "m_tot", "adm"), ref[:7], got[:7]):
+        for name, a, b in zip(("node_mu", "leaf", "bases", "leafbases", "jbase", "m_tot", "adm"),
+                              ref[:1] + ref[2:8], got[:1] + got[2:8]):
             assert (a == b) if isinstance(a, dict) else torch.equal(a, b), (name, steps[step])
-        assert all(torch.equal(a, b) for a, b in zip(ref[7], got[7])), ("selections", steps[step])
+        # both writers store radius + |mu32 - bf16(mu32)| as the bound; the two eps terms round in different
+        # reduction orders, so cols 1..8 and the leaves match bit for bit while col 0 agrees up to a bf16 slack
+        for name, i in (("aux1+", 1),):
+            assert torch.equal(ref[1][..., i:], got[1][..., i:]), (name, steps[step])
+        slack = ref[0].float().norm(dim=-1) * (2.0**-8) + 1e-6
+        assert bool(((ref[1][..., 0] - got[1][..., 0]).abs() <= slack).all()), ("aux0", steps[step])
+        assert all(torch.equal(a, b) for a, b in zip(ref[8], got[8])), ("selections", steps[step])
 
 
 @_CUDA
@@ -251,8 +267,8 @@ def test_decode_ingest_cuda_transient_failure_falls_back(monkeypatch):
         for visible in steps:
             cache.ingest(keys, ceilings, visible, tau)
             F = cache.F
-            snap.append((F["node"].clone(), F["leaf"].clone(), F["jbase"].clone(), cache.m_tot.clone(),
-                         cache.adm.clone(), selections(F, q, visible * 16)))
+            snap.append((F["node_mu"].clone(), F["node_aux"].clone(), F["leaf"].clone(), F["jbase"].clone(),
+                         cache.m_tot.clone(), cache.adm.clone(), selections(F, q, visible * 16)))
         return snap
 
     monkeypatch.setenv("FSB_BUILD_CUDA", "0")
@@ -271,5 +287,10 @@ def test_decode_ingest_cuda_transient_failure_falls_back(monkeypatch):
     got = run()
     assert len(calls) == len(steps)                       # attempted every step, failed only the first
     for step, (a, b) in enumerate(zip(ref, got)):
-        assert all(torch.equal(x, y) for x, y in zip(a[:5], b[:5])), steps[step]
-        assert all(torch.equal(x, y) for x, y in zip(a[5], b[5])), ("selections", steps[step])
+        assert all(torch.equal(x, y) for x, y in zip(a[0:1] + a[2:6], b[0:1] + b[2:6])), steps[step]
+        # means and the non-radius aux fields match bit for bit; each writer's radius carries its own bf16
+        # mean-rounding slack, so col 0 agrees only up to that scale
+        assert torch.equal(a[1][..., 1:], b[1][..., 1:]), ("aux1+", steps[step])
+        slack = a[0].float().norm(dim=-1) * (2.0**-8) + 1e-6
+        assert bool(((a[1][..., 0] - b[1][..., 0]).abs() <= slack).all()), ("aux0", steps[step])
+        assert all(torch.equal(x, y) for x, y in zip(a[6], b[6])), ("selections", steps[step])

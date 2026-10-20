@@ -39,8 +39,9 @@ def _pow2(n: int) -> int:
 
 if _HAVE_TRITON:
     @triton.jit
-    def _beam_level(ref, q, qn, qpos, lam, sig, budget, wbeam, t, tidx, CHUNK, SPINE, Ntot, Sp, scale, cell_size,
-                    NC: tl.constexpr, DH: tl.constexpr, DHP: tl.constexpr, WM: tl.constexpr, BOUND: tl.constexpr):
+    def _beam_level(ref, q, qn, qpos, lam, sig, budget, wbeam, t, tidx, CHUNK_MU, CHUNK_AX, SPINE, Ntot, Sp, scale,
+                    cell_size, NC: tl.constexpr, NA: tl.constexpr, DH: tl.constexpr, DHP: tl.constexpr,
+                    WM: tl.constexpr, BOUND: tl.constexpr):
         # one _level_kernel step on a register frontier. The node scores use _level_kernel's expressions and, like
         # it, compile without multiply-add contraction, so they do not depend on the launch width; the candidate
         # bookkeeping is cheaper but selects the same frontier: carried slots (score 1e30) keep their order ahead
@@ -49,12 +50,12 @@ if _HAVE_TRITON:
         active = ref != -1
         is_c = ref >= 0
         is_s = ref <= -2
-        pn = tl.where(is_c, CHUNK + (tidx * Ntot + tl.where(is_c, ref, 0)) * NC,
-                      SPINE + (t * Sp + tl.where(is_s, -ref - 2, 0)) * NC)
+        pa = tl.where(is_c, CHUNK_AX + (tidx * Ntot + tl.where(is_c, ref, 0)) * NA,
+                      SPINE + (t * Sp + tl.where(is_s, -ref - 2, 0)) * NC + DH)
         okn = is_c | is_s
-        cnt = tl.load(pn + DH + 3, mask=okn, other=0.0)
-        chl = tl.load(pn + DH + 4, mask=okn, other=-1.0)
-        chr_ = tl.load(pn + DH + 5, mask=okn, other=-1.0)
+        cnt = tl.load(pa + 3, mask=okn, other=0.0)
+        chl = tl.load(pa + 4, mask=okn, other=-1.0)
+        chr_ = tl.load(pa + 5, mask=okn, other=-1.0)
         expand = active & (cnt > budget.to(tl.float32))
         carried = active & (cnt <= budget.to(tl.float32))
         chv = tl.interleave(tl.where(expand, chl, -1.0), tl.where(expand, chr_, -1.0)).to(tl.int64)
@@ -63,13 +64,20 @@ if _HAVE_TRITON:
         c_is_s = chv <= -2
         d = tl.arange(0, DHP)
         dmask = d < DH
-        pc = tl.where(c_is_c, CHUNK + (tidx * Ntot + tl.where(c_is_c, chv, 0)) * NC,
-                      SPINE + (t * Sp + tl.where(c_is_s, -chv - 2, 0)) * NC)
+        pcm = (tidx * Ntot + tl.where(c_is_c, chv, 0)) * DH
+        pcs = (t * Sp + tl.where(c_is_s, -chv - 2, 0)) * NC
+        pca = (tidx * Ntot + tl.where(c_is_c, chv, 0)) * NA
         okc = c_is_c | c_is_s
-        mu = tl.load(pc[:, None] + d[None, :], mask=okc[:, None] & dmask[None, :], other=0.0)
-        rad = tl.load(pc + DH, mask=okc, other=0.0)
-        amax = tl.load(pc + DH + 1, mask=okc, other=0.0)
-        pmin = tl.load(pc + DH + 2, mask=okc, other=0.0)
+        mu_c = tl.load(CHUNK_MU + pcm[:, None] + d[None, :],
+                       mask=c_is_c[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+        mu_s = tl.load(SPINE + pcs[:, None] + d[None, :], mask=c_is_s[:, None] & dmask[None, :], other=0.0)
+        mu = tl.where(c_is_c[:, None], mu_c, mu_s)
+        rad = tl.where(c_is_c, tl.load(CHUNK_AX + pca, mask=c_is_c, other=0.0),
+                       tl.load(SPINE + pcs + DH, mask=c_is_s, other=0.0))
+        amax = tl.where(c_is_c, tl.load(CHUNK_AX + pca + 1, mask=c_is_c, other=0.0),
+                        tl.load(SPINE + pcs + DH + 1, mask=c_is_s, other=0.0))
+        pmin = tl.where(c_is_c, tl.load(CHUNK_AX + pca + 2, mask=c_is_c, other=0.0),
+                        tl.load(SPINE + pcs + DH + 2, mask=c_is_s, other=0.0))
         prod = q[None, :] * mu
         content = _halve_rows(prod, DHP) * scale
         if BOUND:
@@ -92,8 +100,8 @@ if _HAVE_TRITON:
 
     @triton.jit
     def _fsb_beam_kernel(ROOT, CELLS, NVIS, Q, RC, rc_s, QPOS, LAM, SIG, WBEAM, BUDGET, TIDX,
-                         CHUNK, SPINE, LEAF, ADM, Ntot, Sp, Ltot, Mm, Bq, scale, cell_size, KMAXP1,
-                         NC: tl.constexpr, DH: tl.constexpr, DHP: tl.constexpr, WM: tl.constexpr,
+                         CHUNK_MU, CHUNK_AX, SPINE, LEAF, ADM, Ntot, Sp, Ltot, Mm, Bq, scale, cell_size, KMAXP1,
+                         NC: tl.constexpr, NA: tl.constexpr, DH: tl.constexpr, DHP: tl.constexpr, WM: tl.constexpr,
                          R: tl.constexpr, BOUND: tl.constexpr, RC_T: tl.constexpr):
         # the whole beam descent for (t', b): the radius-scaled query norm of _forest_beam (_det_norm's halving
         # sum and IEEE sqrt), ROOT init, KMAXP1 _beam_level steps with the frontier in registers and the visit
@@ -117,19 +125,19 @@ if _HAVE_TRITON:
         wbeam = tl.load(WBEAM + pid)
         nvis = 0.0
         for _lev in range(KMAXP1):
-            ref, nv = _beam_level(ref, q, qn, qpos, lam, sig, budget, wbeam, t, tidx, CHUNK, SPINE, Ntot, Sp,
-                                  scale, cell_size, NC, DH, DHP, WM, BOUND)
+            ref, nv = _beam_level(ref, q, qn, qpos, lam, sig, budget, wbeam, t, tidx, CHUNK_MU, CHUNK_AX, SPINE,
+                                  Ntot, Sp, scale, cell_size, NC, NA, DH, DHP, WM, BOUND)
             nvis += nv
         # cells epilogue (the _forest_beam torch tail): src/off/len of each frontier node, then the
         # cell ids from the leaf table (src == 1) or the admission table (src == 2)
         is_c = ref >= 0
-        base_c = (tidx * Ntot + tl.where(is_c, ref, 0)) * NC
+        base_c = (tidx * Ntot + tl.where(is_c, ref, 0)) * NA
         base_s = (t * Sp + tl.where(ref <= -2, -ref - 2, 0)) * NC
-        src = tl.where(is_c, tl.load(CHUNK + base_c + DH + 6, mask=is_c, other=0.0),
+        src = tl.where(is_c, tl.load(CHUNK_AX + base_c + 6, mask=is_c, other=0.0),
                        tl.load(SPINE + base_s + DH + 6, mask=(ref <= -2), other=0.0))
-        off = tl.where(is_c, tl.load(CHUNK + base_c + DH + 7, mask=is_c, other=0.0),
+        off = tl.where(is_c, tl.load(CHUNK_AX + base_c + 7, mask=is_c, other=0.0),
                        tl.load(SPINE + base_s + DH + 7, mask=(ref <= -2), other=0.0))
-        ln = tl.where(is_c, tl.load(CHUNK + base_c + DH + 8, mask=is_c, other=0.0),
+        ln = tl.where(is_c, tl.load(CHUNK_AX + base_c + 8, mask=is_c, other=0.0),
                       tl.load(SPINE + base_s + DH + 8, mask=(ref <= -2), other=0.0))
         tr = tl.arange(0, R)
         pos = off.to(tl.int64)[:, None] + tr[None, :]
@@ -564,12 +572,22 @@ def fast_rerank_on() -> bool:
 def fast_beam_ok(F: dict, SP: dict, q: torch.Tensor, W_max: int, delta_max: int) -> bool:
     if not (fast_beam_on() and q.is_cuda and q.dtype in (torch.float32, torch.bfloat16)):
         return False
+    # structural look only: a packed fp32 forest always satisfies the dtype half and its views materialize at the
+    # beam launch; the gate itself must stay allocation- and launch-free (prefill budgets count both)
+    mu = F.get("node_mu")
+    if mu is None:
+        node = F.get("node")
+        if node is None or node.dtype != torch.float32:
+            return False
+        tables_ok = True
+    else:
+        tables_ok = (mu.dtype == torch.bfloat16 and F["node_aux"].dtype == torch.float32
+                     and mu.is_contiguous() and F["node_aux"].is_contiguous())
     Dh = q.shape[-1]
-    return (Dh <= 256 and W_max >= 1 and (W_max & (W_max - 1)) == 0 and W_max * (1 << delta_max) <= 256
+    return (tables_ok and Dh <= 256 and W_max >= 1 and (W_max & (W_max - 1)) == 0 and W_max * (1 << delta_max) <= 256
             and SP["root"].dtype == torch.int64 and SP["t_idx"].dtype == torch.int64
             and F["leaf"].dtype == torch.int64 and F["adm"].dtype == torch.int64
-            and F["leaf"].is_contiguous() and F["adm"].is_contiguous()
-            and F["node"].is_contiguous() and SP["node"].is_contiguous())
+            and F["leaf"].is_contiguous() and F["adm"].is_contiguous() and SP["node"].is_contiguous())
 
 
 @torch.no_grad()
@@ -579,9 +597,11 @@ def forest_beam_fused(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, la
     # bit-exact fused _forest_beam (Triton path): -> cells (T',Bq,W_max*2^delta_max), n_visit (T',Bq); bud (2^delta)
     # may be passed when the caller already has it. Every kernel on the path compiles without multiply-add
     # contraction, so the launch width is free: one warp per descent for prefill grids, eight for decode.
+    from .fsb_tree import _beam_views
+    chunk_mu, chunk_ax = _beam_views(F)
     Tp, Bq, Dh = q.shape
     R = 1 << delta_max
-    chunk, spine = F["node"], SP["node"]
+    spine = SP["node"]
     rc_t = torch.is_tensor(radius_coef)
     rc = radius_coef.reshape(-1).contiguous() if rc_t else q
     rc_s = 1.0 if rc_t else float(radius_coef)
@@ -603,10 +623,11 @@ def forest_beam_fused(F: dict, SP: dict, q: torch.Tensor, qpos: torch.Tensor, la
     nvis = torch.empty((Tp, Bq), dtype=torch.float32, device=q.device)
     _fsb_beam_kernel[(Tp * Bq,)](SP["root"].contiguous(), cells, nvis, q.contiguous(), rc, rc_s, qpos.contiguous(),
                                  lam.reshape(-1).contiguous(), sigv.reshape(-1).contiguous(),
-                                 W.contiguous(), bud, SP["t_idx"].contiguous(), chunk, spine, F["leaf"], F["adm"],
-                                 chunk.shape[1], spine.shape[1], F["Ltot"], F["M"], Bq, float(scale), float(s),
-                                 F["Kmax"] + 1, NC=chunk.shape[-1], DH=Dh, DHP=_pow2(Dh), WM=W_max, R=R,
-                                 BOUND=(node_score == "bound"), RC_T=rc_t,
+                                 W.contiguous(), bud, SP["t_idx"].contiguous(), chunk_mu, chunk_ax, spine,
+                                 F["leaf"], F["adm"],
+                                 chunk_mu.shape[1], spine.shape[1], F["Ltot"], F["M"], Bq, float(scale), float(s),
+                                 F["Kmax"] + 1, NC=spine.shape[-1], NA=chunk_ax.shape[-1], DH=Dh, DHP=_pow2(Dh),
+                                 WM=W_max, R=R, BOUND=(node_score == "bound"), RC_T=rc_t,
                                  num_warps=8 if Tp * Bq < 2048 else 1, enable_fp_fusion=False)
     return cells, nvis
 

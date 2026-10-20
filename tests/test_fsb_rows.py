@@ -656,6 +656,33 @@ def test_rows_cuda_select_paths_match_legacy(monkeypatch, select, layout):
 
 
 @gpu
+@pytest.mark.parametrize("score", ["lse_pos", "lse", "max"])
+def test_rows_fused_cuda_strided_stage_view(monkeypatch, score):
+    # the fused union+rerank kernel on the prefill stage loop's strided query view (q_nq real rows in a wider
+    # buffer) == itself on the zero-padded packed copy, bitwise: rows at and beyond q_nq must read as a zero query.
+    # The pad region is poisoned with NaNs so an unguarded read changes that row's scores
+    from src.fsattn import fsb_rows_cuda
+    st = _stage(17, 512, H=8)
+    st["sel_a"] = st["sel_a"].view(*st["sel_a"].shape[:2], 16, 4)[..., 0].contiguous()
+    st["sel_b"] = st["sel_b"].view(*st["sel_b"].shape[:2], 16, 4)[..., 0].contiguous()
+    Tp, Bq, Dh = st["q"].shape
+    nq = 100
+    qbig = torch.randn(Tp, 3 * Bq, Dh, generator=torch.Generator().manual_seed(5)).to("cuda", torch.bfloat16)
+    qbig[:, nq:Bq].fill_(float("nan"))
+    qref = torch.zeros(Tp, Bq, Dh, device="cuda", dtype=torch.bfloat16)
+    qref[:, :nq] = qbig[:, :nq]
+    calls = []
+    real = fsb_rows_cuda.rows_fused_cuda
+    monkeypatch.setattr(fsb_rows_cuda, "rows_fused_cuda", lambda *a, **k: calls.append(1) or real(*a, **k))
+    ref = rows.union_rerank_rows(st["sel_a"], st["sel_b"], qref, st["qpos"], st["lam"], st["sigv"], st["cellA"],
+                                 st["t_idx"], 0.125, st["s"], 4, score, st["tokK"], prov=True)
+    got = rows.union_rerank_rows(st["sel_a"], st["sel_b"], qbig[:, :Bq], st["qpos"], st["lam"], st["sigv"],
+                                 st["cellA"], st["t_idx"], 0.125, st["s"], 4, score, st["tokK"], prov=True, q_nq=nq)
+    assert ref is not None and got is not None and len(calls) == 2
+    assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
+
+
+@gpu
 def test_rows_cuda_ties_follow_slot_order(monkeypatch):
     # cells with identical keys and no position term tie exactly: both paths keep the first slot's cell, so they
     # agree bitwise and the tie-break is exercised (some query's 4th and 5th scores are equal)

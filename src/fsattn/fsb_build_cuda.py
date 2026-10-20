@@ -127,7 +127,7 @@ _DEBUG_DEFS: dict = {}                                    # debug: extra #define
 
 
 def _source(Dh: int) -> str:
-    defs = {"DH": Dh, "PER": Dh // 32, "NC": Dh + _NC_EXTRA, "XS": Dh + 4, **_DEBUG_DEFS}
+    defs = {"DH": Dh, "PER": Dh // 32, "NC": Dh + _NC_EXTRA, "NA": _NC_EXTRA, "XS": Dh + 4, **_DEBUG_DEFS}
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _bc._HELPERS + _COMMON + _PROLOGUE + _WPHASE + _CPHASE + _GPHASE + _BUILD
 
 
@@ -159,10 +159,15 @@ def _functions(dev: torch.device, Dh: int):
             bld_lean = _bc.load_function(dev, src, "fsb_forest_build_lean")
             prep_lean = _bc.load_function(dev, src, "fsb_prep_lean_tasks")
             sp_lean = _bc.load_function(dev, src, "fsb_spine_lean")
+            bld_lean16 = _bc.load_function(dev, src, "fsb_forest_build_lean16")
+            sp_lean16 = _bc.load_function(dev, src, "fsb_spine_lean16")
+            bld16 = _bc.load_function(dev, src, "fsb_forest_build16")
             _, cuda = _bc._libraries()
             cuda.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             _bc._check(cuda.cuFuncSetAttribute(bld, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
             _bc._check(cuda.cuFuncSetAttribute(bld_lean, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
+            _bc._check(cuda.cuFuncSetAttribute(bld_lean16, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
+            _bc._check(cuda.cuFuncSetAttribute(bld16, 8, _smem_bytes(Dh)), "cuFuncSetAttribute(max dynamic smem)")
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:
@@ -172,7 +177,7 @@ def _functions(dev: torch.device, Dh: int):
             warnings.warn(f"FS-B CUDA forest build unavailable on cuda:{dev.index} for head size {Dh}, using the "
                           f"Triton builder: {e!r}")
             raise _Unavailable(repr(e)) from e
-        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean)
+        fn = _fns[key] = (pro, bld, bld_lean, prep_lean, sp_lean, bld_lean16, sp_lean16, bld16)
     return fn[:2]
 
 
@@ -408,7 +413,7 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
     # full build's: one table per bucket in _tables (its cached layout vector is reused here). _SelLayout ->
     # out-of-layout selection.
     T, M_in, Dh = Kbar.shape
-    M = lean[6] if lean is not None else M_in
+    M = lean[7] if lean is not None else M_in
     dev = Kbar.device
     nf = len(taus)
     H = taus[0].shape[0]
@@ -416,7 +421,7 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
     if lean is not None and nf == 1:
         lay, fold_mask, nbig = _lean_layout_info(M, g)
         Cmaxs = lay["Cmaxs"]
-        fast_lean = 0 < len(sel) <= 16 and len(lean) >= 11 and lean[10] is not None
+        fast_lean = 0 < len(sel) <= 16 and len(lean) >= 12 and lean[11] is not None
         for k, js in sel:
             Ck = Cmaxs.get(k)
             if Ck is None:
@@ -430,10 +435,10 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
         if tkey not in _tables and tkey not in _pinned:
             _tasks(T, M, nf, g, dev, kmax_cuda, only_layv=True)
         _functions(dev, Dh)
-        _, _, bld_lean, prep_lean, sp_lean = _fns[_variant(dev.index, Dh)]
-        node0, leaf0, adm0, mt0, jb0, Kmax_lean, _ = lean[:7]
-        sp_node, sp_root, sp_hgt = lean[7:10] if len(lean) >= 10 else (None, None, None)
-        task_buf = lean[10] if len(lean) >= 11 else None
+        _, _, _, prep_lean, _, bld_lean16, sp_lean16, _ = _fns[_variant(dev.index, Dh)]
+        amu0, anx0, leaf0, adm0, mt0, jb0, Kmax_lean, _ = lean[:8]
+        sp_node, sp_root, sp_hgt = lean[8:11] if len(lean) >= 11 else (None, None, None)
+        task_buf = lean[11] if len(lean) >= 12 else None
         if Kbar.stride(2) == 1 and Kbar.stride(1) == Dh and Kbar.stride(0) % Dh == 0 and Kbar.data_ptr() % 16 == 0:
             M_kb = Kbar.stride(0) // Dh
         else:
@@ -472,11 +477,12 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
                     [P(tasks_ptr), P(lay_ptr), P(jb_ptr), P(mt0.data_ptr()),
                      U64(k_packed), I32(n_k), I32(T), I32(fold_mask), I32(int(Kmax_lean)),
                      I32(int(M_adm0)), I32(int(M_kb)), I32(int(M_ce)), I32(int(M_spr))])
-            _launch(bld_lean, nrec, _THREADS, _smem_bytes(Dh), dev,
+            _launch(bld_lean16, nrec, _THREADS, _smem_bytes(Dh), dev,
                     [P(tasks_ptr), P(lay_ptr), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
                      P(sp.data_ptr()), P(adm0.data_ptr()), P(0), P(mt0.data_ptr()), P(mt0.data_ptr()),
-                     P(node0.data_ptr()), P(node0.data_ptr()), P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(0),
-                     P(0), I32(M), I32(node0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)), I32(nbig),
+                     P(amu0.data_ptr()), P(amu0.data_ptr()), P(anx0.data_ptr()), P(anx0.data_ptr()),
+                     P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(0),
+                     P(0), I32(M), I32(amu0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)), I32(nbig),
                      I32(T), P(0), P(0)])
         else:
             rows: list = []
@@ -502,16 +508,17 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
                 ctl, scr = work.data_ptr(), work.data_ptr() + 4 * nctl
             else:
                 ctl = scr = 0
-            _launch(bld_lean, nrec, _THREADS, _smem_bytes(Dh), dev,
+            _launch(bld_lean16, nrec, _THREADS, _smem_bytes(Dh), dev,
                     [P(tasks_ptr), P(lay_ptr), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
                      P(sp.data_ptr()), P(adm0.data_ptr()), P(0), P(mt0.data_ptr()), P(mt0.data_ptr()),
-                     P(node0.data_ptr()), P(node0.data_ptr()), P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(scr),
-                     P(ctl), I32(M), I32(node0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)), I32(nbig),
+                     P(amu0.data_ptr()), P(amu0.data_ptr()), P(anx0.data_ptr()), P(anx0.data_ptr()),
+                     P(leaf0.data_ptr()), P(leaf0.data_ptr()), P(scr),
+                     P(ctl), I32(M), I32(amu0.shape[1]), I32(leaf0.shape[1]), I32(int(spread is not None)), I32(nbig),
                      I32(T), P(jb_ptr), P(0)])
         if sp_node is not None and T > 0:
-            _launch(sp_lean, (T + 15) // 16, _THREADS, 0, dev,
-                    [P(node0.data_ptr()), P(mt0.data_ptr()), P(sp_node.data_ptr()), P(sp_root.data_ptr()),
-                     P(sp_hgt.data_ptr()), I32(T), I32(node0.shape[1]), I32(int(Kmax_lean))])
+            _launch(sp_lean16, (T + 15) // 16, _THREADS, 0, dev,
+                    [P(amu0.data_ptr()), P(anx0.data_ptr()), P(mt0.data_ptr()), P(sp_node.data_ptr()),
+                     P(sp_root.data_ptr()), P(sp_hgt.data_ptr()), I32(T), I32(amu0.shape[1]), I32(int(Kmax_lean))])
             return [({"_lean_direct": True, "_sp_built": True, "jbase": jb0}, None)]
         return [({"_lean_direct": True, "_sp_built": False, "jbase": jb0}, None)]
     lay = forest_layout(M)
@@ -580,17 +587,18 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
 def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, sel=None,
                        _kmax_cuda: int = 99, lean=None):
     # forests for admission thresholds taus (1 or 2 tensors of shape (H,), head t uses tau[t % H]); returns
-    # [(F, m_b_all)] per tau: build_forest's prefill dict (chunks empty) and searchsorted(adm, E). T = 0 heads give
-    # empty tables of the same layout, without a launch. sel = [(k, [j per head or None])] builds only those dirty
-    # aligned chunks (a decode ingest's; node/leaf rows outside them are not written); an out-of-layout selection
-    # falls through to the whole-forest build.
+    # [(F, m_b_all)] per tau: build_forest's prefill dict (chunks empty), except the node tables land split — means
+    # in bf16 (node_mu, with each row's bf16 rounding error folded into the radius in node_aux[..., 0]) and the nine
+    # aggregates in fp32 (node_aux) — and searchsorted(adm, E). T = 0 heads give empty tables of the same layout,
+    # without a launch. sel = [(k, [j per head or None])] builds only those dirty aligned chunks (a decode ingest's;
+    # node/leaf rows outside them are not written); an out-of-layout selection falls through to the whole-forest build.
     if sel is not None and Kbar.shape[0] > 0 and any(j is not None for _, js in sel for j in js):
         try:
             return _chunks_build(Kbar, ceil_c, spread, taus, E, sel, _kmax_cuda, lean=lean)
         except _SelLayout:
-            if lean is not None and Kbar.shape[1] < lean[6]:
+            if lean is not None and Kbar.shape[1] < lean[7]:
                 T, M_vis, Dh = Kbar.shape
-                M_pad = lean[6]
+                M_pad = lean[7]
                 Kp, cp = Kbar.new_zeros(T, M_pad, Dh), ceil_c.new_full((T, M_pad), float("-inf"))
                 Kp[:, :M_vis] = Kbar; cp[:, :M_vis] = ceil_c
                 Kbar, ceil_c = Kp, cp
@@ -608,25 +616,26 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
         tasks, layv, bounds, nbig, nflags = _tasks(T, M, nf, _group(), dev, _kmax_cuda)
         if torch.cuda.is_current_stream_capturing() and _variant(dev.index, Dh) not in _fns:
             raise RuntimeError("fsb_build_cuda: kernels must be compiled before graph capture")
-        pro, bld = _functions(dev, Dh)
+        pro = _functions(dev, Dh)[0]
     Kbar = Kbar.contiguous(); ceil_c = ceil_c.contiguous()
     sp = spread.contiguous() if spread is not None else ceil_c
     E = E.contiguous()
     nb = E.shape[0]
-    NC = Dh + _NC_EXTRA
     outs = []
     for f in range(2):
         if f < nf:
             outs.append((torch.empty((T, M), dtype=torch.long, device=dev), torch.empty((T,), dtype=torch.long, device=dev),
                          torch.empty((T, nb), dtype=torch.long, device=dev),
-                         torch.empty((T, lay["Ntot"], NC), dtype=torch.float32, device=dev),
+                         torch.empty((T, lay["Ntot"], Dh), dtype=torch.bfloat16, device=dev),
+                         torch.empty((T, lay["Ntot"], _NC_EXTRA), dtype=torch.float32, device=dev),
                          torch.empty((T, lay["Ltot"]), dtype=torch.long, device=dev)))
         else:
             outs.append(outs[0])
     if T > 0:
         t0, t1 = _tau32(taus[0]), _tau32(taus[-1])
         P, I32 = ctypes.c_void_p, ctypes.c_int
-        (a0, m0, b0, n0, l0), (a1, m1, b1, n1, l1) = outs
+        (a0, m0, b0, u0, x0, l0), (a1, m1, b1, u1, x1, l1) = outs
+        bld16 = _fns[_variant(dev.index, Dh)][7]
         # this call's int32 work buffer, from the caching allocator like the outputs (a graph capture owns its own, and
         # calls on different streams never share one): the build kernel's control words (the completion flags of the G
         # nodes), cleared by the prologue, then the slot lists of the chunks of height >= 10
@@ -638,17 +647,18 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
                                             P(b0.data_ptr()), P(b1.data_ptr()), P(ctl), I32(nctl), I32(T), I32(M), I32(H),
                                             I32(nb)])
         for off, cnt in bounds:
-            _launch(bld, cnt, _THREADS, _smem_bytes(Dh), dev,
+            _launch(bld16, cnt, _THREADS, _smem_bytes(Dh), dev,
                     [P(tasks.data_ptr() + 40 * off), P(layv.data_ptr()), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
                      P(sp.data_ptr()), P(a0.data_ptr()), P(a1.data_ptr()), P(m0.data_ptr()), P(m1.data_ptr()),
-                     P(n0.data_ptr()), P(n1.data_ptr()), P(l0.data_ptr()), P(l1.data_ptr()), P(scr),
+                     P(u0.data_ptr()), P(u1.data_ptr()), P(x0.data_ptr()), P(x1.data_ptr()),
+                     P(l0.data_ptr()), P(l1.data_ptr()), P(scr),
                      P(ctl), I32(M), I32(lay["Ntot"]), I32(lay["Ltot"]), I32(int(spread is not None)), I32(nbig),
                      I32(T)])
     res = []
     for f in range(nf):
-        adm, mt, mb, node, leaf = outs[f]
+        adm, mt, mb, mu, aux, leaf = outs[f]
         F = {"adm": adm, "m_tot": mt, "M": M, "T": T, "Dh": Dh, "ks": list(lay["ks"]), "chunks": {},
-             "Kmax": lay["Kmax"], "node": node, "leaf": leaf, "Ntot": lay["Ntot"], "Ltot": lay["Ltot"],
+             "Kmax": lay["Kmax"], "node_mu": mu, "node_aux": aux, "leaf": leaf, "Ntot": lay["Ntot"], "Ltot": lay["Ltot"],
              "bases": dict(lay["bases"]), "nodes_per": dict(lay["nodes_per"]), "leafbases": dict(lay["leafbases"]),
              "Cmaxs": dict(lay["Cmaxs"])}
         res.append((F, mb))

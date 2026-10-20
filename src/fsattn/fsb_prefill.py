@@ -57,11 +57,9 @@ _STREAMS: dict = {}
 def _stage_pipe(stages: tuple, chk: bool, dev):
     # the side stream a stage's re-rank runs on while the next stage's beams run on the caller's: the same op
     # sequence per stage on disjoint stage slices, so the outputs are identical; needs at least two stages and no
-    # compact check (FSB_STAGE_PIPE=0: the serial stage loop; with FSB_ROWS_DEFER=1 there is no per-stage host sync
-    # to hide unless FSB_STAGE_PIPE=1 is explicitly set)
-    from .fsb_rows import rows_defer_on
+    # compact check (FSB_STAGE_PIPE=0: the serial stage loop)
     pipe = os.environ.get("FSB_STAGE_PIPE")
-    if chk or len(stages) < 2 or dev.type != "cuda" or pipe == "0" or (pipe != "1" and rows_defer_on()):
+    if chk or len(stages) < 2 or dev.type != "cuda" or pipe == "0":
         return None
     key = str(dev)
     s1 = _STREAMS.get(key)
@@ -440,9 +438,10 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                 nbc = b1 - b0
                 Tc, r0, r1, q0, q1 = T * nbc, T * b0, T * b1, b0 * Bq, b1 * Bq
                 nq = min(q1, N) - q0
-                if q_bf16 and len(stages) == 1 and nq == nbc * Bq and Q.is_contiguous() and Q.data_ptr() % 16 == 0:
-                    q = Q.view(Tc, Bq, Dh)
-                else:
+                if Q.is_contiguous() and Q.data_ptr() % 16 == 0:
+                    qs = Q.view(T, N, Dh)[:, q0:q0 + nq]     # the stage's query rows, no copy; the kernels
+                    q = qs if nq == nbc * Bq else qs.as_strided((Tc, nbc * Bq, Dh), (N * Dh, Dh, 1))
+                else:                                        # guard the pad rows (q_nq) instead of zero-filling
                     q = torch.empty((Tc, Bq, Dh), dtype=torch.bfloat16 if q_bf16 else torch.float32, device=dev)
                     qv = q.view(B, H, nbc * Bq, Dh)
                     qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
@@ -483,9 +482,9 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                     del full
                 t_idx_c = SPc["t_idx"]
                 del SPc, SP2c, SPuc, Wt, bt, Wut, but
-                return {"t_idx": t_idx_c}, qpos, lam, sigv, q, sel_a, sel_b, nv, nv_u
+                return {"t_idx": t_idx_c}, qpos, lam, sigv, q, nq, sel_a, sel_b, nv, nv_u
 
-            def _rerank_stage(b0: int, b1: int, SPc: dict, qpos, lam, sigv, q, sel_a, sel_b, nv, nv_u):
+            def _rerank_stage(b0: int, b1: int, SPc: dict, qpos, lam, sigv, q, nq, sel_a, sel_b, nv, nv_u):
                 # a stage's block-shared re-rank (fsb_rows.union_rerank_rows) and the int32 stores into the layer's
                 # tables; appends the stage to redo and returns None when a row overflows without the deferred flag
                 if stats and union:
@@ -501,7 +500,7 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                 nf = len(flags)
                 res = union_rerank_rows(sel_a, sel_b, q, qpos, lam, sigv, F["cellA"], SPc["t_idx"], attn.scale, s,
                                         Kk, score, tokK, prov=prov_full is not None, ovf_out=flags, q_bf16=q_bf16,
-                                        out=out_buf, pv_out=pv_buf)
+                                        out=out_buf, pv_out=pv_buf, q_nq=nq)
                 if len(flags) > nf:
                     flagged.append((b0, b1))                    # its device flag: read after the readout is queued
                 if res is None:

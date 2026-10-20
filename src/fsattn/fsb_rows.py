@@ -320,7 +320,8 @@ def rows_ok(q: torch.Tensor, tokK, s: int, K: int, score: str, *, allow_capture:
 def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.Tensor, lam: torch.Tensor,
                       sigv: torch.Tensor, cellA: torch.Tensor, t_idx: torch.Tensor, scale: float, s: int, K: int,
                       score: str, tokK: torch.Tensor, prov: bool = False, ovf_out=None, q_bf16: bool = False,
-                      out: torch.Tensor = None, pv_out: torch.Tensor = None, scratch: dict = None):
+                      out: torch.Tensor = None, pv_out: torch.Tensor = None, scratch: dict = None,
+                      q_nq: int = None):
     # union_candidates + rerank_top (+ utau_prov_add) for batched prefill rows -> (cells (T',Bq,K) int64 (or out),
     # provenance (T',Bq,K) int8 or None); None when a row has more than UCAP distinct candidates. With a list ovf_out
     # (and FSB_ROWS_DEFER on) that check does not sync: a device flag (True = some row overflowed, the result is
@@ -347,7 +348,7 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
         from .fsb_rows_cuda import rows_fused_cuda, rows_fused_ok, rows_union_cuda, rows_union_ok
         if rows_fused_ok(sel_a, sel_b, q, K4, Mc, s, K, score, prov, PROV_UTAU, out):
             ovf = rows_fused_cuda(sel_a, sel_b, q, K4, cellA, t_idx, qv, sq0, sq1, lv, ls0, sv, ss0, out, pv,
-                                  Mc, UCAP, scale, K, score, prov, PROV_UTAU)
+                                  Mc, UCAP, scale, K, score, prov, PROV_UTAU, q_nq=q_nq)
             if ovf is not None:
                 if not rows_defer_on():
                     if not capturing and Mc > UCAP and bool(ovf):

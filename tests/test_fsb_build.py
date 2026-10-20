@@ -98,7 +98,27 @@ def test_lean_stream_spines_match_reference(monkeypatch, fast_cache):
             monkeypatch.setenv("FSB_FAST_BUILD", flag)
             fc.ingest(K, ce, Mv, tau, keep_cells=True)
             out[flag] = ft.build_spines(fc.F, fc.m_tot, torch.arange(T, device=DEV))
-        assert _same(caches["0"].F["node"], caches["1"].F["node"]), Mv
-        assert _same(caches["0"].F["leaf"], caches["1"].F["leaf"]), Mv
+        F0, F1 = caches["0"].F, caches["1"].F
+        if F0.get("node_mu") is None:
+            assert _same(F0["node"], F1["node"]), Mv            # the packed flatten keeps exact fp32 rows
+        else:
+            assert _same(F0["node_mu"], F1["node_mu"]), Mv
+            assert _same(F0["node_aux"][..., 1:], F1["node_aux"][..., 1:]), Mv
+            # both writers store radius + |mu32 - bf16(mu32)| as the bound; the two eps terms round in different
+            # reduction orders, so the radii agree only up to a bf16-scale slack on the row's mean norm
+            slack = F0["node_mu"].float().norm(dim=-1) * (2.0**-8) + 1e-6
+            d0 = (F0["node_aux"][..., 0] - F1["node_aux"][..., 0]).abs()
+            assert bool((d0 <= slack).all()), Mv
+        assert _same(F0["leaf"], F1["leaf"]), Mv
         for k in ("node", "root", "height"):
-            assert _same(out["0"][k], out["1"][k]), (Mv, k)
+            a, b = out["0"][k], out["1"][k]
+            if F0.get("node_mu") is None:
+                assert _same(a, b), (Mv, k)
+            elif k == "node":
+                Dh2 = F0["Dh"]
+                assert _same(torch.cat([a[..., :Dh2], a[..., Dh2 + 1:]], -1),
+                             torch.cat([b[..., :Dh2], b[..., Dh2 + 1:]], -1)), (Mv, k)
+                slack = a[..., :Dh2].float().norm(dim=-1) * (2.0**-8) + 1e-6
+                assert bool(((a[..., Dh2] - b[..., Dh2]).abs() <= slack).all())
+            else:
+                assert _same(a, b), (Mv, k)

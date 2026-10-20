@@ -1015,8 +1015,29 @@ def _flatten_forest(F: dict):
     else:
         F["node"] = torch.zeros(T, 1, Dh + _NA, device=dev); F["node"][:, :, Dh + 4:Dh + 6] = -1
         F["leaf"] = torch.full((T, 1), -1, dtype=torch.long, device=dev)
+    F.pop("node_mu", None); F.pop("node_aux", None)          # the packed rebuild supersedes cached beam views
     F["Ntot"] = F["node"].shape[1]; F["Ltot"] = F["leaf"].shape[1]
     F["bases"] = bases; F["nodes_per"] = nodes_per; F["leafbases"] = leafbases; F["Cmaxs"] = Cmaxs
+
+
+def _beam_views(F: dict):
+    # the beams' node tables: mu in bf16 (their single source of truth for the means) and the 9 packed aux fields
+    # in fp32. A packed fp32 F (build_forest's) converts once and caches the pair on itself, with each radius
+    # inflated by the bf16 rounding error of its mean so q.mu + rad * |q| stays a valid bound
+    mu = F.get("node_mu")
+    if mu is None:
+        node = F["node"]
+        Dh = F["Dh"]
+        src = node[..., :Dh]
+        mu = torch.empty(src.shape, dtype=torch.bfloat16, device=node.device)
+        mu.copy_(src)
+        aux = node[..., Dh:].contiguous()                 # a slice copy: already detached from node
+        eps = torch.empty(node.shape[:-1], dtype=torch.float32, device=node.device)
+        for t in range(src.shape[0]):                     # row chunks keep the fp32 temporaries small
+            eps[t] = (src[t] - mu[t].float()).norm(dim=-1)
+        aux[..., 0] += eps
+        F["node_mu"], F["node_aux"] = mu, aux
+    return F["node_mu"], F["node_aux"]
 
 
 @torch.no_grad()
@@ -1025,7 +1046,6 @@ def build_spines(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, out: dict | No
     Tp = m_b.shape[0]
     K = F["Kmax"]; Dh = F["Dh"]; Nt = F["Ntot"]
     S = K + 1
-    node_flat = F["node"].reshape(-1, Dh + _NA)
     ckey = ("spine", S, tuple(sorted(F["bases"].items())), tuple(sorted(F["nodes_per"].items())), str(dev))
     consts = _STATIC_CACHE.get(ckey)
     if consts is None:
@@ -1040,6 +1060,12 @@ def build_spines(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, out: dict | No
         from .fsb_build_fast import build_spines_fast, fast_spines_ok
         if fast_spines_ok(F, m_b):
             return build_spines_fast(F, m_b, t_idx, consts, out=out)
+    # a packed forest's fp32 rows stay exact here; only the split lean arena upcasts its bf16 means
+    if F.get("node") is not None:
+        node_flat = F["node"].reshape(-1, Dh + _NA)
+    else:
+        mu32, aux32 = _beam_views(F)
+        node_flat = torch.cat([mu32.reshape(-1, Dh).float(), aux32.reshape(-1, _NA)], dim=-1)
     ks, base_t, npr_t, has_k = consts[:4]
     off_all = m_b[:, None] & ~((1 << (ks[None] + 1)) - 1)
     j_all = off_all >> ks[None]
@@ -1080,14 +1106,21 @@ def build_spines(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, out: dict | No
     return {"node": sp, "root": root, "height": height, "m_b": m_b, "t_idx": t_idx}
 
 
-def _forest_gather(F: dict, SP: dict, ref: torch.Tensor, cols=None):
+def _forest_gather(F: dict, SP: dict, ref: torch.Tensor, cols=None, tabs=None):
     Tp, N = ref.shape
     Dh = F["Dh"]; Nt = F["Ntot"]; Sp = SP["node"].shape[1]
     cols = slice(0, Dh + _NA) if cols is None else cols
     lo, hi = cols.start or 0, cols.stop
+    # tabs: the caller's beam tables (bf16 means + inflated radii). Given, every beam backend scores the same
+    # bits; absent, a packed forest's exact fp32 rows (references/tests) or the lean arena's upcast
     gid_c = SP["t_idx"][:, None] * Nt + ref.clamp(min=0, max=Nt - 1)
+    gid = gid_c.reshape(-1)
+    if tabs is None and F.get("node") is not None:
+        Ac = F["node"].reshape(-1, Dh + _NA)[gid][:, lo:hi]
+    else:
+        mu32, aux32 = tabs if tabs is not None else _beam_views(F)
+        Ac = torch.cat([mu32.reshape(-1, Dh)[gid].float(), aux32.reshape(-1, _NA)[gid]], dim=-1)[:, lo:hi]
     gid_s = torch.arange(Tp, device=ref.device)[:, None] * Sp + (-ref - 2).clamp(min=0, max=Sp - 1)
-    Ac = F["node"].reshape(-1, Dh + _NA)[gid_c.reshape(-1)][:, lo:hi]
     As = SP["node"].reshape(-1, Dh + _NA)[gid_s.reshape(-1)][:, lo:hi]
     A = torch.where((ref >= 0).reshape(-1, 1), Ac, As).view(Tp, N, hi - lo)
     none = ref == -1
@@ -1278,6 +1311,8 @@ def _forest_beam(F: dict, SP: dict, q, qpos, lam, sigv, scale: float, s: int, W,
     ref[:, :, 0] = SP["root"][:, None]
     NC = Dh + _NA
     n_visit = torch.zeros(Tp, Bq, device=dev)
+    bt = _beam_views(F)                                   # every beam backend scores the same table bits
+    gath = lambda refs, cols=None: _forest_gather(F, SP, refs, cols, tabs=bt)
     if use_kernel:
         qn2 = _det_norm(q)
         if torch.is_tensor(radius_coef):
@@ -1285,14 +1320,14 @@ def _forest_beam(F: dict, SP: dict, q, qpos, lam, sigv, scale: float, s: int, W,
         elif radius_coef != 1.0:
             qn2 = qn2 * radius_coef
         Wl = W.contiguous(); bud = budget.contiguous()
-        chunk = F["node"]; spine = SP["node"]
+        chunk_mu, chunk_ax = bt; spine = SP["node"]
         for _ in range(F["Kmax"] + 1):
-            ref, nv = level_step(ref, q, qn2, qpos.contiguous(), lam, sigv, Wl, bud, SP["t_idx"], chunk, spine,
-                                 scale, s, W_max, node_score)
+            ref, nv = level_step(ref, q, qn2, qpos.contiguous(), lam, sigv, Wl, bud, SP["t_idx"], chunk_mu,
+                                 chunk_ax, spine, scale, s, W_max, node_score)
             n_visit = n_visit + nv
-        A = _forest_gather(F, SP, ref.view(Tp, Bq * W_max)).view(Tp, Bq, W_max, NC)
+        A = gath(ref.view(Tp, Bq * W_max)).view(Tp, Bq, W_max, NC)
     else:
-        A = _forest_gather(F, SP, ref.view(Tp, Bq * W_max)).view(Tp, Bq, W_max, NC)
+        A = gath(ref.view(Tp, Bq * W_max)).view(Tp, Bq, W_max, NC)
     qn = _det_norm(q)[..., None]
     if torch.is_tensor(radius_coef):
         qn = qn * radius_coef.view(-1, 1, 1)
@@ -1306,7 +1341,7 @@ def _forest_beam(F: dict, SP: dict, q, qpos, lam, sigv, scale: float, s: int, W,
         carried = active & ~expand
         ch = A[..., Dh + 4:Dh + 6].long()
         chv = torch.where(expand[..., None], ch, torch.full_like(ch, -1)).view(Tp, Bq, 2 * W_max)
-        CA = _forest_gather(F, SP, chv.view(Tp, Bq * 2 * W_max)).view(Tp, Bq, 2 * W_max, NC)
+        CA = gath(chv.view(Tp, Bq * 2 * W_max)).view(Tp, Bq, 2 * W_max, NC)
         content = _det_dot(q[:, :, None, :], CA[..., :Dh]) * scale
         if node_score == "bound":
             content = content + qn * CA[..., Dh] * scale
@@ -1357,7 +1392,8 @@ class ForestCache:
         self.m_cap = 0
         self.k_cap = 0
         self._lean_meta = {}
-        self._node_arena = None
+        self._arena_mu = None
+        self._arena_aux = None
         self._leaf_arena = None
         self._arena_k = -1
         self._t_idx = None
@@ -1428,11 +1464,13 @@ class ForestCache:
             old_k = self._arena_k
             ncap = (1 << (Kmax + 2)) - Kmax - 3
             lcap = (1 << (Kmax + 1)) - 1
-            node = torch.zeros(T, ncap, Dh + _NA, device=dev)
-            node[..., Dh + 4:Dh + 6] = -1
+            node_mu = torch.zeros(T, ncap, Dh, dtype=torch.bfloat16, device=dev)
+            node_aux = torch.zeros(T, ncap, _NA, device=dev)
+            node_aux[..., 4:6] = -1
             leaf = torch.full((T, lcap), -1, dtype=torch.long, device=dev)
-            if self._node_arena is not None:
-                node[:, :self._node_arena.shape[1]] = self._node_arena
+            if self._arena_mu is not None:
+                node_mu[:, :self._arena_mu.shape[1]] = self._arena_mu
+                node_aux[:, :self._arena_aux.shape[1]] = self._arena_aux
                 leaf[:, :self._leaf_arena.shape[1]] = self._leaf_arena
             for k in range(old_k + 1, Kmax + 1):
                 size = 1 << k
@@ -1440,10 +1478,10 @@ class ForestCache:
                 nbase = 2 * size - k - 2
                 lbase = size - 1
                 st = _static_chunk(k, 1, T, nbase, lbase, dev)
-                dst = node[:, nbase:nbase + nodes]
-                dst[..., Dh + 3] = st["cnt"]
-                dst[..., Dh + 4:] = st["static"]
-            self._node_arena, self._leaf_arena, self._arena_k = node, leaf, Kmax
+                dst = node_aux[:, nbase:nbase + nodes]
+                dst[..., 3] = st["cnt"]
+                dst[..., 4:] = st["static"]
+            self._arena_mu, self._arena_aux, self._leaf_arena, self._arena_k = node_mu, node_aux, leaf, Kmax
 
     def _get_emp_buf(self, Kbar_all):
         T, Dh, dev = self.T, self.Dh, self.dev
@@ -1480,6 +1518,17 @@ class ForestCache:
         from .fsb_build_fast import pack_lean_chunks_fast
         return pack_lean_chunks_fast(self, F_cuda, emp, Kmax, idx_c)
 
+    def _store_arena_rows(self, sl, mu32, rad, amax, pmin):
+        # packed fp32 rows -> the split arena: mu rounded to bf16 (the beams' single source of truth) and the
+        # radius inflated by the rounding error, so q.mu + rad * |q| stays a valid bound of every member's score
+        mu_w = mu32.float().to(torch.bfloat16)
+        eps = (mu32.float() - mu_w.float()).norm(dim=-1)
+        self._arena_mu[:, sl] = mu_w
+        ax = self._arena_aux[:, sl]
+        ax[..., 0] = rad + eps
+        ax[..., 1] = amax
+        ax[..., 2] = pmin
+
     def _pack_lean(self, F, dirty):
         Dh = self.Dh
         self._ensure_lean_arena(F["Kmax"])
@@ -1503,7 +1552,8 @@ class ForestCache:
             k0, row, lf = contig
             n0 = 2 * (1 << k0) - k0 - 2
             l0 = (1 << k0) - 1
-            self._node_arena[:, n0:n0 + row.shape[1], :Dh + 3] = row
+            self._store_arena_rows(slice(n0, n0 + row.shape[1]), row[..., :Dh], row[..., Dh], row[..., Dh + 1],
+                                   row[..., Dh + 2])
             self._leaf_arena[:, l0:l0 + lf.shape[1]] = lf
         else:
             for k in ks_t:
@@ -1514,17 +1564,15 @@ class ForestCache:
                 nbase = 2 * size - k - 2
                 lbase = size - 1
                 C = F["chunks"][k]
-                dst = self._node_arena[:, nbase:nbase + nodes]
+                sl = slice(nbase, nbase + nodes)
                 if "row" in C:
-                    dst[..., :Dh + 3] = C["row"][:, 0]
+                    r = C["row"][:, 0]
+                    self._store_arena_rows(sl, r[..., :Dh], r[..., Dh], r[..., Dh + 1], r[..., Dh + 2])
                 else:
-                    dst[..., :Dh] = C["mu"][:, 0]
-                    dst[..., Dh] = C["rad"][:, 0]
-                    dst[..., Dh + 1] = C["amax"][:, 0]
-                    dst[..., Dh + 2] = C["pmin"][:, 0]
+                    self._store_arena_rows(sl, C["mu"][:, 0], C["rad"][:, 0], C["amax"][:, 0], C["pmin"][:, 0])
                 self._leaf_arena[:, lbase:lbase + size] = C["leaf"][:, 0]
-        F.update(node=self._node_arena, leaf=self._leaf_arena,
-                 Ntot=self._node_arena.shape[1], Ltot=self._leaf_arena.shape[1],
+        F.update(node_mu=self._arena_mu, node_aux=self._arena_aux, leaf=self._leaf_arena,
+                 Ntot=self._arena_mu.shape[1], Ltot=self._leaf_arena.shape[1],
                  bases=bases, leafbases=leafbases, nodes_per=nodes_per,
                  Cmaxs=Cmaxs)
 
@@ -1668,7 +1716,6 @@ class ForestCache:
         # chunk hold the reference build's all-empty chunk (signed zeros of cell 0's rows, pmin 2^30, leaves -1);
         # _pack_lean adds the static columns at the lean bases
         T, Dh, dev = self.T, self.Dh, self.dev
-        node = F_cuda["node"]
         ks_t = tuple(ks)
         ckey = ("chunk_all", F_cuda["Ntot"], F_cuda["Ltot"], ks_t, str(dev))
         idx_c = _STATIC_CACHE.get(ckey)
@@ -1688,7 +1735,14 @@ class ForestCache:
         lrs = base_l + jbase[:, k_l] * str_l + u_l
         hms = bits[:, k_n]
         hml = bits[:, k_l]
-        row = node.gather(1, nrs[..., None].expand(-1, -1, Dh + 3))
+        node = F_cuda.get("node")
+        if node is not None:
+            row = node.gather(1, nrs[..., None].expand(-1, -1, Dh + 3))
+        else:
+            # the split whole-forest build: bf16 means upcast (the arena re-rounds to the same bits, its radius
+            # slack passing through node_aux[0] untouched) alongside the fp32 aggregate columns
+            row = torch.cat([F_cuda["node_mu"].gather(1, nrs[..., None].expand(-1, -1, Dh)).float(),
+                             F_cuda["node_aux"].gather(1, nrs[..., None].expand(-1, -1, 3))], dim=-1)
         lf = F_cuda["leaf"].gather(1, lrs)
         emp = self._get_emp_buf(Kbar_all)
         row = torch.where(hms[..., None], row, emp)
@@ -1776,7 +1830,8 @@ class ForestCache:
                     sp_out["m_b"] = self.m_tot
                     sp_out["t_idx"] = self._t_idx_rows()
                 M_pad = max(512, 1 << (M_vis - 1).bit_length())
-                lean_arg = (self._node_arena, self._leaf_arena, self.adm, self.m_tot, self._jbase_buf, Kmax, M_pad,
+                lean_arg = (self._arena_mu, self._arena_aux, self._leaf_arena, self.adm, self.m_tot,
+                            self._jbase_buf, Kmax, M_pad,
                             sp_out["node"], sp_out["root"], sp_out["height"], self._task_buf)
                 sel = [(k, [row[k] if bts[k] else None for row, bts in zip(jb_h, bits_h)]) for k in dset]
                 F_cuda = self._cuda_forest(Kbar_all, ceil_all, M_vis, spread_all, [self._get_tau32(tau)], sel=sel,
@@ -1819,10 +1874,20 @@ class ForestCache:
                 prev = self._lean_meta.get(k)
                 if old is not None and prev is not None and torch.equal(prev[0], j) and torch.equal(prev[1], has):
                     b = old["bases"][k]; lb = old["leafbases"][k]
-                    nd = old["node"][:, b:b + nodes]
-                    chunks[k] = {"mu": nd[..., :Dh].reshape(T, 1, nodes, Dh), "rad": nd[..., Dh].reshape(T, 1, nodes),
-                                 "amax": nd[..., Dh + 1].reshape(T, 1, nodes), "pmin": nd[..., Dh + 2].reshape(T, 1, nodes),
-                                 "leaf": old["leaf"][:, lb:lb + size].reshape(T, 1, size), "Cmax": 1, "k": k}
+                    if old.get("node") is None:
+                        # the fast stream's previous stage is the split arena: bf16 means, fp32 aux
+                        ndm = old["node_mu"][:, b:b + nodes]; nda = old["node_aux"][:, b:b + nodes]
+                        chunks[k] = {"mu": ndm.reshape(T, 1, nodes, Dh), "rad": nda[..., 0].reshape(T, 1, nodes),
+                                     "amax": nda[..., 1].reshape(T, 1, nodes), "pmin": nda[..., 2].reshape(T, 1, nodes),
+                                     "leaf": old["leaf"][:, lb:lb + size].reshape(T, 1, size), "Cmax": 1, "k": k}
+                    else:
+                        # the flattened (non-fast) stream keeps the previous stage as a packed fp32 table
+                        nd = old["node"][:, b:b + nodes]
+                        chunks[k] = {"mu": nd[..., :Dh].reshape(T, 1, nodes, Dh),
+                                     "rad": nd[..., Dh].reshape(T, 1, nodes),
+                                     "amax": nd[..., Dh + 1].reshape(T, 1, nodes),
+                                     "pmin": nd[..., Dh + 2].reshape(T, 1, nodes),
+                                     "leaf": old["leaf"][:, lb:lb + size].reshape(T, 1, size), "Cmax": 1, "k": k}
                     meta[k] = (j, has)
                     continue
                 meta[k] = (j, has)
@@ -2411,6 +2476,11 @@ def _forest_chunks_graphed(attn, Qf, Kbar, ceil_c, sigma, N, nb, Bq, NBCH, blk_s
             E_s = (blk_start[b0:b1] / s).floor().long()[None, :].expand(T, nbc).reshape(Tc).contiguous() if hyb else None
             def stage(_F=F, _mba=m_b_all, _b0=b0, _b1=b1, _t_idx=t_idx, _q=q_s, _qpos=qpos, _head=head_id, _sig=sig_s, _W=W_s, _D=D_s,
                       _c=cache["c"], _tok=Kp_s, _rq=rq_s, _E=E_s):
+                for _ff in (_F, _F.get("utau_F")):
+                    if _ff is not None and _ff.get("node") is not None:
+                        # the build graph rewrites the packed tables on every replay (incl. in-place tau changes),
+                        # so the beams' bf16 views are re-derived inside this capture rather than baked in from warmup
+                        _ff.pop("node_mu", None); _ff.pop("node_aux", None)
                 m_b_ = _mba[:, _b0:_b1].reshape(Tc)
                 lam_ = attn.sel_scale.detach().float()[_head].view(Tc, 1, 1)
                 sigv = _sig[_head].view(Tc, 1, 1)
@@ -2911,8 +2981,8 @@ def fsb_graph_registry(attn, cache):
            sig(getattr(cache, "_k_hot", None)), sig(getattr(cache, "_v_hot", None)),
            sig(getattr(cache, "_nq_t", None))]
     if F is not None:
-        reg += [sig(F.get("node")), sig(F.get("leaf")), sig(F.get("adm")), F.get("Kmax"), F.get("M"),
-                F.get("Ltot")]
+        reg += [sig(F.get("node_mu")), sig(F.get("node_aux")), sig(F.get("leaf")), sig(F.get("adm")),
+                F.get("Kmax"), F.get("M"), F.get("Ltot")]
         if plain and getattr(fc, "_cellA_g", None) is not None:
             reg += [sig(fc._cellA_g)]
         else:
@@ -2930,8 +3000,8 @@ def fsb_graph_registry(attn, cache):
         uF, uSP = u.F, u.SP
         reg += [bool(getattr(u, "_live", False)), uF is None, uSP is None]
         if uF is not None:
-            reg += [sig(uF.get("node")), sig(uF.get("leaf")), sig(uF.get("adm")), sig(u.m_tot),
-                    uF.get("Kmax"), uF.get("M"), uF.get("Ltot")]
+            reg += [sig(uF.get("node_mu")), sig(uF.get("node_aux")), sig(uF.get("leaf")), sig(uF.get("adm")),
+                    sig(u.m_tot), uF.get("Kmax"), uF.get("M"), uF.get("Ltot")]
         if uSP is not None:
             reg += [sig(uSP["node"]), sig(uSP["root"]), sig(uSP["t_idx"]), sig(uSP["height"])]
     return tuple(reg)

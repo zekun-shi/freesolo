@@ -9,6 +9,14 @@ __device__ __forceinline__ float f_pow2neg(int p) { return __int_as_float((127 -
 __device__ __forceinline__ float f_sz(unsigned neg) { return neg ? -0.0f : 0.0f; }
 __device__ __forceinline__ unsigned sgn(float v) { return __float_as_uint(v) >> 31; }
 typedef unsigned long long u64;
+// fp32 <-> bf16 in an unsigned short: cvt.rn.bf16 (nearest, ties to even) on the way in, a 16-bit shift on the way
+// out
+__device__ __forceinline__ unsigned short f2bf(float x) {
+    unsigned short r;
+    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(r) : "f"(x));
+    return r;
+}
+__device__ __forceinline__ float bf2f(unsigned short h) { return __uint_as_float(((unsigned)h) << 16); }
 // stable-sort key of a projection: value order with -0 == +0, ties by the slot (torch's stable argsort)
 __device__ __forceinline__ u64 sort_key(float p, unsigned slot) {
     unsigned b = __float_as_uint(p == 0.0f ? 0.0f : p);
@@ -142,6 +150,8 @@ struct Args {
     const float* kb; const float* ce; const float* spr;
     const i64* adm[2]; const i64* mt[2];
     float* node[2]; i64* leaf[2];
+    unsigned short* node_mu[2];   // bf16 means of the split table (lean16; null while node holds a packed row)
+    float* node_aux[2];           // its fp32 aggregates [rad | amax | pmin | cnt | chl | chr | src | off | len]
     int* scr;                  // slot lists of chunks of height >= 10: [f][k - 10][t][M] (int32)
     int* ctl;                  // this call's control words: the completion flags of its G nodes
     int M, Ntot, Ltot, has_sp, nbig, T;
@@ -294,12 +304,14 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
     const int nw = (32 * wid) >> LV;                                                     // node of this warp's rows
     const int row = 32 * wid + lane;
     const float zd = f_sz((unsigned)(S.zb[(n * V) >> R.ks] >> d) & 1u);
+    const bool m16 = R.node_mu != nullptr;
     // ---- mean over the raw rows (pad zero folded once)
     {
         auto val = [&](const int s) { return S.Xs[s * XS + d]; };
         float s = col_sum<LV>(val, g, n);
         if (fold) s = f_add(s, zd);
-        if (g == 0) S.mu[n * DH + d] = f_mul_ftz(s, f_pow2neg(LV));
+        const float mu = f_mul_ftz(s, f_pow2neg(LV));
+        if (g == 0) S.mu[n * DH + d] = mu;
     }
     __syncthreads();
     // ---- centre the warp's rows (registers and S.Xs), squared distances, warp partial summaries
@@ -354,14 +366,28 @@ __device__ __forceinline__ void c_level(float (&x)[32][PER], const SM& S, const 
         }
         S.far[tid] = far;
         S.pvp[tid] = bd;                                   // d2 of the farthest row (its |Xc|^2), read below
+        // lean16: slack covering the bf16 mean stored below (the build itself centres on the fp32 mean)
+        float esp = 0.0f;
+        if (m16) {
+            const float* mrow = S.mu + tid * DH;
+#pragma unroll 8
+            for (int dd = 0; dd < DH; dd++) {
+                const float df = f_sub(mrow[dd], bf2f(f2bf(mrow[dd])));
+                esp = f_add(esp, f_mul(df, df));
+            }
+            esp = f_sqrt_ftz(esp);
+        }
         if (node_full(R, tid * V)) {
             float rad = has_sp ? rq : f_sqrt_ftz(rq);
             if (has_sp && fold) rad = f_max(rad, 0.0f);
-            write_scalars(R, tid * V, LV, rad, f_max(am, 0.0f), pm);
+            write_scalars(R, tid * V, LV, rad, f_max(am, 0.0f), pm, esp);
         }
     }
     for (int e = tid; e < NN * DH; e += 512)
-        if (node_full(R, (e / DH) * V)) mu_ptr(R, (e / DH) * V, LV)[e % DH] = S.mu[e];
+        if (node_full(R, (e / DH) * V)) {
+            if (R.node_mu != nullptr) mu16_ptr(R, (e / DH) * V, LV)[e % DH] = f2bf(S.mu[e]);
+            else mu_ptr(R, (e / DH) * V, LV)[e % DH] = S.mu[e];
+        }
     __syncthreads();
     if (wid < NN) {
         const int nn = wid, far = S.far[nn];
@@ -526,6 +552,8 @@ __device__ __forceinline__ unsigned smid() { unsigned s; asm volatile("mov.u32 %
 // lane l holds dims l (+ 32) of every row in x[r][i]; per-row scalars (cell, ceil, spread) live in lane r.
 struct Rec {                  // where a warp's records go
     float* node;              // forest node table of head t: (Ntot, NC)
+    unsigned short* node_mu;  // its bf16 means (lean16; null while node is the packed table)
+    float* node_aux;          // its fp32 aggregates (lean16)
     i64* leaf;                // leaf table of head t: (Ltot,)
     int k, ks, l0, n0, jb;    // chunk height, subtree height, subtree root level/index, chunk of subtree 0
     int base, leafbase;       // bases[k], leafbases[k]
@@ -542,14 +570,15 @@ __device__ __forceinline__ void rec_pos(const Rec& R, const int gs, const int lv
     row = R.base + j * ((2 << R.k) - 1) + h;
 }
 __device__ __forceinline__ void write_scalars(const Rec& R, const int gs, const int lv, const float rad, const float amax,
-                                              const int pmin) {
+                                              const int pmin, const float eps) {
     int row, h, idx, j;
     rec_pos(R, gs, lv, row, h, idx, j);
-    float* p = R.node + (i64)row * NC + DH;
+    float* p = R.node_aux != nullptr ? R.node_aux + (i64)row * NA : R.node + (i64)row * NC + DH;
     const int V = 1 << lv;
     const int rb = R.base + j * ((2 << R.k) - 1);
     const bool inner = lv > 0;
-    p[0] = rad; p[1] = amax; p[2] = (float)pmin; p[3] = (float)V;
+    // split table: the mean is stored in bf16, so the radius carries the rounding slack (packed path keeps rad bit-exact)
+    p[0] = R.node_aux != nullptr ? f_add(rad, eps) : rad; p[1] = amax; p[2] = (float)pmin; p[3] = (float)V;
     p[4] = inner ? (float)(rb + 2 * h + 1) : -1.0f; p[5] = inner ? (float)(rb + 2 * h + 2) : -1.0f;
     p[6] = 1.0f; p[7] = (float)(R.leafbase + j * (1 << R.k) + idx * V); p[8] = (float)V;
 }
@@ -557,6 +586,11 @@ __device__ __forceinline__ float* mu_ptr(const Rec& R, const int gs, const int l
     int row, h, idx, j;
     rec_pos(R, gs, lv, row, h, idx, j);
     return R.node + (i64)row * NC;
+}
+__device__ __forceinline__ unsigned short* mu16_ptr(const Rec& R, const int gs, const int lv) {
+    int row, h, idx, j;
+    rec_pos(R, gs, lv, row, h, idx, j);
+    return R.node_mu + (i64)row * DH;
 }
 __device__ __forceinline__ bool node_full(const Rec& R, const int gs) { return (gs >> R.ks) < R.nfull; }
 
@@ -575,14 +609,21 @@ __device__ __forceinline__ void w_level(float (&x)[32][PER], int& cell, float& c
     constexpr int V = 1 << LV, NN = 32 / V;
     constexpr bool KEEPMU = LV >= 3;
     float mus[KEEPMU ? NN : 1][PER];
+    float epsw[LV > 0 ? NN : 1];
     unsigned xcpb = 0;
-    float* const mp0 = mu_ptr(R, gs0, LV) + lane;
+    float* const mp0 = R.node_mu != nullptr ? nullptr : mu_ptr(R, gs0, LV) + lane;
+    const bool m16 = R.node_mu != nullptr;
+    unsigned short* const mp0b = m16 ? mu16_ptr(R, gs0, LV) + lane : nullptr;
     const int nodes = (2 << R.k) - 1, npc = 1 << max(R.ks - LV, 0);
-    // ---- mean (pad zero folded into the node sum once), record, centring
+    // ---- mean (pad zero folded into the node sum once), record, centring; the fp32 mean drives all build math and
+    // the stored bf16 mean (epsw: its rounding slack, a full-warp butterfly over the node's DH dims split per lane)
 #pragma unroll
     for (int n = 0; n < NN; n++) {
         const bool wr = node_full(R, gs0 + n * V);
-        float* mp = mp0 + (i64)(n + ((n * V) >> R.ks) * (nodes - npc)) * NC;
+        const i64 moff = n + ((n * V) >> R.ks) * (nodes - npc);
+        float* mp = m16 ? nullptr : mp0 + moff * NC;
+        unsigned short* mpb = m16 ? mp0b + moff * DH : nullptr;
+        float e2 = 0.0f;
 #pragma unroll
         for (int i = 0; i < PER; i++) {
             auto ld = [&](const int q) { return x[n * V + q][i]; };
@@ -590,7 +631,13 @@ __device__ __forceinline__ void w_level(float (&x)[32][PER], int& cell, float& c
             const float z = zsel(zb, n * V * PER + i);
             if (fold) s = f_add(s, z);
             const float mu = f_mul_ftz(s, f_pow2neg(LV));
-            if (wr) mp[32 * i] = mu;
+            const unsigned short mw = m16 ? f2bf(mu) : 0;
+            if constexpr (LV > 0)
+                if (m16) {
+                    const float df = f_sub(mu, bf2f(mw));
+                    e2 = f_add(e2, f_mul(df, df));
+                }
+            if (wr) { if (m16) mpb[32 * i] = mw; else mp[32 * i] = mu; }
             if constexpr (LV > 0) {
                 xcpb |= sgn(f_mul(f_sub(z, mu), 0.0f)) << ((n * PER + i) & 31);
 #pragma unroll
@@ -598,14 +645,31 @@ __device__ __forceinline__ void w_level(float (&x)[32][PER], int& cell, float& c
                 if constexpr (KEEPMU) mus[n][i] = mu;
             }
         }
+        if constexpr (LV > 0)
+            if (m16) {
+#pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) e2 = f_add(e2, __shfl_xor_sync(FULL, e2, o));
+                epsw[n] = f_sqrt_ftz(e2);
+            }
     }
     if constexpr (LV == 0) {
         // a leaf's centred row is zero (or a flushed subnormal whose square underflows): d2 = +0, rad = sqrt(+0) or
-        // +0 + spread
+        // +0 + spread; the split table stores the row itself in bf16, so its radius carries the rounding slack
+        auto sqe = [&](const int r) {
+            const float d0 = f_sub(x[r][0], bf2f(f2bf(x[r][0])));
+            float a = f_mul(d0, d0);
+#if PER == 2
+            const float d1 = f_sub(x[r][1], bf2f(f2bf(x[r][1])));
+            a = f_add(a, f_mul(d1, d1));
+#endif
+            return a;
+        };
+        float le = 0.0f;
+        if (m16) le = f_sqrt_ftz(rs_lazy(sqe, lane));
         float rad = has_sp ? f_add(0.0f, sp) : 0.0f;
         if (has_sp && fold) rad = f_max(rad, 0.0f);
         if (node_full(R, gs0 + lane)) {
-            write_scalars(R, gs0 + lane, 0, rad, f_max(ce, 0.0f), cell);
+            write_scalars(R, gs0 + lane, 0, rad, f_max(ce, 0.0f), cell, le);
             int row, h, idx, j;
             rec_pos(R, gs0 + lane, 0, row, h, idx, j);
             R.leaf[R.leafbase + j * (1 << R.k) + idx] = (i64)cell;
@@ -633,9 +697,14 @@ __device__ __forceinline__ void w_level(float (&x)[32][PER], int& cell, float& c
             if (bd2 > bd || (bd2 == bd && far2 < far)) { bd = bd2; far = far2; }
         }
         if ((lane & (V - 1)) == 0 && node_full(R, gs0 + lane)) {
+            float eps = 0.0f;
+            if (m16) {
+#pragma unroll
+                for (int un = 0; un < NN; un++) eps = (un == (lane >> LV)) ? epsw[un] : eps;
+            }
             float rad = has_sp ? rq : f_sqrt_ftz(rq);
             if (has_sp && fold) rad = f_max(rad, 0.0f);
-            write_scalars(R, gs0 + lane, LV, rad, f_max(am, 0.0f), pm);
+            write_scalars(R, gs0 + lane, LV, rad, f_max(am, 0.0f), pm, eps);
         }
         // ---- v0 = Xc[far] / max(sqrt(|Xc[far]|^2), 1e-6); |Xc[far]|^2 is d2[far] = bd (same pairwise sum)
         float v[NN][PER];
@@ -752,14 +821,20 @@ __device__ __forceinline__ void h_level(float (&x)[16][PER], int& cell, float& c
     constexpr int V = 1 << LV, NN = 16 / V;
     constexpr bool KEEPMU = LV >= 3;
     float mus[KEEPMU ? NN : 1][PER];
+    float epsw[LV > 0 ? NN : 1];
     unsigned xcpb = 0;
     const int row = lane >> 1;
-    float* const mp0 = mu_ptr(R, gsh, LV) + lane;
+    float* const mp0 = R.node_mu != nullptr ? nullptr : mu_ptr(R, gsh, LV) + lane;
+    const bool m16 = R.node_mu != nullptr;
+    unsigned short* const mp0b = m16 ? mu16_ptr(R, gsh, LV) + lane : nullptr;
     const int nodes = (2 << R.k) - 1, npc = 1 << max(R.ks - LV, 0);
 #pragma unroll
     for (int n = 0; n < NN; n++) {
         const bool wr = node_full(R, gsh + n * V);
-        float* mp = mp0 + (i64)(n + ((n * V) >> R.ks) * (nodes - npc)) * NC;
+        const i64 moff = n + ((n * V) >> R.ks) * (nodes - npc);
+        float* mp = m16 ? nullptr : mp0 + moff * NC;
+        unsigned short* mpb = m16 ? mp0b + moff * DH : nullptr;
+        float e2 = 0.0f;
 #pragma unroll
         for (int i = 0; i < PER; i++) {
             auto ld = [&](const int q) { return x[n * V + q][i]; };
@@ -767,7 +842,13 @@ __device__ __forceinline__ void h_level(float (&x)[16][PER], int& cell, float& c
             const float z = f_sz((zh >> (n * V * PER + i)) & 1u);
             if (fold) s = f_add(s, z);
             const float mu = f_mul_ftz(s, f_pow2neg(LV));
-            if (wr) mp[32 * i] = mu;
+            const unsigned short mw = m16 ? f2bf(mu) : 0;
+            if constexpr (LV > 0)
+                if (m16) {
+                    const float df = f_sub(mu, bf2f(mw));
+                    e2 = f_add(e2, f_mul(df, df));
+                }
+            if (wr) { if (m16) mpb[32 * i] = mw; else mp[32 * i] = mu; }
             if constexpr (LV > 0) {
                 xcpb |= sgn(f_mul(f_sub(z, mu), 0.0f)) << ((n * PER + i) & 31);
 #pragma unroll
@@ -775,12 +856,30 @@ __device__ __forceinline__ void h_level(float (&x)[16][PER], int& cell, float& c
                 if constexpr (KEEPMU) mus[n][i] = mu;
             }
         }
+        if constexpr (LV > 0)
+            if (m16) {
+#pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) e2 = f_add(e2, __shfl_xor_sync(FULL, e2, o));
+                epsw[n] = f_sqrt_ftz(e2);
+            }
     }
     if constexpr (LV == 0) {
+        // split tables store the leaf row itself in bf16: its radius picks up the rounding slack
+        auto sqe = [&](const int r) {
+            const float d0 = f_sub(x[r][0], bf2f(f2bf(x[r][0])));
+            float a = f_mul(d0, d0);
+#if PER == 2
+            const float d1 = f_sub(x[r][1], bf2f(f2bf(x[r][1])));
+            a = f_add(a, f_mul(d1, d1));
+#endif
+            return a;
+        };
+        float le = 0.0f;
+        if (m16) le = f_sqrt_ftz(rs16_lazy(sqe, lane));
         float rad = has_sp ? f_add(0.0f, sp) : 0.0f;
         if (has_sp && fold) rad = f_max(rad, 0.0f);
         if ((lane & 1) == 0 && node_full(R, gsh + row)) {
-            write_scalars(R, gsh + row, 0, rad, f_max(ce, 0.0f), cell);
+            write_scalars(R, gsh + row, 0, rad, f_max(ce, 0.0f), cell, le);
             int rr, h, idx, j;
             rec_pos(R, gsh + row, 0, rr, h, idx, j);
             R.leaf[R.leafbase + j * (1 << R.k) + idx] = (i64)cell;
@@ -807,9 +906,14 @@ __device__ __forceinline__ void h_level(float (&x)[16][PER], int& cell, float& c
             if (bd2 > bd || (bd2 == bd && far2 < far)) { bd = bd2; far = far2; }
         }
         if ((lane & (2 * V - 1)) == 0 && node_full(R, gsh + row)) {
+            float eps = 0.0f;
+            if (m16) {
+#pragma unroll
+                for (int un = 0; un < NN; un++) eps = (un == (row >> LV)) ? epsw[un] : eps;
+            }
             float rad = has_sp ? rq : f_sqrt_ftz(rq);
             if (has_sp && fold) rad = f_max(rad, 0.0f);
-            write_scalars(R, gsh + row, LV, rad, f_max(am, 0.0f), pm);
+            write_scalars(R, gsh + row, LV, rad, f_max(am, 0.0f), pm, eps);
         }
         float v[NN][PER];
         const float den0 = f_max(f_sqrt_ftz(bd), 1e-6f);
@@ -1055,7 +1159,10 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
 #pragma unroll
         for (int i = 0; i < PER; i++) S.wpart[wid * DH + lane + 32 * i] = ws_[i];
         __syncthreads();
-        if (tid < DH) S.mu[tid] = f_mul_ftz(g_cross(S, tid), f_pow2neg(lvn));
+        if (tid < DH) {
+            const float mu = f_mul_ftz(g_cross(S, tid), f_pow2neg(lvn));
+            S.mu[tid] = mu;
+        }
         __syncthreads();
     }
     float mul[PER], xcp[PER];
@@ -1120,18 +1227,32 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
             S.misc[0] = far0;
             float rad = has_sp ? rq0 : f_sqrt_ftz(rq0);
             if (has_sp && fold) rad = f_max(rad, 0.0f);
-            // record scalars
+            // record scalars (split table: radius carries the bf16 mean-rounding slack; the fp32 mean built the node)
             const int jo = LEAN ? 0 : j;
             const int nodes = (2 << k) - 1, rb = A.lay[k] + jo * nodes, h = (1 << l) - 1 + n;
-            float* p = A.node[f] + ((i64)t * A.Ntot + rb + h) * NC + DH;
-            p[0] = rad; p[1] = f_max(am0, 0.0f); p[2] = (float)pm0; p[3] = (float)V;
+            float* p = A.node_mu[f] != nullptr ? A.node_aux[f] + ((i64)t * A.Ntot + rb + h) * NA
+                                               : A.node[f] + ((i64)t * A.Ntot + rb + h) * NC + DH;
+            float eps = 0.0f;
+            if (A.node_mu[f] != nullptr) {
+                float s2 = 0.0f;
+#pragma unroll 8
+                for (int dd = 0; dd < DH; dd++) {
+                    const float df = f_sub(S.mu[dd], bf2f(f2bf(S.mu[dd])));
+                    s2 = f_add(s2, f_mul(df, df));
+                }
+                eps = f_sqrt_ftz(s2);
+            }
+            p[0] = A.node_mu[f] != nullptr ? f_add(rad, eps) : rad; p[1] = f_max(am0, 0.0f); p[2] = (float)pm0; p[3] = (float)V;
             p[4] = (float)(rb + 2 * h + 1); p[5] = (float)(rb + 2 * h + 2); p[6] = 1.0f;
             p[7] = (float)(A.lay[16 + k] + jo * (1 << k) + n * V); p[8] = (float)V;
         }
         if (tid < DH) {
             const int jo = LEAN ? 0 : j;
             const int nodes = (2 << k) - 1, rb = A.lay[k] + jo * nodes, h = (1 << l) - 1 + n;
-            A.node[f][((i64)t * A.Ntot + rb + h) * NC + tid] = S.mu[tid];
+            if (A.node_mu[f] != nullptr)
+                A.node_mu[f][((i64)t * A.Ntot + rb + h) * DH + tid] = f2bf(S.mu[tid]);
+            else
+                A.node[f][((i64)t * A.Ntot + rb + h) * NC + tid] = S.mu[tid];
         }
         __syncthreads();
     }
@@ -1253,7 +1374,10 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
     if (ja >= jb) return;
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const int nodes = (2 << k) - 1, base = A.lay[k], lbase = A.lay[16 + k];
-    float* nt = A.node[f] + (i64)t * A.Ntot * NC;
+    const bool m16 = A.node_mu[f] != nullptr;
+    float* nt = m16 ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
+    unsigned short* ntm = m16 ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
+    float* nta = m16 ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
     float z[PER];
 #pragma unroll
     for (int i = 0; i < PER; i++) z[i] = f_sz(sgn(A.kb[(i64)t * A.M * DH + lane + 32 * i]));
@@ -1262,22 +1386,41 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
         {
             const int jj = ja + it / nodes, h = it - (it / nodes) * nodes;
             const int rb = base + jj * nodes;
-            float* p = nt + (i64)(rb + h) * NC;
+            const int l = 31 - __clz(h + 1), idx = h + 1 - (1 << l), V = 1 << (k - l);
+            if (m16) {
+                unsigned short* pm = ntm + (i64)(rb + h) * DH;
 #pragma unroll
-            for (int i = 0; i < PER; i++) p[lane + 32 * i] = z[i];
-            if (lane < 9) {
-                const int l = 31 - __clz(h + 1), idx = h + 1 - (1 << l), V = 1 << (k - l);
-                float val;
-                switch (lane) {
-                    case 0: case 1: val = 0.0f; break;
-                    case 2: val = 1073741824.0f; break;
-                    case 3: case 8: val = (float)V; break;
-                    case 4: val = l < k ? (float)(rb + 2 * h + 1) : -1.0f; break;
-                    case 5: val = l < k ? (float)(rb + 2 * h + 2) : -1.0f; break;
-                    case 6: val = 1.0f; break;
-                    default: val = (float)(lbase + jj * (1 << k) + idx * V); break;
+                for (int i = 0; i < PER; i++) pm[lane + 32 * i] = f2bf(z[i]);
+                if (lane < 9) {
+                    float val;
+                    switch (lane) {
+                        case 0: case 1: val = 0.0f; break;
+                        case 2: val = 1073741824.0f; break;
+                        case 3: case 8: val = (float)V; break;
+                        case 4: val = l < k ? (float)(rb + 2 * h + 1) : -1.0f; break;
+                        case 5: val = l < k ? (float)(rb + 2 * h + 2) : -1.0f; break;
+                        case 6: val = 1.0f; break;
+                        default: val = (float)(lbase + jj * (1 << k) + idx * V); break;
+                    }
+                    nta[(i64)(rb + h) * NA + lane] = val;
                 }
-                p[DH + lane] = val;
+            } else {
+                float* p = nt + (i64)(rb + h) * NC;
+#pragma unroll
+                for (int i = 0; i < PER; i++) p[lane + 32 * i] = z[i];
+                if (lane < 9) {
+                    float val;
+                    switch (lane) {
+                        case 0: case 1: val = 0.0f; break;
+                        case 2: val = 1073741824.0f; break;
+                        case 3: case 8: val = (float)V; break;
+                        case 4: val = l < k ? (float)(rb + 2 * h + 1) : -1.0f; break;
+                        case 5: val = l < k ? (float)(rb + 2 * h + 2) : -1.0f; break;
+                        case 6: val = 1.0f; break;
+                        default: val = (float)(lbase + jj * (1 << k) + idx * V); break;
+                    }
+                    p[DH + lane] = val;
+                }
             }
         }
     }
@@ -1322,7 +1465,10 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
     const int gs0 = 32 * wid;
     if (gs0 >= (nfull << k)) return;
     Rec R;
-    R.node = A.node[f] + (i64)t * A.Ntot * NC; R.leaf = A.leaf[f] + (i64)t * A.Ltot;
+    R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
+    R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = A.leaf[f] + (i64)t * A.Ltot;
     R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = min(k, 5);
@@ -1395,7 +1541,10 @@ __device__ __forceinline__ void task_cbatch(const Args& A, const int f, const in
     empty_chunks(A, f, t, k, jo + nfull, jo + nsub);
     if (nfull == 0) return;
     Rec R;
-    R.node = A.node[f] + (i64)t * A.Ntot * NC; R.leaf = A.leaf[f] + (i64)t * A.Ltot;
+    R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
+    R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = A.leaf[f] + (i64)t * A.Ltot;
     R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = 5;
@@ -1457,7 +1606,10 @@ __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t
     wait_flag(A.ctl + dep);
     const int* scr = A.scr + (((i64)f * A.nbig + (k - 10)) * A.T + t) * M + ((i64)j0 << k) + n0 * 512;
     Rec R;
-    R.node = A.node[f] + (i64)t * A.Ntot * NC; R.leaf = A.leaf[f] + (i64)t * A.Ltot;
+    R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
+    R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
+    R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
+    R.leaf = A.leaf[f] + (i64)t * A.Ltot;
     R.k = k; R.ks = 9; R.l0 = k - 9; R.n0 = n0; R.jb = LEAN ? 0 : j0;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = 1; R.zsh = 5;
@@ -1490,13 +1642,17 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
                  const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
                  const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
                  const i64* __restrict__ MT0, const i64* __restrict__ MT1,
-                 float* __restrict__ NODE0, float* __restrict__ NODE1, i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
+                 float* __restrict__ NODE0, float* __restrict__ NODE1,
+                 unsigned short* __restrict__ MU0, unsigned short* __restrict__ MU1,
+                 float* __restrict__ AX0, float* __restrict__ AX1,
+                 i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
                  int* __restrict__ SCR, int* __restrict__ CTL, const int M, const int Ntot, const int Ltot,
                  const int has_sp, const int nbig, const int T) {
     Args A;
     A.tasks = TASKS; A.lay = LAY; A.kb = KB; A.ce = CE; A.spr = SPR;
     A.adm[0] = ADM0; A.adm[1] = ADM1; A.mt[0] = MT0; A.mt[1] = MT1;
     A.node[0] = NODE0; A.node[1] = NODE1; A.leaf[0] = LEAF0; A.leaf[1] = LEAF1;
+    A.node_mu[0] = MU0; A.node_mu[1] = MU1; A.node_aux[0] = AX0; A.node_aux[1] = AX1;
     A.M = M; A.Ntot = Ntot; A.Ltot = Ltot; A.has_sp = has_sp; A.scr = SCR; A.ctl = CTL; A.nbig = nbig; A.T = T;
     const int* tk = TASKS + 10 * blockIdx.x;
     const int type = tk[0], f = tk[1], t = tk[2], k = tk[3], j0 = tk[4], nsub = tk[5], l0 = tk[6], n0 = tk[7];
@@ -1659,8 +1815,28 @@ fsb_forest_build(const int* __restrict__ TASKS, const int* __restrict__ LAY,
                  const int has_sp, const int nbig, const int T) {
     extern __shared__ float smem[];
     DBG_START();
-    build_task<false>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot,
-                      has_sp, nbig, T);
+    build_task<false>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, nullptr, nullptr, nullptr, nullptr,
+                      LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
+    DBG_END();
+}
+
+// fsb_forest_build with the split destination table instead of the packed rows: the same task records and input
+// strides, with means landing in an unsigned-short bf16 slab and aggregates in a 9-wide fp32 slab; every store keying
+// off the destination pointers covers the mean's bf16 rounding error with the radius it records
+extern "C" __global__ void __launch_bounds__(512, 1)
+fsb_forest_build16(const int* __restrict__ TASKS, const int* __restrict__ LAY,
+                   const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
+                   const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
+                   const i64* __restrict__ MT0, const i64* __restrict__ MT1,
+                   unsigned short* __restrict__ MU0, unsigned short* __restrict__ MU1,
+                   float* __restrict__ AX0, float* __restrict__ AX1,
+                   i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
+                   int* __restrict__ SCR, int* __restrict__ CTL, const int M, const int Ntot, const int Ltot,
+                   const int has_sp, const int nbig, const int T) {
+    extern __shared__ float smem[];
+    DBG_START();
+    build_task<false>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, nullptr, nullptr, MU0, MU1, AX0, AX1,
+                      LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
     DBG_END();
 }
 
@@ -1686,7 +1862,130 @@ fsb_forest_build_lean(const int* __restrict__ TASKS, const int* __restrict__ LAY
             }
         }
     }
-    build_task<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot,
-                     has_sp, nbig, T);
+    build_task<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, NODE0, NODE1, nullptr, nullptr, nullptr, nullptr,
+                     LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
+}
+
+// fsb_forest_build_lean with the split destination table: means land in an unsigned-short bf16 slab (rows centred on
+// the stored mean, so the radius a writer records covers exactly what a beam reads), aggregates in a 9-wide fp32 slab
+extern "C" __global__ void __launch_bounds__(512, 1)
+fsb_forest_build_lean16(const int* __restrict__ TASKS, const int* __restrict__ LAY,
+                        const float* __restrict__ KB, const float* __restrict__ CE, const float* __restrict__ SPR,
+                        const i64* __restrict__ ADM0, const i64* __restrict__ ADM1,
+                        const i64* __restrict__ MT0, const i64* __restrict__ MT1,
+                        unsigned short* __restrict__ MU0, unsigned short* __restrict__ MU1,
+                        float* __restrict__ AX0, float* __restrict__ AX1,
+                        i64* __restrict__ LEAF0, i64* __restrict__ LEAF1,
+                        int* __restrict__ SCR, int* __restrict__ CTL, const int M, const int Ntot, const int Ltot,
+                        const int has_sp, const int nbig, const int T,
+                        i64* __restrict__ JB0, i64* __restrict__ JB1) {
+    extern __shared__ float smem[];
+    if (blockIdx.x == 0 && JB0 != nullptr) {
+        const int K1 = LAY[33] + 1;
+        for (int e = threadIdx.x; e < T * K1; e += 512) {
+            const int t = e / K1, k = e - t * K1;
+            const i64 mi = MT0[t];
+            JB0[e] = ((mi >> k) & 1) ? ((mi >> (k + 1)) << 1) : 0;
+            if (JB1 != nullptr) {
+                const i64 mi1 = MT1[t];
+                JB1[e] = ((mi1 >> k) & 1) ? ((mi1 >> (k + 1)) << 1) : 0;
+            }
+        }
+    }
+    build_task<true>(TASKS, LAY, KB, CE, SPR, ADM0, ADM1, MT0, MT1, nullptr, nullptr, MU0, MU1, AX0, AX1,
+                     LEAF0, LEAF1, SCR, CTL, M, Ntot, Ltot, has_sp, nbig, T);
+}
+
+// fsb_spine_lean over the split table (bf16 means upcast, fp32 aggregates); the spine rows stay packed fp32
+extern "C" __global__ void __launch_bounds__(512)
+fsb_spine_lean16(const unsigned short* __restrict__ NMU0, const float* __restrict__ NAX0, const i64* __restrict__ MT0,
+                 float* __restrict__ SP_NODE, i64* __restrict__ SP_ROOT, i64* __restrict__ SP_HGT,
+                 const int T, const int Ntot, const int Kmax_lean) {
+    const int t = blockIdx.x * 16 + (threadIdx.x >> 5);
+    if (t >= T) return;
+    const int lane = threadIdx.x & 31;
+    const i64 m = MT0[t];
+    const int S = Kmax_lean + 1;
+    const unsigned short* ntm = NMU0 + (i64)t * Ntot * DH;
+    const float* nta = NAX0 + (i64)t * Ntot * NA;
+    float r_mu[PER];
+#pragma unroll
+    for (int i = 0; i < PER; i++) r_mu[i] = 0.0f;
+    float r_rad = 0.0f, r_am = 0.0f, r_pm = 1073741824.0f, r_cnt = 0.0f;
+    i64 r_ref = -1, pop = 0, hb = 0;
+    for (int k = 0; k < S; k++) {
+        const i64 kk = (i64)k;
+        const i64 off = m & ~((2ll << kk) - 1ll);
+        const i64 croot = (i64)((2 << k) - k - 2);
+        const bool bit = ((m >> kk) & 1ll) != 0;
+        const bool present = bit;
+        const bool mk = present && (r_cnt > 0.0f);
+        float* row = SP_NODE + ((i64)t * S + kk) * NC;
+        if (present) {
+            const i64 crow = min(max(croot, 0ll), (i64)(Ntot - 1));
+            const unsigned short* npm = ntm + crow * DH;
+            const float* npa = nta + crow * NA;
+            float c_mu[PER];
+#pragma unroll
+            for (int i = 0; i < PER; i++) c_mu[i] = bf2f(npm[lane + 32 * i]);
+            const float c_rad = npa[0];
+            const float c_am = npa[1];
+            const float c_pm = npa[2];
+            const float c_cnt = npa[3];
+            if (mk) {
+                const float tot = f_max(f_add(c_cnt, r_cnt), 1.0f);
+                float n_mu[PER], sq0[PER], sq1[PER];
+#pragma unroll
+                for (int i = 0; i < PER; i++) {
+                    n_mu[i] = f_div_ftz(f_add(f_mul(c_cnt, c_mu[i]), f_mul(r_cnt, r_mu[i])), tot);
+                    const float a = f_sub(c_mu[i], n_mu[i]);
+                    const float b = f_sub(r_mu[i], n_mu[i]);
+                    sq0[i] = f_mul(a, a);
+                    sq1[i] = f_mul(b, b);
+                }
+                const float nrm0 = f_sqrt_ftz(dim_allsum(sq0));
+                const float nrm1 = f_sqrt_ftz(dim_allsum(sq1));
+                const float n_rad = f_max(f_add(c_rad, nrm0), f_add(r_rad, nrm1));
+                const float n_am = f_max(c_am, r_am);
+                const float n_pm = f_min(c_pm, r_pm);
+                const float n_cnt = f_add(c_cnt, r_cnt);
+#pragma unroll
+                for (int i = 0; i < PER; i++) row[lane + 32 * i] = n_mu[i];
+                if (lane == 0) {
+                    row[DH] = n_rad;
+                    row[DH + 1] = n_am;
+                    row[DH + 2] = n_pm;
+                    row[DH + 3] = n_cnt;
+                    row[DH + 4] = (float)croot;
+                    row[DH + 5] = (float)r_ref;
+                    row[DH + 6] = 2.0f;
+                    row[DH + 7] = (float)off;
+                    row[DH + 8] = n_cnt;
+                }
+#pragma unroll
+                for (int i = 0; i < PER; i++) r_mu[i] = n_mu[i];
+                r_rad = n_rad; r_am = n_am; r_pm = n_pm; r_cnt = n_cnt;
+                r_ref = -(kk + 2);
+            } else {
+#pragma unroll
+                for (int i = 0; i < PER; i++) row[lane + 32 * i] = 0.0f;
+                if (lane < 9) row[DH + lane] = (lane == 4 || lane == 5) ? -1.0f : 0.0f;
+#pragma unroll
+                for (int i = 0; i < PER; i++) r_mu[i] = c_mu[i];
+                r_rad = c_rad; r_am = c_am; r_pm = c_pm; r_cnt = c_cnt;
+                r_ref = croot;
+            }
+            pop += 1;
+            hb = kk;
+        } else {
+#pragma unroll
+            for (int i = 0; i < PER; i++) row[lane + 32 * i] = 0.0f;
+            if (lane < 9) row[DH + lane] = (lane == 4 || lane == 5) ? -1.0f : 0.0f;
+        }
+    }
+    if (lane == 0) {
+        SP_ROOT[t] = (m > 0) ? r_ref : -1ll;
+        SP_HGT[t] = (m > 1) ? (hb + (pop >= 2 ? 1ll : 0ll)) : 0ll;
+    }
 }
 

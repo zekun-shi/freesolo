@@ -104,7 +104,7 @@ _fused_failed: list = []
 def _fused_source(CA: int, CB: int, KK: int, lse_mode: bool, pos_mode: bool, prov_on: bool, prov_bit: int,
                   out_i32: bool) -> str:
     defs = dict(CA=CA, CB=CB, NT=_NT, MCW=MC_MAX // 32, KK=KK, LSE_MODE=int(lse_mode), POS_MODE=int(pos_mode),
-                PROV_ON=int(prov_on), PROV_BIT=int(prov_bit), OUT_I32=int(out_i32), UTILE=16, MIN_BLOCKS=3)
+                PROV_ON=int(prov_on), PROV_BIT=int(prov_bit), OUT_I32=int(out_i32), UTILE=32, MIN_BLOCKS=3)
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _SRC
 
 
@@ -131,7 +131,7 @@ def rows_fused_ok(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tensor,
 def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tensor, cellA: torch.Tensor,
                     t_idx: torch.Tensor, qv: torch.Tensor, sq0: int, sq1: int, lv: torch.Tensor, ls0: int,
                     sv: torch.Tensor, ss0: int, out: torch.Tensor, pv: torch.Tensor, Mc: int, ucap: int,
-                    scale: float, K: int, score: str, prov: bool, prov_bit: int):
+                    scale: float, K: int, score: str, prov: bool, prov_bit: int, q_nq: int = None):
     from .fsb_beam_cuda import _sm80, launch, load_function
     dev = sel_a.device
     if not _sm80(dev):
@@ -154,9 +154,16 @@ def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tenso
     sb = sel_b.contiguous() if Cb else sa
     if sa.data_ptr() % 16 or sb.data_ptr() % 16:
         sa, sb = sa.clone(), (sb.clone() if Cb else sa)
-    qc = q.reshape(Tp, Bq, 64).contiguous()
-    if qc.data_ptr() % 16:
-        qc = qc.clone()
+    nq = Bq if q_nq is None else int(q_nq)
+    esz = q.element_size()
+    if (q.dim() == 3 and q.stride(2) == 1 and q.stride(1) * esz % 16 == 0 and q.stride(0) * esz % 16 == 0
+            and q.data_ptr() % 16 == 0 and 0 < nq <= Bq):
+        qc, qst0, qst1 = q, q.stride(0), q.stride(1)        # a strided stage view: kernel clamps rows >= nq
+    else:
+        qc = q.reshape(Tp, Bq, 64).contiguous()
+        if qc.data_ptr() % 16:
+            qc = qc.clone()
+        qst0, qst1, nq = Bq * 64, 64, Bq
     tc = t_idx.contiguous()
     ovf = (torch.zeros if Mc > ucap else torch.empty)((), dtype=torch.bool, device=dev)
     if Tp == 0:
@@ -168,7 +175,7 @@ def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tenso
             P(lv.data_ptr()), I64(ls0), P(sv.data_ptr()), I64(ss0),
             P(out.data_ptr()), P(pv.data_ptr()), P(ovf.data_ptr()),
             I32(Mc), I32(ucap), I32(K4.shape[1]), I64(K4.stride(0)), I64(K4.stride(1)), I64(K4.stride(2)),
-            F32(float(scale))]
+            F32(float(scale)), I64(qst0), I64(qst1), I32(nq)]
     launch(fn, Tp, _NT, dev, args)
     return ovf
 
