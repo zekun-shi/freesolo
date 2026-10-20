@@ -50,7 +50,8 @@ def ruler_driver(monkeypatch):
     route.router_key_check = lambda *args, **kwargs: (None, set())
     for module in (torch, transformers, infer, cache, tree, route):
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    for name in (*FAST_FLAGS, *GRAPH_FLAGS, *ROWS_FLAGS, "FS_PRUNE_KERNEL", "FS_FUSED_ATTN"):
+    for name in (*FAST_FLAGS, *GRAPH_FLAGS, *ROWS_FLAGS, "FSB_DECODE_V2", "FSB_DECODE_FORK", "FS_PRUNE_KERNEL",
+                 "FS_FUSED_ATTN"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(sys, "path", list(sys.path))
     path = Path(__file__).resolve().parents[1] / "eval_ruler.py"
