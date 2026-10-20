@@ -13,8 +13,13 @@
 // - readout: _fsb_decread_int8_kernel's math (the token scores are the re-rank's own q.k dot products, stored in bf16
 //   and scaled), with its own reduction order for the softmax denominator and the value sum (F8-class, as that kernel
 //   against the torch reference).
+// DEC_V3 (FSB_DECODE_V3=1) shortens each descent's chain with the same cells and outputs bit for bit: the query's load
+// leads the preamble, the spine rows (and the cached shape plan) arrive by cp.async in one round, and the root's aux
+// row is read only where the level loop starts at the root; the keep-all top levels run as one batch (team_prefix:
+// their nodes from the tree's shape, cached per row, staged in one round, scored in one pass, the frontier order
+// replayed); and the ranks compare through register masks rather than predicate chains.
 // Requires _HELPERS (fsb_beam.cu). Compile-time: DH (64), NA (9), NC, WM (<= 16), R, KK (cells read: 1, 2, 4 or 8),
-// SCELL (cell size, 32), BOUND, RC_T, LSE_ON, POS_ON, HAS_SR, W_BF16, LRS_BF16, PROV_BIT, NWARP (16).
+// SCELL (cell size, 32), BOUND, RC_T, LSE_ON, POS_ON, HAS_SR, W_BF16, LRS_BF16, PROV_BIT, NWARP (16), DEC_V3.
 
 #define C_ALL (2 * WM * R)
 #define CA (WM * R)
@@ -33,10 +38,11 @@
 #define LSTAMP(k) do { } while (0)
 #endif
 
-// one beam's tables (forest_beam_pair_cuda's BeamP without its outputs)
+// one beam's tables (forest_beam_pair_cuda's BeamP without its outputs, plus the spines' heights)
 struct DecBeam {
     const i64* ROOT; const i64* WBEAM; const i64* BUDGET; const i64* TIDX;
     const unsigned short* CHUNK; const float* CHUNK_AX; const float* SPINE; const i64* LEAF; const i64* ADM;
+    const i64* HGT; int* PLAN;
     i64 Ntot; i64 Sp; i64 Ltot; i64 Mm; int KMAXP1; int pad_;
 };
 
@@ -75,6 +81,17 @@ __device__ __forceinline__ float f_max(float a, float b) { float r; asm("max.f32
 __device__ __forceinline__ float f_abs(float a) { float r; asm("abs.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
 __device__ __forceinline__ float f_rsqrt_ftz(float a) { float r; asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
 __device__ __forceinline__ float f_i2f(int a) { float r; asm("cvt.rn.f32.s32 %0, %1;" : "=f"(r) : "r"(a)); return r; }
+// comparison masks in a register (all ones / zero) rather than a predicate: a rank over many candidates then needs no
+// chain of predicated moves through the few predicate registers
+__device__ __forceinline__ unsigned m_gt(const float a, const float b) {
+    unsigned r; asm("set.gt.u32.f32 %0, %1, %2;" : "=r"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ unsigned m_eq(const float a, const float b) {
+    unsigned r; asm("set.eq.u32.f32 %0, %1, %2;" : "=r"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ unsigned m_lt(const int a, const int b) {
+    unsigned r; asm("set.lt.u32.s32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b)); return r; }
+// 1 when (s2, c2) ranks ahead of (s, c): higher score, or the same score and a lower index (the ranks' tie order)
+__device__ __forceinline__ int ahead(const float s2, const int c2, const float s, const int c) {
+    return (int)((m_gt(s2, s) | (m_eq(s2, s) & m_lt(c2, c))) & 1u); }
 __device__ __forceinline__ unsigned word_of(const uint4& u, const int k) {
     return k == 0 ? u.x : (k == 1 ? u.y : (k == 2 ? u.z : u.w));
 }
@@ -191,6 +208,383 @@ __device__ __forceinline__ void stage_node(TeamS& S, const int e, const int n, c
     if (g == 0) cp4(d + 8, a + 8);
 }
 
+#ifndef DEC_V3
+#define DEC_V3 0
+#endif
+#if DEC_V3
+#define PMAX (2 * WM + 1)                           // prefix members: the root and up to 2 WM children
+#define PDMAX 16                                    // prefix levels at most
+// a descent team's keep-all prefix (team_prefix): its members (the nodes of the prefix levels: index, stage entry, chunk
+// height << 16 | heap index or -1 for a spine node, count, parent member, slot in the replayed frontier, stage index of
+// the children of a member that expands at the first per-level loop level), each level's member range, the frontier
+// hand-over of the replay (member and count per slot) and the expanding members of the last prefix level
+// The walk's part (key .. npm) is a pure function of the forest's shape at the row (root, its count, the budgets, the
+// level bound) and is cached per row in global memory (PLAN): loaded with the spine rows, reused while its key holds.
+struct __align__(16) PlanS {
+    int key[8];
+    int ref[PMAX], ent[PMAX], kh[PMAX];
+    float cnt[PMAX];
+    signed char mlv[2 * WM];                        // the level of member m at index m - 1 (word-aligned)
+    signed char par[PMAX], eix[PMAX], fe[16];
+    signed char lvs[PDMAX + 1], lvn[PDMAX + 1];
+    int L0, nfe, npm;
+};
+struct __align__(16) PrefS : PlanS {
+    float rsc[16];                                  // 16-byte aligned (read as float4): first after the plan
+    int rcc[16];
+    float ocnt[16];
+    int bad;
+    signed char slot[PMAX], fl[16], ord[16];
+};
+#define PLAN_BYTES ((int)sizeof(PlanS))
+#define PLAN_CHUNKS ((PLAN_BYTES + 15) / 16)
+#define PLAN_STRIDE 1024                            // bytes per row of the cache (fsb_decode_cuda._PLAN_INTS words)
+#define PLAN_MARK 0x5EED0001
+static_assert(PLAN_CHUNKS * 16 <= PLAN_STRIDE, "the prefix plan must fit its cache row");
+
+// keep-all prefix of a descent (FSB_DECODE_V3): while a level keeps every child it visits (its carried slots plus
+// its children fit in min(wbeam, WM)), its node set follows from the tree's shape alone: the spine rows (children and
+// counts) and the chunks' heap layout (heap node h of a chunk of height kk has its children h + 1 and h + 2 entries
+// after it and count 2^(kk - depth)), a lone chunk's height being the spine's (hgt). So the nodes of all such levels and
+// the next level's candidates are staged in one round, the prefix nodes are scored in one pass with the per-level loop's
+// arithmetic, and only the frontier order is replayed level by level with the loop's rules (the exit when every slot is
+// carried, carried slots first, children by (score desc, c = 2 slot + side asc), the keep conditions). Every staged node
+// is checked against the shape (count, heap children); on a mismatch, or with nothing to batch, it returns 0 and the loop
+// starts at the root; else S.f[0] and the stage are what the loop would hold at the returned level. The shape walk and
+// the replay run in the team's first warp with the frontier in registers (lane = slot). Team-uniform exits.
+__device__ int team_prefix(const DecBeam& B, TeamS& S, PrefS& P, const int tt, const int bar_id, const i64 r,
+                           const int root, const i64 hgt, const float bud, const int wbeam, const int nsp,
+                           const unsigned short* __restrict__ cmub, const float* __restrict__ cax,
+                           const i64* __restrict__ leafb, const i64* __restrict__ admb, const i64 Ltot, const i64 Mm,
+                           const float (&qa)[8], const float (&qb)[8], const float qn, const float qpos,
+                           const float lam, const float sig2, const float scale, const float cell_size,
+                           const signed char* __restrict__ qk_row, const i64 sqk_n,
+                           const unsigned short* __restrict__ sk_row, long long* pt_out) {
+    const int c = tt >> 2, g = tt & 3, lane = tt & 31, gl = lane & ~3;
+    const unsigned below = (1u << lane) - 1u;
+    const int cap = min(wbeam, WM);
+#if DEC_TIMING
+#define PSTAMP(k) do { if (pt_out != nullptr && tt == 0) pt_out[k] = clock64(); } while (0)
+#else
+#define PSTAMP(k) do { } while (0)
+#endif
+    PSTAMP(0);
+    // the key of the shape this row's walk depends on: the cached plan (loaded with the spine rows) holds if it matches
+    int key[8];
+    key[0] = PLAN_MARK; key[1] = root;
+    key[2] = __float_as_int(root <= -2 && -root - 2 < nsp ? S.spn[-root - 2][DH + 3] : 0.0f);
+    key[3] = __float_as_int(bud); key[4] = wbeam; key[5] = B.KMAXP1; key[6] = nsp; key[7] = (int)hgt;
+    bool hit = B.PLAN != nullptr;
+#pragma unroll
+    for (int i = 0; i < 8; i++) hit = hit && P.key[i] == key[i];
+    // ---- the prefix levels' node sets from the shape (the team's first warp; lane j: member j of the walk's frontier,
+    // carried members first, then the new children in member order) ----
+    if (tt < 32 && !hit) {
+        int p = -1, ref = 0, kh = -1, bad = 0;
+        float cnt = 0.0f;
+        if (lane == 0 && root != -1) {
+            p = 0; ref = root;
+            if (root <= -2) {
+                if (-root - 2 < nsp) cnt = S.spn[-root - 2][DH + 3]; else bad = 1;
+            } else if (hgt < 0 || hgt > 30) {
+                bad = 1;
+            } else {
+                kh = (int)hgt << 16; cnt = (float)(1 << (int)hgt);
+            }
+            P.ref[0] = root; P.ent[0] = -1; P.kh[0] = kh; P.cnt[0] = cnt; P.par[0] = -1;
+        }
+        bad = __shfl_sync(FULL, bad, 0);
+        int npm = 1, L0 = 0;
+        for (int d = 1; d <= PDMAX && !bad; d++) {
+            const bool expd = p >= 0 && cnt > bud;
+            const bool car = p >= 0 && !expd;
+            const unsigned be = __ballot_sync(FULL, expd), bc = __ballot_sync(FULL, car);
+            const int nexp = __popc(be), ncar = __popc(bc);
+            if (nexp == 0 || ncar + 2 * nexp > cap || npm + 2 * nexp > PMAX || d - 1 >= B.KMAXP1) break;
+            int cref[2] = {0, 0}, ckh[2] = {-1, -1};
+            float ccnt[2] = {0.0f, 0.0f};
+            bool cbad = false;
+            if (expd) {
+                if (ref <= -2) {                                // a spine node: its chunk of height k and the rest
+                    const int k = -ref - 2;
+                    const float* row = S.spn[k];
+                    const float ck = (float)(1 << k);
+                    const int rr = (int)row[DH + 5];
+                    cref[0] = (int)row[DH + 4]; ckh[0] = k << 16; ccnt[0] = ck;
+                    cref[1] = rr;
+                    if (rr <= -2) {
+                        if (-rr - 2 < nsp) ccnt[1] = S.spn[-rr - 2][DH + 3]; else cbad = true;
+                    } else {
+                        const float rest = f_sub(row[DH + 3], ck);  // a lone chunk below: a power of two
+                        const int ri = (int)rest;
+                        if (ri < 1 || (ri & (ri - 1)) != 0 || (float)ri != rest) cbad = true;
+                        else { ckh[1] = (31 - __clz(ri)) << 16; ccnt[1] = rest; }
+                    }
+                    if (cref[0] < 0 || rr == -1) cbad = true;
+                } else {                                        // heap node h of a chunk of height kk
+                    const int kk = kh >> 16, h = kh & 0xffff;
+                    const int l = 31 - __clz(h + 1);
+                    if (kh < 0 || l >= kk || 2 * h + 2 > 0xffff) cbad = true;
+                    else {
+                        cref[0] = ref + h + 1; cref[1] = ref + h + 2;
+                        ckh[0] = (kk << 16) | (2 * h + 1); ckh[1] = (kk << 16) | (2 * h + 2);
+                        ccnt[0] = ccnt[1] = (float)(1 << (kk - l - 1));
+                    }
+                }
+            }
+            if (__any_sync(FULL, cbad)) { bad = 1; break; }
+            if (expd) {
+                const int c0 = npm + 2 * __popc(be & below);
+#pragma unroll
+                for (int sd = 0; sd < 2; sd++) {
+                    const int m = c0 + sd;
+                    P.ref[m] = cref[sd]; P.kh[m] = ckh[sd]; P.cnt[m] = ccnt[sd]; P.par[m] = (signed char)p;
+                    P.ent[m] = cref[sd] >= 0 ? 2 * WM + m - 1 : -1;
+                    P.mlv[m - 1] = (signed char)d;
+                }
+            }
+            if (car) P.fl[__popc(bc & below)] = (signed char)p;
+            if (lane == 0) { P.lvs[d] = (signed char)npm; P.lvn[d] = (signed char)(2 * nexp); }
+            __syncwarp();
+            const int nm = lane < ncar ? (int)P.fl[lane] : (lane < ncar + 2 * nexp ? npm + lane - ncar : -1);
+            p = nm;
+            if (nm >= 0) { ref = P.ref[nm]; kh = P.kh[nm]; cnt = P.cnt[nm]; }
+            __syncwarp();
+            npm += 2 * nexp;
+            L0 = d;
+        }
+        // the members that expand at the loop's first level: their children go to stage entries 2 e, 2 e + 1
+        const bool expd = !bad && L0 > 0 && p >= 0 && cnt > bud;
+        const unsigned be = __ballot_sync(FULL, expd);
+        if (!bad && L0 > 0 && p >= 0) {
+            const int e = expd ? __popc(be & below) : 0;
+            P.eix[p] = (signed char)e;
+            if (expd) P.fe[e] = (signed char)p;
+        }
+        if (lane == 0) {
+            P.L0 = bad ? 0 : L0; P.nfe = __popc(be); P.npm = npm;
+#pragma unroll
+            for (int i = 0; i < 8; i++) P.key[i] = key[i];
+        }
+        __syncwarp();
+        if (B.PLAN != nullptr) {                        // the plan into the row's cache for the next tokens
+            const uint4* src = reinterpret_cast<const uint4*>(&P);
+            uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<char*>(B.PLAN) + r * PLAN_STRIDE);
+            for (int i = lane; i < PLAN_CHUNKS; i += 32) dst[i] = src[i];
+        }
+    }
+    if (tt == 0) P.bad = 0;
+    team_bar(bar_id);
+    PSTAMP(1);
+    if (P.L0 == 0) return 0;
+    const int npm = P.npm, nfe = P.nfe, L0 = P.L0;
+    // ---- one round of loads: the prefix members (group c: member c + 1) and the next level's candidates ----
+    if (c + 1 < npm && P.ref[c + 1] >= 0) stage_node(S, P.ent[c + 1], P.ref[c + 1], g, cmub, cax);
+    if ((c >> 1) < nfe) {
+        const int m = P.fe[c >> 1], sd = c & 1, ref = P.ref[m];
+        const int ch = ref <= -2 ? (int)S.spn[-ref - 2][DH + 4 + sd] : ref + (P.kh[m] & 0xffff) + 1 + sd;
+        if (ch >= 0) stage_node(S, c, ch, g, cmub, cax);
+    }
+    cp_commit();
+    cp_wait_all();
+    team_bar(bar_id);
+    PSTAMP(2);
+    // ---- the prefix members' scores in one pass (the per-level loop's operations), each staged node checked; a member
+    // that cannot expand loads its first cell for the L2 prefetch issued after the replay ----
+    int lcell = -1;
+    {
+        const int m = c + 1;
+        const bool has = m < npm;
+        const int ref = has ? P.ref[m] : -1;
+        float ax[NA], x[8];
+#pragma unroll
+        for (int f = 0; f < NA; f++) ax[f] = 0.0f;
+        if (has && ref >= 0) {
+            const int e = P.ent[m];
+            const uint4 ma = S.mu[e][g], mb = S.mu[e][g + DH / 16];
+            const float4 a0 = S.ax[e][0], a1 = S.ax[e][1], a2 = S.ax[e][2];
+            ax[0] = a0.x; ax[1] = a0.y; ax[2] = a0.z; ax[3] = a0.w;
+            ax[4] = a1.x; ax[5] = a1.y; ax[6] = a1.z; ax[7] = a1.w; ax[8] = a2.x;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned wa = word_of(ma, i >> 1), wb = word_of(mb, i >> 1);
+                x[i] = f_add(f_mul(qa[i], (i & 1) ? bf_hi(wa) : bf_lo(wa)), f_mul(qb[i], (i & 1) ? bf_hi(wb) : bf_lo(wb)));
+            }
+            const int kk = P.kh[m] >> 16, h = P.kh[m] & 0xffff, l = 31 - __clz(h + 1);
+            const bool ok = ax[3] == P.cnt[m] && (l < kk ? (ax[4] == (float)(ref + h + 1) && ax[5] == (float)(ref + h + 2))
+                                                         : (ax[4] == -1.0f && ax[5] == -1.0f));
+            if (!ok) P.bad = 1;
+        } else if (has) {
+            const float* sp32 = S.spn[-ref - 2];
+#pragma unroll
+            for (int f = 0; f < NA; f++) ax[f] = sp32[DH + f];
+#pragma unroll
+            for (int i = 0; i < 8; i++) x[i] = f_add(f_mul(qa[i], sp32[8 * g + i]), f_mul(qb[i], sp32[DH / 2 + 8 * g + i]));
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; i++) x[i] = 0.0f;
+        }
+        const float v = group_halve(x, g);
+        float content = f_mul(v, scale);
+#if BOUND
+        content = f_add(content, f_mul(f_mul(qn, ax[0]), scale));
+#endif
+        const float pmin_pos = f_mul(f_add(ax[2], 0.5f), cell_size);
+        const float dx = __int_as_float(__float_as_int(f_sub(qpos, pmin_pos)) & 0x7fffffff);
+        const float score = f_add(content, f_mul(f_mul(lam, ax[1]), erf_tl(f_div_full(dx, sig2))));
+        if (has && g == 0) S.sc[c] = score;
+        if (has && g == 0 && ax[3] <= bud && ax[6] > 0.0f && ax[8] > 0.0f) {
+            const i64 ps = (i64)ax[7];
+            lcell = (int)(ax[6] == 1.0f ? leafb[min(max(ps, (i64)0), Ltot - 1)] : admb[min(max(ps, (i64)0), Mm - 1)]);
+        }
+    }
+    team_bar(bar_id);
+    PSTAMP(3);
+    if (P.bad) {
+        if (tt == 0 && B.PLAN != nullptr)
+            reinterpret_cast<PlanS*>(reinterpret_cast<char*>(B.PLAN) + r * PLAN_STRIDE)->L0 = 0;
+        return 0;
+    }
+    // ---- the frontier order of every prefix level with the loop's rules, and the frontier it hands over (the team's
+    // first warp; lane = slot, holding the member there and its count) ----
+    if (tt < 32) {
+        // with no two children of one level scoring alike and none dropped (score <= -5e8), every level orders its
+        // children by score alone, so the frontier of level L0 is: the carried members (cnt <= bud, made before L0) by
+        // (level made, score desc), then the members made at L0 by score desc; lane j: member j + 1
+        int mo = -1;
+        float mcnt = 0.0f;
+        bool fast;
+        {
+            const int m = lane + 1;
+            const bool has = m < npm;
+            const int lv = has ? (int)P.mlv[lane] : 0x7f;
+            const float sc = has ? S.sc[lane] : NEG_INF;
+            // members are numbered level by level, so the lower levels are the members below the level's first; the
+            // order within the level compares only its (at most WM) members, in four independent chains
+            const int ls = has ? (int)P.lvs[lv] : 1, ln = has ? (int)P.lvn[lv] : 0;
+            const unsigned lower = (1u << (ls - 1)) - 1u;
+            unsigned ac[4] = {0u, 0u, 0u, 0u}, tc[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+            for (int i = 0; i < WM; i++) {
+                const int j = ls - 1 + i;                   // member j + 1 of the level
+                const float s2 = i < ln ? S.sc[j] : NEG_INF;
+                const unsigned bit = i < ln ? (1u << j) : 0u;
+                ac[i & 3] |= m_gt(s2, sc) & bit;
+                tc[i & 3] |= m_eq(s2, sc) & bit;
+            }
+            const unsigned ahd = (ac[0] | ac[1]) | (ac[2] | ac[3]);
+            unsigned tie = (tc[0] | tc[1]) | (tc[2] | tc[3]);
+            tie &= ~(1u << lane);
+            const bool carried = has && lv < L0 && P.cnt[m] <= bud;
+            const unsigned bcar = __ballot_sync(FULL, carried);
+            fast = !__any_sync(FULL, has && (tie != 0u || !(sc > -5e8f)));
+            int pos = -1;
+            if (carried) pos = __popc(bcar & (lower | ahd));
+            else if (has && lv == L0) pos = __popc(bcar) + __popc(ahd);
+            if (fast) {
+                if (lane < 16) P.ord[lane] = -1;
+                __syncwarp();
+                if (pos >= 0 && pos < WM) { P.ord[pos] = (signed char)m; P.ocnt[pos] = P.cnt[m]; }
+                __syncwarp();
+                mo = lane < 16 ? (int)P.ord[lane] : -1;
+                mcnt = mo >= 0 ? P.ocnt[lane] : 0.0f;
+            }
+        }
+        int lr = L0;
+        if (!fast) {
+        mo = lane == 0 ? 0 : -1;
+        mcnt = lane == 0 ? P.cnt[0] : 0.0f;
+        if (lane < PMAX) P.slot[lane] = -1;
+        if (lane + 32 < PMAX) P.slot[lane + 32] = -1;
+        __syncwarp();
+        for (int d = 1; d <= L0; d++) {
+            const bool active = mo >= 0;
+            const bool carried = active && mcnt <= bud;
+            const unsigned bc = __ballot_sync(FULL, carried);
+            const int ncar = __popc(bc);
+            if (__ballot_sync(FULL, active && !carried) == 0u && ncar <= wbeam) { lr = d - 1; break; }
+            if (active) P.slot[mo] = (signed char)lane;
+            __syncwarp();
+            const int cs = P.lvs[d], cn = P.lvn[d];
+            const int cm = cs + lane;
+            int cc = 0x7fffffff;
+            float sc = NEG_INF, ccnt = 0.0f;
+            bool valid = false;
+            if (lane < cn) {
+                const int ps = P.slot[P.par[cm]];
+                if (ps >= 0) { valid = true; cc = 2 * ps + (lane & 1); sc = S.sc[cm - 1]; ccnt = P.cnt[cm]; }
+            }
+            if (lane < 16) { P.rsc[lane] = sc; P.rcc[lane] = cc; }
+            __syncwarp();
+            int rr;
+            {
+                const float4* s4p = reinterpret_cast<const float4*>(P.rsc);
+                const int4* c4p = reinterpret_cast<const int4*>(P.rcc);
+                int rk[4] = {0, 0, 0, 0};                   // four short chains instead of one of sixteen
+#pragma unroll
+                for (int h = 0; h < 4; h++) {
+                    const float4 s4 = s4p[h];
+                    const int4 c4 = c4p[h];
+                    rk[0] += ahead(s4.x, c4.x, sc, cc);
+                    rk[1] += ahead(s4.y, c4.y, sc, cc);
+                    rk[2] += ahead(s4.z, c4.z, sc, cc);
+                    rk[3] += ahead(s4.w, c4.w, sc, cc);
+                }
+                rr = (rk[0] + rk[1]) + (rk[2] + rk[3]);
+            }
+            const int crank = ncar + rr, ncb = __popc(bc & below);
+            const bool keep = valid && sc > -5e8f && crank < wbeam && crank < WM;
+            const bool ckeep = carried && ncb < wbeam && ncb < WM;
+            if (lane < 16) P.ord[lane] = -1;
+            __syncwarp();
+            if (ckeep) { P.ord[ncb] = (signed char)mo; P.ocnt[ncb] = mcnt; }
+            if (keep) { P.ord[crank] = (signed char)cm; P.ocnt[crank] = ccnt; }
+            __syncwarp();
+            mo = lane < 16 ? (int)P.ord[lane] : -1;
+            mcnt = mo >= 0 ? P.ocnt[lane] : 0.0f;
+        }
+        }
+        // the frontier the loop would hold at level lr
+        if (lane < WM) {
+            FrontS& F0 = S.f[0];
+            if (mo < 0) {
+                F0.ref[lane] = -1;
+            } else {
+                const int ref = P.ref[mo];
+                float a[6];
+                if (ref >= 0) {
+                    const int e = P.ent[mo];
+                    const float4 a0 = S.ax[e][0], a1 = S.ax[e][1], a2 = S.ax[e][2];
+                    a[0] = a0.w; a[1] = a1.x; a[2] = a1.y; a[3] = a1.z; a[4] = a1.w; a[5] = a2.x;
+                } else {
+                    const float* sp = S.spn[-ref - 2] + DH + 3;
+#pragma unroll
+                    for (int f = 0; f < 6; f++) a[f] = sp[f];
+                }
+                F0.ref[lane] = ref; F0.stg[lane] = P.eix[mo]; F0.cnt[lane] = a[0]; F0.chl[lane] = (int)(i64)a[1];
+                F0.chr[lane] = (int)(i64)a[2]; F0.src[lane] = a[3]; F0.off[lane] = a[4]; F0.len[lane] = a[5];
+            }
+        }
+        if (lane == 0) P.L0 = lr;
+    }
+    team_bar(bar_id);
+    PSTAMP(4);
+    // the first cells of the members that cannot expand: their key rows into L2 for the re-rank
+    {
+        const int lc = __shfl_sync(FULL, lcell, gl);
+        if (lc >= 0) {
+            const signed char* kp = qk_row + (i64)lc * SCELL * sqk_n;
+#pragma unroll
+            for (int i = 0; i < SCELL * DH / 512; i++) prefetch_l2(kp + (i64)(g * (SCELL * DH / 512) + i) * 128);
+            if (g == 0) prefetch_l2(sk_row + lc);
+        }
+    }
+    PSTAMP(5);
+    return P.L0;
+#undef PSTAMP
+}
+#endif
+
 // one beam descent by a team of 4 warps (fsb_beam_pair_cuda's warp_query and warp_descend, bitwise): the frontier
 // slots live in shared memory, child c of a level (frontier slot c / 2, side c & 1: warp_descend's compacted child
 // order is this order) belongs to the 4 lanes 4 c .. 4 c + 3, lane g of them holding columns 8 g .. 8 g + 7 and
@@ -208,13 +602,20 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
                                              const float qpos, const float lam, const float sig2, const float scale,
                                              const float cell_size, const signed char* __restrict__ qk_row,
                                              const i64 sqk_n, const unsigned short* __restrict__ sk_row,
-                                             long long* lt_out) {
+                                             long long* lt_out, int* __restrict__ lev0_out
+#if DEC_V3
+                                             , PrefS& P
+#endif
+                                             ) {
     const int c = tt >> 2, g = tt & 3;
     const int lane = tt & 31, gl = lane & ~3;
     const i64 tidx = B.TIDX[r];
     const int root = (int)B.ROOT[r];
     const float bud = (float)B.BUDGET[r];
     const i64 wbeam = B.WBEAM[r];
+#if DEC_V3
+    const i64 hgt = B.HGT[r];
+#endif
     const unsigned short* cmub = B.CHUNK + tidx * B.Ntot * DH;
     const float* cax = B.CHUNK_AX + tidx * B.Ntot * NA;
     const float* sbase = B.SPINE + r * B.Sp * NC;
@@ -223,6 +624,31 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
     const i64* admb = B.ADM + tidx * Mm;
     const int nsp = (int)min(B.Sp, (i64)SPMAX);
     // the spine rows into shared memory and the query into registers, in one round of loads
+#if DEC_V3
+    // the query's load first (the norm below waits for it), then the spine rows and the cached plan, all in flight
+    uint4 qua = make_uint4(0u, 0u, 0u, 0u), qub = make_uint4(0u, 0u, 0u, 0u);
+    if (q_bf16) {
+        const uint4* q16 = reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned short*>(Q) + r * DH);
+        qua = q16[g]; qub = q16[g + DH / 16];
+    }
+    for (int i = tt; i < nsp * NC; i += 128) cp4(&S.spn[0][0] + i, sbase + i);
+    if (B.PLAN != nullptr && tt < PLAN_CHUNKS)
+        cp16(reinterpret_cast<char*>(&P) + 16 * tt, reinterpret_cast<const char*>(B.PLAN) + r * PLAN_STRIDE + 16 * tt);
+    cp_commit();
+    float qa[8], qb[8];
+    if (q_bf16) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const unsigned wa = word_of(qua, i >> 1), wb = word_of(qub, i >> 1);
+            qa[i] = (i & 1) ? bf_hi(wa) : bf_lo(wa);
+            qb[i] = (i & 1) ? bf_hi(wb) : bf_lo(wb);
+        }
+    } else {
+        const float* qf = reinterpret_cast<const float*>(Q) + r * DH;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { qa[i] = qf[8 * g + i]; qb[i] = qf[DH / 2 + 8 * g + i]; }
+    }
+#else
     for (int i = tt; i < nsp * NC; i += 128) (&S.spn[0][0])[i] = sbase[i];
     float qa[8], qb[8];
     if (q_bf16) {
@@ -239,6 +665,7 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
 #pragma unroll
         for (int i = 0; i < 8; i++) { qa[i] = qf[8 * g + i]; qb[i] = qf[DH / 2 + 8 * g + i]; }
     }
+#endif
     if (c == 0) {
 #pragma unroll
         for (int i = 0; i < 8; i++) { q_out[8 * g + i] = qa[i]; q_out[DH / 2 + 8 * g + i] = qb[i]; }
@@ -251,35 +678,56 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
     float rx[NA];
 #pragma unroll
     for (int f = 0; f < NA; f++) rx[f] = 0.0f;
+#if !DEC_V3
     if (root != -1 && c == 0) {
         const float* p = (root <= -2 && -root - 2 < SPMAX) ? nullptr : dec_aux(cax, sbase, root);
 #pragma unroll
         for (int f = 3; f < NA; f++) rx[f] = p != nullptr ? p[f] : 0.0f;
     }
+#endif
     if (tt < WM) S.f[0].ref[tt] = -1;
+#if DEC_V3
+    cp_wait_all();
+#endif
     team_bar(bar_id);                                     // the spine stage
-    if (root != -1 && c == 0) {
-        if (root <= -2 && -root - 2 < SPMAX) {
+    int lev0 = 0;
+#if DEC_V3
+    lev0 = team_prefix(B, S, P, tt, bar_id, r, root, hgt, bud, (int)wbeam, nsp, cmub, cax, leafb, admb, Ltot, Mm, qa, qb,
+                       qn, qpos, lam, sig2, scale, cell_size, qk_row, sqk_n, sk_row,
+                       lt_out != nullptr ? lt_out - 7 : nullptr);
+#endif
+    if (lev0_out != nullptr && tt == 0) *lev0_out = lev0;              // test hook: the levels the prefix covered
+    if (lev0 == 0) {
+#if DEC_V3
+        if (root != -1 && c == 0 && !(root <= -2 && -root - 2 < SPMAX)) {
+            const float* p = dec_aux(cax, sbase, root);
 #pragma unroll
-            for (int f = 3; f < NA; f++) rx[f] = S.spn[-root - 2][DH + f];
+            for (int f = 3; f < NA; f++) rx[f] = p[f];
         }
-        if (rx[3] > bud) {
+#endif
+        if (root != -1 && c == 0) {
+            if (root <= -2 && -root - 2 < SPMAX) {
 #pragma unroll
-            for (int side = 0; side < 2; side++) {
-                const int n = (int)(i64)(side ? rx[5] : rx[4]);
-                if (n >= 0) stage_node(S, side, n, g, cmub, cax);
+                for (int f = 3; f < NA; f++) rx[f] = S.spn[-root - 2][DH + f];
+            }
+            if (rx[3] > bud) {
+#pragma unroll
+                for (int side = 0; side < 2; side++) {
+                    const int n = (int)(i64)(side ? rx[5] : rx[4]);
+                    if (n >= 0) stage_node(S, side, n, g, cmub, cax);
+                }
+            }
+            if (g == 0) {
+                S.f[0].ref[0] = root; S.f[0].stg[0] = 0; S.f[0].cnt[0] = rx[3]; S.f[0].chl[0] = (int)(i64)rx[4];
+                S.f[0].chr[0] = (int)(i64)rx[5]; S.f[0].src[0] = rx[6]; S.f[0].off[0] = rx[7]; S.f[0].len[0] = rx[8];
             }
         }
-        if (g == 0) {
-            S.f[0].ref[0] = root; S.f[0].stg[0] = 0; S.f[0].cnt[0] = rx[3]; S.f[0].chl[0] = (int)(i64)rx[4];
-            S.f[0].chr[0] = (int)(i64)rx[5]; S.f[0].src[0] = rx[6]; S.f[0].off[0] = rx[7]; S.f[0].len[0] = rx[8];
-        }
+        cp_commit();
+        cp_wait_all();
+        team_bar(bar_id);
     }
-    cp_commit();
-    cp_wait_all();
-    team_bar(bar_id);
     int cur = 0;
-    for (int lev = 0; lev < B.KMAXP1; lev++) {
+    for (int lev = lev0; lev < B.KMAXP1; lev++) {
         LSTAMP(0);
         FrontS& Fc = S.f[cur];
         FrontS& Fn = S.f[cur ^ 1];
@@ -373,10 +821,15 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
             for (int h = 0; h < 2; h++) {
                 const float4 s4 = s4p[h];
                 const int m0 = 8 * g + 4 * h;
+#if DEC_V3
+                rr += (ahead(s4.x, m0, sc, c) + ahead(s4.y, m0 + 1, sc, c)) + (ahead(s4.z, m0 + 2, sc, c)
+                                                                            + ahead(s4.w, m0 + 3, sc, c));
+#else
                 rr += (int)(s4.x > sc) + ((int)(s4.x == sc) & (int)(m0 < c));
                 rr += (int)(s4.y > sc) + ((int)(s4.y == sc) & (int)(m0 + 1 < c));
                 rr += (int)(s4.z > sc) + ((int)(s4.z == sc) & (int)(m0 + 2 < c));
                 rr += (int)(s4.w > sc) + ((int)(s4.w == sc) & (int)(m0 + 3 < c));
+#endif
             }
             rr += __shfl_xor_sync(FULL, rr, 1);
             rr += __shfl_xor_sync(FULL, rr, 2);
@@ -564,9 +1017,12 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
                  const i64 srb, const i64 srh, const void* __restrict__ LRS, unsigned short* __restrict__ OUT,
                  const i64 sob, const i64 soh, const float eps, const int Hh,
                  i64* __restrict__ SEL_OUT, signed char* __restrict__ PROV_OUT, i64* __restrict__ CELLS_OUT,
-                 long long* __restrict__ TIMES) {
+                 int* __restrict__ LEV0_OUT, long long* __restrict__ TIMES) {
     __shared__ __align__(16) float s_q[2][DH];
     __shared__ TeamS s_team[2];
+#if DEC_V3
+    __shared__ PrefS s_pref[2];
+#endif
     __shared__ int s_cell[C_ALL];
     __shared__ float s_u[C_ALL];
     __shared__ float s_raw[C_ALL][32];
@@ -589,7 +1045,11 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
 #endif
     // the re-rank's row scalars, in flight across the descents
     const i64 seq = BA.TIDX[r];
+#if DEC_V3
+    const i64 bi = (i64)((int)seq / Hh), hi = seq - bi * Hh;      // rows < 2^31: one 32-bit division
+#else
     const i64 bi = seq / Hh, hi = seq - bi * Hh;
+#endif
     const i64 nq = *NQ;
     const i64 posv = *POS;
     const signed char* qk_row = QK + bi * sqk_b + hi * sqk_h;
@@ -604,14 +1064,24 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
     // beam's cells ----
     const int team = wid >> 2, tt = tid & 127;
     constexpr int NRW = NWARP - 8;                            // re-rank warps
+    if (wid == 0) TSTAMP(1);
     if (tid >= 256 && tid < 256 + KK) s_slot[tid - 256] = -1;
     if (team == 0) {
         team_descend(BA, s_team[0], s_cell, s_q[0], tt, 1, r, Q, q_bf16, rcq, qp, lam_r, sig2, scale, cell_size,
-                     qk_row, sqk_n, sk_row, DEC_TIMING && TIMES != nullptr ? TIMES + r * 256 + 16 : nullptr);
+                     qk_row, sqk_n, sk_row, DEC_TIMING && TIMES != nullptr ? TIMES + r * 256 + 16 : nullptr,
+                     LEV0_OUT != nullptr ? LEV0_OUT + 2 * r : nullptr
+#if DEC_V3
+                     , s_pref[0]
+#endif
+                     );
         if (tt == 0) TSTAMP(2);
     } else if (team == 1) {
         team_descend(BB, s_team[1], s_cell + CA, s_q[1], tt, 2, r, Q, q_bf16, rcq, qp, lam_r, sig2, scale, cell_size,
-                     qk_row, sqk_n, sk_row, nullptr);
+                     qk_row, sqk_n, sk_row, nullptr, LEV0_OUT != nullptr ? LEV0_OUT + 2 * r + 1 : nullptr
+#if DEC_V3
+                     , s_pref[1]
+#endif
+                     );
         if (tt == 0) TSTAMP(3);
         asm volatile("bar.arrive 3, %0;" :: "r"((NRW + 4) * 32) : "memory");
     } else {

@@ -1419,6 +1419,7 @@ class ForestCache:
         self._async_next = False          # the next ingest decides its dirty chunks on the device (FSB_DECODE_ASYNC)
         self._rb = None                   # (pinned host copy, row, event, device source) of such an ingest's counts
         self._eff_open = False            # that ingest's budgets may differ from the host's height key's
+        self._plan = None                 # the V3 fused read's per-row cache of its prefix walk (fsb_decode_cuda)
 
     def _get_tau32(self, tau):
         key = (tau.data_ptr(), int(tau._version), tuple(tau.shape), tau.dtype)

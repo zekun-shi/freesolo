@@ -363,3 +363,92 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq):
     assert h0 == h1
     assert torch.equal(s0, s1) and (s0 >= 0).float().mean() > 0.9
     assert torch.equal(l0, l1)
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("L,tau_q,periodic", [(640, 0.0, False), (1408, 0.0, False), (2944, 0.3, False),
+                                              (4096, 0.0, False), (4096, 0.3, True), (2944, 0.0, True)])
+def test_prefix_beams_match_pair_kernel(monkeypatch, L, tau_q, periodic):
+    # FSB_DECODE_V3=1: both descents with their keep-all top levels batched (team_prefix) against forest_beam_pair,
+    # on decode states whose forests are a lone chunk or a spine of chunks (every cell admitted, or 70% per head; the
+    # union forest about half), with tie-heavy cells too (a periodic prompt: identical cells, whose scores differ only
+    # through a position prior that saturates far away); the hook reports how many levels each prefix covered
+    from src.fsattn.fsb_fast_step import forest_beam_pair
+    from src.fsattn.fsb_route import radius_rows, route_radius
+    from src.fsattn.fsb_tree import beam_delta_eff, fsb_decode_token
+    m = _model(monkeypatch, L)
+    gen = torch.Generator().manual_seed(107)
+    if periodic:
+        prompt = torch.randint(0, 512, (1, 32), generator=gen).repeat(1, L // 32).cuda()
+    else:
+        prompt = torch.randint(0, 512, (1, L), generator=gen).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", "1")
+    monkeypatch.setenv("FSB_DECODE_V3", "1")
+    gd = _decoder(m, prompt, 16)
+    if tau_q > 0:
+        f, c = gd.attn[0], gd.cache[0]
+        f.fsb_tau.copy_(c._ceil[0].float().quantile(tau_q, dim=-1))
+    for _ in range(3):
+        gd.step()
+    attn, cache = gd.attn[0], gd.cache[0]
+    fc = cache._fsb_forest
+    tk, T, s = fc._tok, 16, attn.cell_stride
+    ukw = tk["ukw"]
+    pos_t = torch.full((), gd.pos, dtype=torch.int64, device="cuda")
+    pos_f = torch.full((1,), float(gd.pos), device="cuda")
+    d_max = beam_delta_eff(attn)
+    rc = radius_rows(attn, tk["head_id"], route_radius(attn))
+    cells = torch.full((T, 2 * attn.fsb_W_max << d_max), -7, dtype=torch.int64, device="cuda")
+    lev0 = torch.full((T, 2), -1, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(dcu, "_CELLS", cells)
+    monkeypatch.setattr(dcu, "_LEV0", lev0)
+    g = torch.Generator(device="cuda").manual_seed(109)
+    covered = []
+    for scale in (0.25, 1.0, 4.0, 16.0):
+        q_t = (torch.randn(1, T, 1, 64, device="cuda", generator=g) * scale).to(torch.bfloat16)
+        fsb_decode_token(attn, q_t, cache, tk["sigma"], pos_t, pos_f=pos_f)
+        pair = forest_beam_pair(fc.F, fc.SP, tk["W"], tk["delta"], attn.fsb_W_max, ukw["union_F"], ukw["union_SP"],
+                                ukw["union_W"], ukw["union_delta"], attn.fsb_union_W_max, q_t.view(T, 1, 64),
+                                pos_f.view(1, 1).expand(T, 1), tk["lam"], tk["sigv"], attn.scale, s, d_max,
+                                attn.fsb_node_score, rc, bud=tk["bud"], bud_u=tk["bud_u"])
+        (ca, _), (cb, _) = pair
+        want = torch.cat([ca.reshape(T, -1), cb.reshape(T, -1)], dim=1)
+        assert torch.equal(cells, want), scale
+        assert (want >= 0).any()
+        covered.append(lev0.clone())
+    # every descent of a forest with at least 16 admitted cells batched its top levels (an empty forest has none)
+    big = torch.stack([fc.m_tot, fc.utau.m_tot], dim=1) >= 16
+    assert big.any()
+    for lv in covered:
+        assert bool((lv[big] >= 2).all()), (lv.tolist(), big.tolist())
+
+
+@gpu
+@torch.no_grad()
+def test_prefix_decode_matches_level_loop(monkeypatch):
+    # FSB_DECODE_V3=1 in the whole-step decode (with the fork, the one-kernel join and the device-decided block
+    # changes): teacher-forced steps across query blocks give the read cells and the logits of the level-by-level
+    # descent bit for bit
+    m = _model(monkeypatch, 2944, n_layers=2)
+    prompt = torch.randint(0, 512, (1, 2944), generator=torch.Generator().manual_seed(113)).cuda()
+    forced = torch.randint(0, 512, (400,), generator=torch.Generator().manual_seed(127)).cuda()
+    for k, v in (("FSB_DECODE_V2", "1"), ("FSB_DECODE_FORK", "1"), ("FSB_DECODE_JOIN", "1"), ("FSB_DECODE_ASYNC", "1")):
+        monkeypatch.setenv(k, v)
+    restore = _taus(m)
+    runs = {}
+    for pre in ("0", "1"):
+        monkeypatch.setenv("FSB_DECODE_V3", pre)
+        restore()
+        gd = _decoder(m, prompt, len(forced))
+        logits, sels = [], []
+        for t in forced:
+            gd.next_tok = t.view(1)
+            gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
+        runs[pre] = (torch.stack(logits), torch.stack(sels))
+    (l0, s0), (l1, s1) = runs["0"], runs["1"]
+    assert (s0 >= 0).float().mean() > 0.9
+    assert torch.equal(s0, s1)
+    assert torch.equal(l0, l1)
