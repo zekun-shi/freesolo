@@ -275,6 +275,30 @@ def test_window_decode_through_slots_matches_full_int8_store(N):
     assert torch.equal(hots[1][0][:, :, N - nq], k[:, :, 0]) and torch.equal(hots[1][1][:, :, N - nq], v[:, :, 0])
 
 
+@pytest.mark.parametrize("N", [4096 + 5, 9000 + 31])
+@torch.no_grad()
+def test_window_decode_reads_no_scale_of_the_open_cell(N):
+    # a full int8 store whose K / V reserve ends inside the open cell (a decoder near the end of prompt + max_new_tokens
+    # + 8 positions when that is not a multiple of 32): its scale buffers hold the completed cells only, so the open
+    # cell's index is one past them; the window kernel takes that cell's rows from the hot buffer and must not read its
+    # scale (run under compute-sanitizer memcheck with PYTORCH_NO_CUDA_MEMORY_CACHING=1 to see the read). Same output as
+    # the torch reference
+    a, st, (qk, qv, sk, sv, kh, vh, nq_t), q, k, v, pos_t = _window_args(N, seed=N % 83 + 7)
+    nq = int(nq_t)
+    qk, qv = qk[:, :, :N + 1].clone(), qv[:, :, :N + 1].clone()
+    sk, sv = sk[:, :, :nq // S].clone(), sv[:, :, :nq // S].clone()
+    win_idx = torch.arange(N - W, N + 1, device="cuda")
+    win_pos = win_idx.float()
+    cos, sin = a.rope.cos_cached, a.rope.sin_cached
+    khot, vhot = kh.clone(), vh.clone()
+    args = (qk, sk, khot, qv, sv, vhot)
+    assert N // S == sk.shape[2] and tt.sr_decode_int8_ok(q, k, v, *args, nq_t, win_idx, win_pos, cos)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = tt.sr_decode_fused_int8(q, k, v, *args, nq_t, S, pos_t, win_idx, win_pos, a.sigma, a.scale, W, True,
+                                      True, cos, sin)
+    assert torch.equal(out, _window_ref(a, q, k, v, qk, sk, qv, sv, kh, vh, nq, N))
+
+
 @pytest.mark.parametrize("N", [4096 + 77, 9000 + 31])
 @pytest.mark.parametrize("ln_f32", [False, True])
 @torch.no_grad()

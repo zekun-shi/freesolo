@@ -347,12 +347,15 @@ if triton is not None:
         if not SLOTS:
             prow = w_idx
             pcell = cell
+        # the int8 store is read for the quantized rows only: the open cell's index can equal the number of scales
+        # the store holds (a K / V reserve that ends inside that cell), and its rows come from the hot buffer
+        mq = m & (w_idx < nq)
 
         kq1 = tl.load(QK + b * sqkb + h * sqkh + prow[:, None] * sqkn + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
+                      mask=mq[:, None], other=0).to(tl.float32)
         kq2 = tl.load(QK + b * sqkb + h * sqkh + prow[:, None] * sqkn + HALF + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
-        ksc = tl.load(SK + b * sskb + h * sskh + pcell, mask=m, other=0.0).to(tl.float32)[:, None]
+                      mask=mq[:, None], other=0).to(tl.float32)
+        ksc = tl.load(SK + b * sskb + h * sskh + pcell, mask=mq, other=0.0).to(tl.float32)[:, None]
         kh1 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + cols[None, :],
                       mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
         kh2 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + HALF + cols[None, :],
@@ -376,10 +379,10 @@ if triton is not None:
         tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=m[:, None])
 
         vq1 = tl.load(QV + b * sqvb + h * sqvh + prow[:, None] * sqvn + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
+                      mask=mq[:, None], other=0).to(tl.float32)
         vq2 = tl.load(QV + b * sqvb + h * sqvh + prow[:, None] * sqvn + HALF + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
-        vsc = tl.load(SV + b * ssvb + h * ssvh + pcell, mask=m, other=0.0).to(tl.float32)[:, None]
+                      mask=mq[:, None], other=0).to(tl.float32)
+        vsc = tl.load(SV + b * ssvb + h * ssvh + pcell, mask=mq, other=0.0).to(tl.float32)[:, None]
         vh1 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + cols[None, :],
                       mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
         vh2 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + HALF + cols[None, :],
