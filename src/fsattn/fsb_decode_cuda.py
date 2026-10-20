@@ -24,7 +24,8 @@ _SRC = bc._load_cu_sections("fsb_decode.cu")["_DECODE_KERNEL"]
 _NWARP = 16                                              # warps per (batch, head) row
 _fns: dict = {}
 _failed: list = []                                       # the kernel failed to build: the chain runs from then on
-_TIMES = None        # diagnostic hook: an int64 CUDA tensor (rows, 16) -> the DEC_TIMING build records phase clocks
+_TIMES = None        # diagnostic hook: an int64 CUDA tensor (rows, 256) -> the DEC_TIMING build records phase clocks
+_CELLS = None        # test hook: an int64 CUDA tensor (rows, 2 W_max 2^delta) -> both beams' cells (main, then union)
 
 
 def v2_on() -> bool:
@@ -170,6 +171,7 @@ def decode_read_fused(attn, fc, tk: dict, cache, q_t: torch.Tensor, q: torch.Ten
             I64(vhot.stride(0)), I64(vhot.stride(1)), I64(vhot.stride(2)),
             P(pos_i.data_ptr()), P(lnw.data_ptr()), P(srp), I64(srb), I64(srh), P(lrs.data_ptr()),
             P(out.data_ptr()), I64(sob), I64(soh), F32(float(attn.lr_norm.eps)), I32(H),
-            P(sel.data_ptr()), P(pv.data_ptr()), P(times.data_ptr() if times is not None else 0)]
+            P(sel.data_ptr()), P(pv.data_ptr()), P(_CELLS.data_ptr() if _CELLS is not None else 0),
+            P(times.data_ptr() if times is not None else 0)]
     bc.launch(fn, T, 32 * _NWARP, dev, args)
     return out, sel, pv

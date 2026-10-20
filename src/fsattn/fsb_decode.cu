@@ -4,8 +4,9 @@
 // of their cells (warps 8.. re-rank the union beam's cells while the main descent goes on, then every warp the main
 // beam's), the stable top-KK selection and the readout of the selected cells with lr_norm and the window combine.
 // - descents: fsb_beam_pair_cuda's frontier, child scores, ranks and cells, bitwise (team_descend: four lanes per
-//   child, the frontier in shared memory carrying every aux field the next level and the cells epilogue read, so a
-//   level is one round of loads; the children's own children are prefetched into L2 meanwhile);
+//   child, the frontier in shared memory carrying every aux field the next level and the cells epilogue read; each
+//   level stages the next level's candidate nodes in shared memory with cp.async while it is scored, so no global
+//   round trip sits on a level's critical path, and prefetches into L2 the key rows of cells that may be read);
 // - re-rank: _fsb_upar_int8_kernel + _fsb_selpv_kernel's arithmetic (the int8 rows dequantized as int8 * scale with one
 //   rounding, libdevice expf / logf as Triton links them, CUDA's erff as torch calls it), so the read cells and their
 //   provenance are bitwise the chain's;
@@ -47,12 +48,12 @@ struct DecBeam {
 // scores, the next level's candidate chunk nodes (bf16 means and aux rows, staged while the level is scored) and the
 // row's spine (fp32 means and aux, staged once)
 struct __align__(16) FrontS {
-    int ref[16], stg[16];
-    float cnt[16], chl[16], chr[16], src[16], off[16], len[16];
+    int ref[16], stg[16], chl[16], chr[16];
+    float cnt[16], src[16], off[16], len[16];
 };
 struct __align__(16) TeamS {
     uint4 mu[NST][DH / 8];
-    float ax[NST][NA];
+    float4 ax[NST][3];                              // aux rows padded to 12 words: three 16-byte reads
     float spn[SPMAX][NC];
     FrontS f[2];
     float sc[32];
@@ -184,9 +185,10 @@ __device__ __forceinline__ void stage_node(TeamS& S, const int e, const int n, c
     cp16(&S.mu[e][g], row + g);
     cp16(&S.mu[e][g + DH / 16], row + g + DH / 16);
     const float* a = cax + (i64)n * NA;
-    cp4(&S.ax[e][g], a + g);
-    cp4(&S.ax[e][g + 4], a + g + 4);
-    if (g == 0) cp4(&S.ax[e][8], a + 8);
+    float* d = reinterpret_cast<float*>(S.ax[e]);
+    cp4(d + g, a + g);
+    cp4(d + g + 4, a + g + 4);
+    if (g == 0) cp4(d + 8, a + 8);
 }
 
 // one beam descent by a team of 4 warps (fsb_beam_pair_cuda's warp_query and warp_descend, bitwise): the frontier
@@ -196,15 +198,19 @@ __device__ __forceinline__ void stage_node(TeamS& S, const int e, const int n, c
 // against children 8 g .. 8 g + 7 and the group sums the counts. A level reads its children from shared memory (the
 // chunk nodes staged by the previous level, the spine staged once) and stages the children of every child that can
 // still expand with cp.async, which lands while the level is scored and ranked: no global round trip on the level's
-// critical path. Three team barriers per level (children read; scores; next frontier). q_out (the query, fp32) and
-// cells_out (the WM * R cells) are the team's outputs
+// critical path. A child that cannot expand (it may end in the frontier) loads its first cell and, once the level is
+// ranked, prefetches that cell's key rows (qk_row, sqk_n, sk_row) into L2 for the re-rank. Three team barriers per
+// level (children read; scores; next frontier). q_out (the query, fp32) and cells_out (the WM * R cells) are the
+// team's outputs
 __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __restrict__ cells_out,
                                              float* __restrict__ q_out, const int tt, const int bar_id, const i64 r,
                                              const void* __restrict__ Q, const int q_bf16, const float rcq,
                                              const float qpos, const float lam, const float sig2, const float scale,
-                                             const float cell_size, long long* lt_out) {
+                                             const float cell_size, const signed char* __restrict__ qk_row,
+                                             const i64 sqk_n, const unsigned short* __restrict__ sk_row,
+                                             long long* lt_out) {
     const int c = tt >> 2, g = tt & 3;
-    const int lane = tt & 31;
+    const int lane = tt & 31, gl = lane & ~3;
     const i64 tidx = B.TIDX[r];
     const int root = (int)B.ROOT[r];
     const float bud = (float)B.BUDGET[r];
@@ -265,8 +271,8 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
             }
         }
         if (g == 0) {
-            S.f[0].ref[0] = root; S.f[0].stg[0] = 0; S.f[0].cnt[0] = rx[3]; S.f[0].chl[0] = rx[4];
-            S.f[0].chr[0] = rx[5]; S.f[0].src[0] = rx[6]; S.f[0].off[0] = rx[7]; S.f[0].len[0] = rx[8];
+            S.f[0].ref[0] = root; S.f[0].stg[0] = 0; S.f[0].cnt[0] = rx[3]; S.f[0].chl[0] = (int)(i64)rx[4];
+            S.f[0].chr[0] = (int)(i64)rx[5]; S.f[0].src[0] = rx[6]; S.f[0].off[0] = rx[7]; S.f[0].len[0] = rx[8];
         }
     }
     cp_commit();
@@ -288,7 +294,7 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
         const int slot = c >> 1;
         int child = -1, e = 0;
         if (slot < WM && Fc.ref[slot] != -1 && Fc.cnt[slot] > bud) {
-            child = (int)(i64)((c & 1) ? Fc.chr[slot] : Fc.chl[slot]);
+            child = (c & 1) ? Fc.chr[slot] : Fc.chl[slot];
             e = 2 * Fc.stg[slot] + (c & 1);
         }
         if (tt < WM) Fn.ref[tt] = -1;                        // the next frontier starts empty (filled after the barrier)
@@ -301,8 +307,9 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
         if (child >= 0) {
             ma = S.mu[e][g];
             mb = S.mu[e][g + DH / 16];
-#pragma unroll
-            for (int f = 0; f < NA; f++) ax[f] = S.ax[e][f];
+            const float4 a0 = S.ax[e][0], a1 = S.ax[e][1], a2 = S.ax[e][2];
+            ax[0] = a0.x; ax[1] = a0.y; ax[2] = a0.z; ax[3] = a0.w;
+            ax[4] = a1.x; ax[5] = a1.y; ax[6] = a1.z; ax[7] = a1.w; ax[8] = a2.x;
         } else if (child <= -2) {
             const int k = -child - 2;
             sp32 = k < SPMAX ? S.spn[k] : sbase + (i64)k * NC;
@@ -311,6 +318,13 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
         }
         const float rad = ax[0], amax = ax[1], pmin = ax[2], cnt = ax[3], chl = ax[4], chr = ax[5];
         const float src = ax[6], off = ax[7], len = ax[8];
+        // a child that cannot expand may end in the frontier: its first cell now, its key rows into L2 once the level
+        // is ranked (the re-rank reads them)
+        int lcell = -1;
+        if (g == 0 && child != -1 && cnt <= bud && src > 0.0f && len > 0.0f) {
+            const i64 ps = (i64)off;
+            lcell = (int)(src == 1.0f ? leafb[min(max(ps, (i64)0), Ltot - 1)] : admb[min(max(ps, (i64)0), Mm - 1)]);
+        }
         float x[8];
         if (child >= 0) {
 #pragma unroll
@@ -327,18 +341,12 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
         }
         LSTAMP(1);
         team_bar(bar_id);                                     // every child read: its stage entries can be reused
-        // the next level's candidates (the children of a child that can still expand) into the stage; a child that
-        // cannot expand may end in the frontier: its cell entry into L2
-        if (child != -1) {
-            if (cnt > bud) {
+        // the next level's candidates (the children of a child that can still expand) into the stage
+        if (child != -1 && cnt > bud) {
 #pragma unroll
-                for (int side = 0; side < 2; side++) {
-                    const int n = (int)(i64)(side ? chr : chl);
-                    if (n >= 0) stage_node(S, 2 * c + side, n, g, cmub, cax);
-                }
-            } else if (src > 0.0f && g == 0) {
-                const i64 ps = (i64)off;
-                prefetch_l2(src == 1.0f ? leafb + min(max(ps, (i64)0), Ltot - 1) : admb + min(max(ps, (i64)0), Mm - 1));
+            for (int side = 0; side < 2; side++) {
+                const int n = (int)(i64)(side ? chr : chl);
+                if (n >= 0) stage_node(S, 2 * c + side, n, g, cmub, cax);
             }
         }
         cp_commit();
@@ -375,8 +383,18 @@ __device__ __forceinline__ void team_descend(const DecBeam B, TeamS& S, int* __r
         }
         const int crank = ncar + rr;
         LSTAMP(4);
+        {
+            const int lc = __shfl_sync(FULL, lcell, gl);
+            if (lc >= 0) {
+                const signed char* kp = qk_row + (i64)lc * SCELL * sqk_n;
+#pragma unroll
+                for (int i = 0; i < SCELL * DH / 512; i++) prefetch_l2(kp + (i64)(g * (SCELL * DH / 512) + i) * 128);
+                if (g == 0) prefetch_l2(sk_row + lc);
+            }
+        }
         if (g == 0 && child != -1 && sc > -5e8f && crank < wbeam && crank < WM) {
-            Fn.ref[crank] = child; Fn.stg[crank] = c; Fn.cnt[crank] = cnt; Fn.chl[crank] = chl; Fn.chr[crank] = chr;
+            Fn.ref[crank] = child; Fn.stg[crank] = c; Fn.cnt[crank] = cnt; Fn.chl[crank] = (int)(i64)chl;
+            Fn.chr[crank] = (int)(i64)chr;
             Fn.src[crank] = src; Fn.off[crank] = off; Fn.len[crank] = len;
         }
         if (tt < WM && carried) {
@@ -545,7 +563,8 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
                  const i64* __restrict__ POS, const void* __restrict__ LNW, const unsigned short* __restrict__ SR,
                  const i64 srb, const i64 srh, const void* __restrict__ LRS, unsigned short* __restrict__ OUT,
                  const i64 sob, const i64 soh, const float eps, const int Hh,
-                 i64* __restrict__ SEL_OUT, signed char* __restrict__ PROV_OUT, long long* __restrict__ TIMES) {
+                 i64* __restrict__ SEL_OUT, signed char* __restrict__ PROV_OUT, i64* __restrict__ CELLS_OUT,
+                 long long* __restrict__ TIMES) {
     __shared__ __align__(16) float s_q[2][DH];
     __shared__ TeamS s_team[2];
     __shared__ int s_cell[C_ALL];
@@ -588,11 +607,11 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
     if (tid >= 256 && tid < 256 + KK) s_slot[tid - 256] = -1;
     if (team == 0) {
         team_descend(BA, s_team[0], s_cell, s_q[0], tt, 1, r, Q, q_bf16, rcq, qp, lam_r, sig2, scale, cell_size,
-                     DEC_TIMING && TIMES != nullptr ? TIMES + r * 256 + 16 : nullptr);
+                     qk_row, sqk_n, sk_row, DEC_TIMING && TIMES != nullptr ? TIMES + r * 256 + 16 : nullptr);
         if (tt == 0) TSTAMP(2);
     } else if (team == 1) {
         team_descend(BB, s_team[1], s_cell + CA, s_q[1], tt, 2, r, Q, q_bf16, rcq, qp, lam_r, sig2, scale, cell_size,
-                     nullptr);
+                     qk_row, sqk_n, sk_row, nullptr);
         if (tt == 0) TSTAMP(3);
         asm volatile("bar.arrive 3, %0;" :: "r"((NRW + 4) * 32) : "memory");
     } else {
@@ -603,6 +622,7 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
     }
     __syncthreads();
     if (wid == 0) TSTAMP(4);
+    if (CELLS_OUT != nullptr && tid < C_ALL) CELLS_OUT[r * C_ALL + tid] = s_cell[tid];   // test hook: both beams' cells
     rerank_range<(CA + NWARP - 1) / NWARP < 4 ? (CA + NWARP - 1) / NWARP : 4>(
         0, CA, wid, NWARP, lane, s_cell, s_u, s_raw, s_q[1], qk_row, sk_row, hk_row, qv_row, sqk_n, shk_n, sqv_n, nq,
         Mc, cella_row, ca1, qp, lam_r, sig2, scale);

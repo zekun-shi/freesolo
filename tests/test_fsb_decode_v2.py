@@ -171,3 +171,42 @@ def test_forked_read_matches_serial_step(monkeypatch, v2):
     rel = ((l1 - l0).norm(dim=-1) / l0.norm(dim=-1)).max().item()
     assert rel < 1e-2, rel
     assert (l1.argmax(-1) == l0.argmax(-1)).float().mean().item() >= 0.99
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("L", [1024, 4096])
+def test_fused_beams_match_pair_kernel(monkeypatch, L):
+    # the fused kernel's two beam descents (its test hook writes both beams' cells) against forest_beam_pair (the
+    # warp-per-query pair kernel, itself bitwise with the per-level reference) on the same decode state and queries
+    from src.fsattn.fsb_fast_step import forest_beam_pair
+    from src.fsattn.fsb_route import radius_rows, route_radius
+    from src.fsattn.fsb_tree import beam_delta_eff, fsb_decode_token
+    m = _model(monkeypatch, L)
+    prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(73)).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", "1")
+    gd = _decoder(m, prompt, 16)
+    for _ in range(3):
+        gd.step()
+    attn, cache = gd.attn[0], gd.cache[0]
+    fc = cache._fsb_forest
+    tk, T, s = fc._tok, 16, attn.cell_stride
+    ukw = tk["ukw"]
+    pos_t = torch.full((), gd.pos, dtype=torch.int64, device="cuda")
+    pos_f = torch.full((1,), float(gd.pos), device="cuda")
+    d_max = beam_delta_eff(attn)
+    rc = radius_rows(attn, tk["head_id"], route_radius(attn))
+    cells = torch.full((T, 2 * attn.fsb_W_max << d_max), -7, dtype=torch.int64, device="cuda")
+    monkeypatch.setattr(dcu, "_CELLS", cells)
+    g = torch.Generator(device="cuda").manual_seed(79)
+    for scale in (0.25, 1.0, 4.0, 16.0):
+        q_t = (torch.randn(1, T, 1, 64, device="cuda", generator=g) * scale).to(torch.bfloat16)
+        fsb_decode_token(attn, q_t, cache, tk["sigma"], pos_t, pos_f=pos_f)
+        pair = forest_beam_pair(fc.F, fc.SP, tk["W"], tk["delta"], attn.fsb_W_max, ukw["union_F"], ukw["union_SP"],
+                                ukw["union_W"], ukw["union_delta"], attn.fsb_union_W_max, q_t.view(T, 1, 64),
+                                pos_f.view(1, 1).expand(T, 1), tk["lam"], tk["sigv"], attn.scale, s, d_max,
+                                attn.fsb_node_score, rc, bud=tk["bud"], bud_u=tk["bud_u"])
+        (ca, _), (cb, _) = pair
+        want = torch.cat([ca.reshape(T, -1), cb.reshape(T, -1)], dim=1)
+        assert torch.equal(cells, want), scale
+        assert (want >= 0).any()
