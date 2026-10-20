@@ -272,13 +272,16 @@ def _env(monkeypatch):
         monkeypatch.setenv(k, v)
 
 
-@pytest.mark.parametrize("L,ties", [(4096 + 77, False), (3 * 1024, True), (8192, False)])
+@pytest.mark.parametrize("L,ties,prealloc", [(4096 + 77, False, "1"), (4096 + 77, False, "0"), (3 * 1024, True, "1"),
+                                            (8192, False, "1")])
 @torch.no_grad()
-def test_graphed_decoder_bounded_matches_full_store(monkeypatch, L, ties):
+def test_graphed_decoder_bounded_matches_full_store(monkeypatch, L, ties, prealloc):
     # teacher-forced: both runs decode the same tokens; every step's logits must be identical with the flag on and
-    # off, across many block refreshes (the tied prompt makes most layer-0 cell ceilings exactly equal)
+    # off, across many block refreshes (the tied prompt makes most layer-0 cell ceilings exactly equal); without
+    # KV_PREALLOC the prefill allocates the store itself
     from decode_graph import GraphedDecoder
     _env(monkeypatch)
+    monkeypatch.setenv("KV_PREALLOC", prealloc)
     m = _model()
     g = torch.Generator().manual_seed(L)
     hi = 6 if ties else 512

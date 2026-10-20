@@ -26,7 +26,9 @@ per-layer device counter (SlotStore.flags) instead of reading out of bounds, and
 
 The decode reads the same values of the same cells as on the full int8 store, so its logits are identical with the
 switch on and off (tests/test_kv_bounded.py). A layer of the released models keeps about 6 MB plus the cell-indexed
-tables (8 bytes per cell and head), against about 290 MB at 131k tokens with the full int8 store."""
+tables (8 bytes per cell and head), against about 290 MB at 131k tokens with the full int8 store. (The bounded
+streaming cache of linear_cache.py, FSL_LINEAR_CACHE=1, is a different configuration: it also bounds the prefill and
+selects in its own tie order.)"""
 from __future__ import annotations
 
 import os

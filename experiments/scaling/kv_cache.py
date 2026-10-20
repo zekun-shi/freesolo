@@ -47,7 +47,7 @@ class FSKVCache:
         self._n_q = 0                                # quantized rows ([0, _n_q) is the int8 region)
         self._nq_t = None                            # device int64 scalar holding _n_q, read inside decode graphs
         self._deq = None                             # eager materialization scratch (built lazily)
-        self.bounded_kv = False                      # GraphedDecoder flips this on via enable_bounded (FSL_KV_BOUNDED=1)
+        self.bounded_kv = False                      # GraphedDecoder's enable_bounded (FSL_KV_BOUNDED=1)
         self._slots = None                           # kv_bounded.SlotStore: the bounded mode's K / V
         self._ncell = 0                              # completed cells (bounded mode)
 
