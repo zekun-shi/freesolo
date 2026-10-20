@@ -215,16 +215,30 @@ def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tenso
     sb = sel_b.contiguous() if Cb else sa
     if sa.data_ptr() % 16 or sb.data_ptr() % 16:
         sa, sb = sa.clone(), (sb.clone() if Cb else sa)
-    nq = Bq if q_nq is None else int(q_nq)
-    esz = q.element_size()
-    if (q.dim() == 3 and q.stride(2) == 1 and q.stride(1) * esz % 16 == 0 and q.stride(0) * esz % 16 == 0
-            and q.data_ptr() % 16 == 0 and 0 < nq <= Bq):
-        qc, qst0, qst1 = q, q.stride(0), q.stride(1)        # a strided stage view: kernel clamps rows >= nq
+    from .fsb_beam_cuda import packed_queries, stage_view
+    qsv = stage_view(q, Tp, Bq, q_nq)
+    if qsv is not None:
+        (rph, nq), qc, qst0, qst1 = qsv, q, q.stride(0), q.stride(1)   # read in place; the kernel clamps pads
     else:
-        qc = q.reshape(Tp, Bq, 64).contiguous()
+        qc = packed_queries(q, Tp, Bq, q_nq) if q.dim() == 3 else q.reshape(Tp, Bq, 64).contiguous()
         if qc.data_ptr() % 16:
             qc = qc.clone()
-        qst0, qst1, nq = Bq * 64, 64, Bq
+        rph, nq, qst0, qst1 = 1, Bq, Bq * 64, 64
+    # the outputs: packed (Tp, Bq, K) or a view (T'', n, K) in the stage-view row layout (view row v holds the cells
+    # of rows v * RPH'' .. back to back, n >= RPH'' * Bq); provenance in the same layout. The kernel takes one RPH: a
+    # packed side without pads is re-expressed in the other side's layout
+    orph = Tp // out.shape[0] if (out.dim() == 3 and out.shape[0] > 0 and Tp % out.shape[0] == 0) else 0
+    if not (orph and out.stride(2) == 1 and out.stride(1) == K and out.shape[1] >= orph * Bq
+            and (not prov or pv.stride() == out.stride())):
+        return None
+    ost0 = out.stride(0)
+    if orph != rph:
+        if rph == 1 and nq == Bq and qst0 == Bq * qst1:
+            rph, nq, qst0 = orph, orph * Bq, orph * Bq * qst1
+        elif orph == 1 and ost0 == Bq * K:
+            ost0 = rph * Bq * K
+        else:
+            return None
     tc = t_idx.contiguous()
     ovf = (torch.zeros if Mc > ucap else torch.empty)((), dtype=torch.bool, device=dev)
     if Tp == 0:
@@ -236,7 +250,7 @@ def rows_fused_cuda(sel_a: torch.Tensor, sel_b, q: torch.Tensor, K4: torch.Tenso
             P(lv.data_ptr()), I64(ls0), P(sv.data_ptr()), I64(ss0),
             P(out.data_ptr()), P(pv.data_ptr()), P(ovf.data_ptr()),
             I32(Mc), I32(ucap), I32(K4.shape[1]), I64(K4.stride(0)), I64(K4.stride(1)), I64(K4.stride(2)),
-            F32(float(scale)), I64(qst0), I64(qst1), I32(nq)]
+            F32(float(scale)), I64(qst0), I64(qst1), I32(nq), I32(rph), I64(ost0)]
     launch(fn, Tp, _NT, dev, args, smem=smem)
     return ovf
 

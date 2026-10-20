@@ -359,6 +359,16 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
                     elif not capturing and bool(ovf):
                         return None
                 return out, (pv if prov else None)
+    # the paths below read packed (T', Bq, Dh) queries and write packed outputs: a stage view of the queries
+    # (fsb_beam_cuda.stage_view) is packed here, and outputs given as views are stored into them at the end
+    if q.dim() == 3 and tuple(q.shape[:2]) != (Tp, Bq):
+        from .fsb_beam_cuda import packed_queries
+        q = packed_queries(q, Tp, Bq, q_nq)
+    views = None
+    if not (tuple(out.shape[:2]) == (Tp, Bq) and out.is_contiguous() and (not prov or pv.is_contiguous())):
+        views = (out, pv if prov else None)
+        out = torch.empty((Tp, Bq, K), dtype=out.dtype, device=dev)
+        pv = torch.empty((Tp, Bq, K), dtype=torch.int8, device=dev) if prov else out
     un = ovf = None
     if rows_impl() == "cuda":
         if rows_union_ok(sel_a, sel_b, Mc):
@@ -433,5 +443,10 @@ def union_rerank_rows(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
                                      sq0, sq1, lv, ls0, sv, ss0, out, pv, Bq, C, Ca, Mc, UCAP, s, PROV_UTAU,
                                      BQ=BQ, CP=_pow2(C), KK=K, KP2=_pow2(K), POS=(score == "lse_pos"), PRV=prov,
                                      num_warps=1)
+    if views is not None:
+        for dst, src in zip(views, (out, pv)):
+            if dst is not None:
+                dst[:, :src.numel() // (dst.shape[0] * K)].copy_(src.view(dst.shape[0], -1, K))
+        out, pv = views[0], views[1]
     return out, (pv if prov else None)
 

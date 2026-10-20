@@ -861,6 +861,57 @@ def test_rows_v3_strided_stage_view(monkeypatch, score):
 
 
 @gpu
+@pytest.mark.parametrize("score", ["lse_pos", "lse"])
+@pytest.mark.parametrize("M,pad", [(512, 0), (512, 45), (2048, 0)])
+def test_rows_v3_head_major_stage_views(monkeypatch, score, M, pad):
+    # FSB_PREFILL_NOCOPY's views at the released shape (16 heads of 64, top 4 cells, beams of 16 + 16 slots): row
+    # t * nbc + j (block j of head t) reads its queries in place from Q's (B, N, H, D)-transposed layout, positions past
+    # the stage's last real query (pad of them, poisoned with NaNs beyond the view) read zeros, and the int32 cells and
+    # provenance land straight in the layer's (B, H, Npad, K) tables. fsb_rows_v3 == fsb_rows_fused2 on these views ==
+    # both on the packed copies, bitwise, and neither touches the tables outside the stage
+    from src.fsattn import fsb_beam_cuda as bc
+    from src.fsattn import fsb_rows_cuda as rc
+    if not _v3_ok():
+        pytest.skip("NVRTC unavailable")
+    H, nbc, K = 16, 4, 4
+    st = _bf16_stage(_layout(_stage(83 + M + pad, M, H=H, nbc=nbc), "compact"))
+    Tp, Bq, Dh = st["q"].shape
+    nq, q0, Npad = nbc * Bq - pad, 2 * Bq, 8 * Bq
+    heads = st["q"].view(H, nbc * Bq, Dh)                         # head t's stage queries, block j at j * Bq
+    base = torch.full((1, Npad, H, Dh), float("nan"), device="cuda", dtype=torch.bfloat16)
+    base[0, q0:q0 + nq] = heads[:, :nq].transpose(0, 1)
+    Q = base.transpose(1, 2)                                      # (B, H, N, D) view of (B, N, H, D)
+    qview = Q.as_strided((H, nq, Dh), (Q.stride(1), Q.stride(2), 1), Q.storage_offset() + q0 * Q.stride(2))
+    qpack = torch.zeros(H, nbc * Bq, Dh, device="cuda", dtype=torch.bfloat16)
+    qpack[:, :nq] = heads[:, :nq]
+    qpack = qpack.view(Tp, Bq, Dh)
+    packs = []
+    real_pack = bc.packed_queries
+    monkeypatch.setattr(bc, "packed_queries", lambda *a, **k: packs.append(1) or real_pack(*a, **k))
+    rest = (st["qpos"], st["lam"], st["sigv"], st["cellA"], st["t_idx"], 0.125, st["s"], K, score, st["tokK"])
+    res = {}
+    for v3 in ("0", "1"):
+        monkeypatch.setenv("FSB_ROWS_V3", v3)
+        sel32 = torch.full((1, H, Npad, K), -9, dtype=torch.int32, device="cuda")
+        prov = torch.full((1, H, Npad, K), -9, dtype=torch.int8, device="cuda")
+        out_v = sel32[:, :, q0:q0 + nbc * Bq].view(H, nbc * Bq, K)
+        pv_v = prov[:, :, q0:q0 + nbc * Bq].view(H, nbc * Bq, K)
+        packs.clear()
+        got = rows.union_rerank_rows(st["sel_a"], st["sel_b"], qview, *rest, prov=True, q_bf16=True, out=out_v,
+                                     pv_out=pv_v, q_nq=nq)
+        assert got is not None and got[0] is out_v and not packs     # the fused kernel read and wrote the views
+        assert bool((sel32[:, :, :q0] == -9).all()) and bool((sel32[:, :, q0 + nbc * Bq:] == -9).all())
+        assert bool((prov[:, :, :q0] == -9).all()) and bool((prov[:, :, q0 + nbc * Bq:] == -9).all())
+        pk = rows.union_rerank_rows(st["sel_a"], st["sel_b"], qpack, *rest, prov=True, q_bf16=True,
+                                    out=torch.empty((Tp, Bq, K), dtype=torch.int32, device="cuda"))
+        assert torch.equal(out_v.reshape(Tp, Bq, K), pk[0]) and torch.equal(pv_v.reshape(Tp, Bq, K), pk[1])
+        res[v3] = (sel32, prov)
+    assert rc._v3_fns and not rc._v3_failed
+    assert int((res["1"][0] >= 0).sum()) > 0
+    assert torch.equal(res["0"][0], res["1"][0]) and torch.equal(res["0"][1], res["1"][1])
+
+
+@gpu
 def test_rows_v3_ties_follow_slot_order(monkeypatch):
     # cells with identical keys tie exactly ("lse": no position term); v3 keeps fused2's first-slot winner
     if not _v3_ok():

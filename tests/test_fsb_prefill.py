@@ -4,7 +4,9 @@ lengths, batch, both forests or one, re-rank overflow, stage sizes and both read
 overflow; the per-layer launch count; the shared pieces it must use (fsb_rows.union_rerank_rows with the deferred
 flags and bf16 queries, both beams in one forest_beam_pair launch in the compact layout, the cell statistics handed to
 the KV cache, the fused readout's hand-off across an overflow redo); the window branch forked next to the long-range
-branch (FSB_WINDOW_OVERLAP) against the serial prefill, eager and CUDA-graph captured."""
+branch (FSB_WINDOW_OVERLAP) against the serial prefill, eager and CUDA-graph captured; the trimmed forest build, the
+in-place stage views and the faster re-rank and beam kernels (FSB_BUILD_PREFILL_TRIM, FSB_PREFILL_NOCOPY, FSB_ROWS_V3,
+FSB_BEAM_V2) in every combination at the released shape."""
 import os
 import sys
 
@@ -1033,10 +1035,16 @@ def test_mb_max_is_the_device_bound():
             assert _mb_max(nb, Bq, s, 1 << 40) == e, (nb, Bq, s)
 
 
+PREFILL_SWITCHES = ("FSB_BUILD_PREFILL_TRIM", "FSB_PREFILL_NOCOPY", "FSB_WINDOW_OVERLAP", "FSB_ROWS_V3", "FSB_BEAM_V2",
+                    "FSB_BEAM_V2_EXACT")
+
+
 @gpu
-def test_graphed_prefill_trim_matches_full_build(monkeypatch):
-    # the trimmed build inside a captured prefill (several stages on the stage pipe): replays equal the eager
-    # prefill with the full build bit for bit
+@pytest.mark.parametrize("switches,H", [(PREFILL_SWITCHES[:2], 4), (PREFILL_SWITCHES, 16)], ids=["trim_nocopy", "all"])
+def test_graphed_prefill_switches_match_eager(monkeypatch, switches, H):
+    # the trimmed build and the in-place stage views inside a captured prefill (several stages on the stage pipe), and
+    # with 16 heads (the fused re-rank's shape) every exact prefill switch at once: replays equal the eager prefill
+    # with the switches off (the full build, the copies, the serial window, fsb_rows_fused2, fsb_beam_rows) bit for bit
     import bench_efficiency as be
     from decode_graph import GraphedPrefiller
     from experiments.scaling.model import FreeSoloLM
@@ -1049,7 +1057,7 @@ def test_graphed_prefill_trim_matches_full_build(monkeypatch):
     kw = be.serve_kwargs("fsb", 0.5)
     torch.manual_seed(13)
     L = 3000
-    m = FreeSoloLM(vocab_size=512, d_model=256, n_layers=2, n_heads=4, d_ff=512, max_seq_len=L + 64,
+    m = FreeSoloLM(vocab_size=512, d_model=64 * H, n_layers=2, n_heads=H, d_ff=512, max_seq_len=L + 64,
                    attn_type="fsattn", **kw).cuda().to(torch.bfloat16).eval()
     g = torch.Generator().manual_seed(27)
     x1 = torch.randint(0, 512, (1, L), generator=g).cuda()
@@ -1060,10 +1068,12 @@ def test_graphed_prefill_trim_matches_full_build(monkeypatch):
         for blk, c in zip(m.blocks, cs):
             blk.attn.fsattn.fsb_tau.fill_(0.0)
             blk.attn.fsattn.fsb_tau_union.copy_(c._ceil[0].float().median(dim=-1).values)
-    monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", "1")
+    for name in PREFILL_SWITCHES:
+        monkeypatch.setenv(name, "1" if name in switches else "0")
     gp = GraphedPrefiller(m, L, B=1, device="cuda", dtype=torch.bfloat16, tail_tokens=64)
     gp.capture(x1)                                         # its eager warm-up builds the trimmed task tables
-    monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", "0")
+    for name in PREFILL_SWITCHES:
+        monkeypatch.setenv(name, "0")
     for x in (x1, x2):
         gp.run(x)
         got_tail = gp.tail_logits().clone()
@@ -1072,3 +1082,179 @@ def test_graphed_prefill_trim_matches_full_build(monkeypatch):
             h = _trunk_cached(m, x, cs)
             ref_tail = _lm_head_fp32(m, h[:, -64:, :], 4096)
         assert _same(got_tail, ref_tail)
+
+
+def _copies(fn) -> int:
+    # direct-copy kernels (tensor copies) of one call
+    from torch.profiler import ProfilerActivity, profile
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return sum(1 for e in prof.events()
+               if e.device_type == torch.autograd.DeviceType.CUDA and "direct_copy" in e.name)
+
+
+@gpu
+@pytest.mark.parametrize("N,B,H,blk,contig", [(4096, 1, 8, "8", False), (3000, 1, 8, "8", False),
+                                              (3000, 1, 8, "3", True), (2500, 2, 8, "4", False),
+                                              (2500, 2, 8, "4", True), (700, 1, 8, "0", False),
+                                              (20000, 1, 8, "0", False), (3000, 1, 4, "8", False)])
+def test_prefill_nocopy_matches_reference(monkeypatch, N, B, H, blk, contig):
+    # FSB_PREFILL_NOCOPY=1: the beams and the re-rank read the stage queries from Q in place and the re-rank writes the
+    # cell table directly; output, cells, statistics and read accumulators bit for bit as the copies and the stage
+    # loop, for Q's transposed layout and a contiguous Q (both flags), batched rows, partial last stages (H = 8: the
+    # fused re-rank kernel; H = 4: its Triton path, which packs the views)
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", blk)
+    attn = _attn(H=H)
+    Q, K, V, sigma = _inputs(60 + N, B, H, N)
+    if contig:
+        Q = Q.contiguous()
+    _set_tau(attn, K, tau_q=0.2 if N == 3000 else None)
+    ref = _run(monkeypatch, attn, Q, K, V, sigma, fast=False, acc=True, stats=True)
+    for nocopy in ("0", "1"):
+        monkeypatch.setenv("FSB_PREFILL_NOCOPY", nocopy)
+        got = _run(monkeypatch, attn, Q, K, V, sigma, fast=True, acc=True, stats=True)
+        _assert_same(got, ref)
+
+
+@gpu
+def test_prefill_nocopy_removes_the_stage_copies(monkeypatch):
+    # with Q in the (B, N, H, D)-transposed layout every stage copies its queries and, with two or more stages, its
+    # int64 cells into the int32 table; FSB_PREFILL_NOCOPY=1 drops both
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "8")
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    attn = _attn(H=8)
+    N = 4096                                                     # 32 blocks: 4 stages
+    Q, K, V, sigma = _inputs(5, 1, 8, N)
+    _set_tau(attn, K)
+    attn._fsb_read_acc = None
+
+    def one():
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            ft.fsb_long_range(attn, Q, K, V, sigma, N)
+
+    n = {}
+    for nocopy in ("0", "1"):
+        monkeypatch.setenv("FSB_PREFILL_NOCOPY", nocopy)
+        one()
+        n[nocopy] = _copies(one)
+    assert n["0"] - n["1"] == 2 * 4, n
+
+
+@gpu
+@pytest.mark.parametrize("which", ["beam", "rows", "both"])
+def test_prefill_nocopy_fallbacks(monkeypatch, which):
+    # where the in-place kernels do not run, the stage takes the copies (the beams) or the re-rank packs the views
+    # itself (its Triton path): same values
+    from src.fsattn import fsb_fast_step
+    from src.fsattn import fsb_rows_cuda
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "3")
+    attn = _attn(H=8)
+    Q, K, V, sigma = _inputs(8, 1, 8, 2900)
+    _set_tau(attn, K)
+    ref = _run(monkeypatch, attn, Q, K, V, sigma, fast=False, acc=True)
+    if which in ("beam", "both"):
+        real = fsb_fast_step.forest_beam_pair
+
+        def pair(F, SP, W, d, Wm, Fu, SPu, Wu, du, Wum, q, *a, **k):    # views: as if the pair kernel did not run
+            return None if q.shape[0] != W.shape[0] else real(F, SP, W, d, Wm, Fu, SPu, Wu, du, Wum, q, *a, **k)
+
+        monkeypatch.setattr(fsb_fast_step, "forest_beam_pair", pair)
+    if which in ("rows", "both"):
+        monkeypatch.setattr(fsb_rows_cuda, "rows_fused_ok", lambda *a, **k: False)
+    monkeypatch.setenv("FSB_PREFILL_NOCOPY", "1")
+    got = _run(monkeypatch, attn, Q, K, V, sigma, fast=True, acc=True)
+    _assert_same(got, ref)
+
+
+@gpu
+def test_prefill_nocopy_overflow_redo(monkeypatch):
+    # rows over a small re-rank capacity: the in-place stages' cells of the flagged stages are redone by the stage
+    # loop's stages exactly as with the copies (deferred flags, trimmed build)
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "3")
+    monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", "1")
+    N = 4096
+    attn = _attn(H=8, blkchunk=2)
+    Q, K, V, sigma = _inputs(41, 1, 8, N)
+    _set_tau(attn, K)
+    seen = []
+    real = rows.union_rerank_rows
+
+    def spy(*a, **k):
+        r = real(*a, **k)
+        seen.append(r is None)
+        return r
+
+    monkeypatch.setattr(rows, "union_rerank_rows", spy)
+    monkeypatch.setattr(rows, "UCAP", 40)
+    ref = _run(monkeypatch, attn, Q, K, V, sigma, fast=False, acc=True, stats=True)
+    assert any(seen) and not all(seen), seen
+    monkeypatch.setenv("FSB_PREFILL_NOCOPY", "1")
+    got = _run(monkeypatch, attn, Q, K, V, sigma, fast=True, acc=True, stats=True)
+    _assert_same(got, ref)
+
+
+def _poison_trimmed(monkeypatch):
+    # a trimmed build (mb_max) leaves the chunks no spine reads unwritten: fill their node rows with NaNs and their
+    # leaves with -7 after each such build, so a kernel that reads one of them changes its result
+    from src.fsattn import fsb_build_cuda as bc
+    real = bc.forests_cuda
+
+    def poisoned(*a, mb_max=None, **k):
+        got = real(*a, mb_max=mb_max, **k)
+        if got is not None and mb_max is not None:
+            for F, _ in got:
+                nodes, leaves = [], []
+                for kk in F["ks"]:
+                    ja, jsh, nj = bc.spine_chunks(F["M"], kk, mb_max)
+                    keep = set(range(ja, ja + (nj << jsh), 1 << jsh))
+                    npr, nb0, lb0 = F["nodes_per"][kk], F["bases"][kk], F["leafbases"][kk]
+                    for j in range(F["Cmaxs"][kk]):
+                        if j not in keep:
+                            nodes.append(torch.arange(nb0 + j * npr, nb0 + (j + 1) * npr))
+                            leaves.append(torch.arange(lb0 + (j << kk), lb0 + ((j + 1) << kk)))
+                if nodes:
+                    ni = torch.cat(nodes).cuda()
+                    F["node_mu"].index_fill_(1, ni, float("nan"))
+                    F["node_aux"].index_fill_(1, ni, float("nan"))
+                    F["leaf"].index_fill_(1, torch.cat(leaves).cuda(), -7)
+        return got
+
+    monkeypatch.setattr(bc, "forests_cuda", poisoned)
+
+
+@gpu
+@pytest.mark.parametrize("N,blk", [(4096, "0"), (3000, "8"), (9000, "16"), (17000, "32")])
+def test_prefill_switches_at_released_shape(monkeypatch, N, blk):
+    # the released shape (16 heads of 64, top 4 cells): every combination of FSB_BUILD_PREFILL_TRIM,
+    # FSB_PREFILL_NOCOPY, FSB_ROWS_V3 and FSB_BEAM_V2 (its exact build) gives the stage loop's output, cells,
+    # statistics and read accumulators bit for bit, over one stage or several with a partial last one (the stage pipe;
+    # 17000 tokens: more cells than the re-rank capacity, deferred flags), and each switch runs its kernels. The
+    # trimmed builds' unwritten chunks are poisoned, so none of the kernels may read them
+    from src.fsattn import fsb_beam_cuda as bc
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", blk)
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    seen = []
+    real_launch = bc.launch
+    monkeypatch.setattr(bc, "launch", lambda fn, *a, **k: seen.append(fn.value) or real_launch(fn, *a, **k))
+    _poison_trimmed(monkeypatch)
+    attn = _attn(H=16)
+    Q, K, V, sigma = _inputs(70 + N, 1, 16, N)
+    _set_tau(attn, K)
+    flags = ("FSB_BUILD_PREFILL_TRIM", "FSB_PREFILL_NOCOPY", "FSB_ROWS_V3", "FSB_BEAM_V2")
+    for f in flags:
+        monkeypatch.setenv(f, "0")
+    ref = _run(monkeypatch, attn, Q, K, V, sigma, fast=False, acc=True, stats=True)
+    for bits in range(1 << len(flags)):
+        on = {f: (bits >> i) & 1 for i, f in enumerate(flags)}
+        for f, v in on.items():
+            monkeypatch.setenv(f, str(v))
+        seen.clear()
+        got = _run(monkeypatch, attn, Q, K, V, sigma, fast=True, acc=True, stats=True)
+        _assert_same(got, ref)
+        by_fn = {f.value: key[2] for key, (f, _, _) in bc._funcs.items()}
+        ran = {by_fn.get(v) for v in seen}
+        assert ("fsb_beam_rows2" in ran) == ("fsb_spines2" in ran) == bool(on["FSB_BEAM_V2"]), (on, ran)
+        assert ("fsb_beam_rows" in ran) != bool(on["FSB_BEAM_V2"]), (on, ran)
+        assert ("fsb_rows_v3" in ran) == bool(on["FSB_ROWS_V3"]) != ("fsb_rows_fused2" in ran), (on, ran)

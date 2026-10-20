@@ -773,7 +773,7 @@ extern "C" __global__ void __launch_bounds__(NT, MINB)
 fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const float* __restrict__ QPOS,
               const float* __restrict__ RC, const float rc_s, const float* __restrict__ LAM,
               const float* __restrict__ SIG, const int Bq, const float scale, const float cell_size,
-              const i64 QST_T, const i64 QST_B, const int NQ, int* __restrict__ FBC) {
+              const i64 QST_T, const i64 QST_B, const int NQ, int* __restrict__ FBC, const int RPH) {
     extern __shared__ __align__(128) unsigned char smem[];
     float* s_mu = reinterpret_cast<float*>(smem + OFF_MU);          // [CAP][64] tile: even, then odd columns
     float4* s_umeta = reinterpret_cast<float4*>(smem + OFF_UM);     // [2][UMAX] union: ref (bits), cnt, children
@@ -823,10 +823,15 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
     const float lam = LAM[t];
     const float sig2 = f_mul(2.0f, SIG[t]);
     const int root = (int)ROOT[t];
+    // the row's queries in the strided stage view: row t is block t % RPH of view row (head) t / RPH, i.e. its
+    // positions (t % RPH) * Bq + [0, Bq) (RPH = 1: view row t itself); positions >= NQ are pads and read zeros
+    const i64 qv_t = t / RPH, qv_p = (t - qv_t * RPH) * Bq;
+    const i64 qoff = qv_t * QST_T + qv_p * QST_B;
+    const int nq_r = NQ - (int)qv_p;
     const bool qok = q0 + qi < Bq;
-    const bool qr_ok = qok && q0 + qi < NQ;                           // a strided stage view's pads read zeros
+    const bool qr_ok = qok && q0 + qi < nq_r;
     const i64 pid = t * Bq + (qok ? q0 + qi : 0);
-    const i64 qrow = t * QST_T + (qr_ok ? q0 + qi : 0) * QST_B;
+    const i64 qrow = qoff + (qr_ok ? q0 + qi : 0) * QST_B;
 #if Q_BF16 && QB == 128 && CAP == 64 && UMAX == 128
     float qn;
     {
@@ -849,9 +854,9 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
     const int g_tc = lane >> 2, t4_tc = lane & 3;
     unsigned qa[4][4];
     {
-        const unsigned short* qbase_bf = reinterpret_cast<const unsigned short*>(Q) + t * QST_T + q0 * QST_B;
+        const unsigned short* qbase_bf = reinterpret_cast<const unsigned short*>(Q) + qoff + q0 * QST_B;
         const int r0 = 16 * wid + g_tc, r1 = r0 + 8;
-        const bool ok0 = q0 + r0 < NQ, ok1 = q0 + r1 < NQ;
+        const bool ok0 = q0 + r0 < nq_r, ok1 = q0 + r1 < nq_r;
 #pragma unroll
         for (int ks = 0; ks < 4; ks++) {
             const int c0 = 16 * ks + 2 * t4_tc, c1 = c0 + 8;
@@ -1397,12 +1402,12 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
 #else
             const float* sq = s_sc + ql * SCS;
 #endif
-            const bool pq_ok = q0 + ql < NQ;
+            const bool pq_ok = q0 + ql < nq_r;
 #if Q_BF16
-            const float* qrow_p = pq_ok ? reinterpret_cast<const float*>(reinterpret_cast<const unsigned short*>(Q) + t * QST_T + (i64)(q0 + ql) * QST_B)
+            const float* qrow_p = pq_ok ? reinterpret_cast<const float*>(reinterpret_cast<const unsigned short*>(Q) + qoff + (i64)(q0 + ql) * QST_B)
                                         : fsb_qzero;
 #else
-            const float* qrow_p = pq_ok ? Q + t * QST_T + (i64)(q0 + ql) * QST_B : fsb_qzero;
+            const float* qrow_p = pq_ok ? Q + qoff + (i64)(q0 + ql) * QST_B : fsb_qzero;
 #endif
             continue_query(*ws, lane, slot < WM ? s_front[ql * 16 + slot] : EMPTY_E, s_umeta + pbf * UMAX,
                            qrow_p, BOUND ? sq[1] : 0.0f, reinterpret_cast<const int*>(sq)[0], QPOS[p2], lam, sig2,
@@ -1669,7 +1674,7 @@ extern "C" __global__ void __launch_bounds__(NT, MINB2)
 fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const float* __restrict__ QPOS,
                const float* __restrict__ RC, const float rc_s, const float* __restrict__ LAM,
                const float* __restrict__ SIG, const int Bq, const float scale, const float cell_size,
-               const i64 QST_T, const i64 QST_B, const int NQ, int* __restrict__ FBC) {
+               const i64 QST_T, const i64 QST_B, const int NQ, int* __restrict__ FBC, const int RPH) {
     extern __shared__ __align__(128) unsigned char smem[];
     unsigned* s_mu = reinterpret_cast<unsigned*>(smem + OFF2_MU);     // [UC2][32] union tile: bf16 pairs, row u's
                                                                        // 16-byte pieces XOR (u & 7)
@@ -1721,9 +1726,15 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
     const float sig2 = f_mul(2.0f, SIG[t]);
     const int root = (int)ROOT[t];
     const bool qok = q0 + qi < Bq;
-    const bool qr_ok = qok && q0 + qi < NQ;                           // a strided stage view's pads read zeros
+    // the row's queries in the strided stage view, as fsb_beam_rows reads them: row t is block t % RPH of view row
+    // t / RPH, i.e. its positions (t % RPH) * Bq + [0, Bq) (RPH = 1: view row t itself); positions >= NQ are pads and
+    // read zeros
+    const i64 qv_t = t / RPH, qv_p = (t - qv_t * RPH) * Bq;
+    const i64 qoff = qv_t * QST_T + qv_p * QST_B;
+    const int nq_r = NQ - (int)qv_p;
+    const bool qr_ok = qok && q0 + qi < nq_r;
     const i64 pid = t * Bq + (qok ? q0 + qi : 0);
-    const i64 qrow = t * QST_T + (qr_ok ? q0 + qi : 0) * QST_B;
+    const i64 qrow = qoff + (qr_ok ? q0 + qi : 0) * QST_B;
     // the query's radius-scaled norm (lane h: columns 32 h .. 32 h + 31) and the warp's mma A fragments (rows 16 wid +
     // g and + 8), as fsb_beam_rows reads them
     float qn;
@@ -1747,9 +1758,9 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
     const int g = lane >> 2, t4 = lane & 3;
     unsigned qa[4][4];
     {
-        const unsigned short* qbase_bf = reinterpret_cast<const unsigned short*>(Q) + t * QST_T + q0 * QST_B;
+        const unsigned short* qbase_bf = reinterpret_cast<const unsigned short*>(Q) + qoff + q0 * QST_B;
         const int r0 = 16 * wid + g, r1 = r0 + 8;
-        const bool ok0 = q0 + r0 < NQ, ok1 = q0 + r1 < NQ;
+        const bool ok0 = q0 + r0 < nq_r, ok1 = q0 + r1 < nq_r;
 #pragma unroll
         for (int ks = 0; ks < 4; ks++) {
             const int c0 = 16 * ks + 2 * t4, c1 = c0 + 8;
@@ -2124,8 +2135,8 @@ fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, cons
             const int q2 = wid * (QB / NWARP_R) + kq;
             if (q0 + q2 >= Bq) break;
             const i64 p2 = t * Bq + q0 + q2;
-            const bool pq_ok = q0 + q2 < NQ;
-            const unsigned short* q2p = reinterpret_cast<const unsigned short*>(Q) + t * QST_T + (i64)(q0 + q2) * QST_B;
+            const bool pq_ok = q0 + q2 < nq_r;
+            const unsigned short* q2p = reinterpret_cast<const unsigned short*>(Q) + qoff + (i64)(q0 + q2) * QST_B;
             const float* qrow_p = pq_ok ? reinterpret_cast<const float*>(q2p) : fsb_qzero;
             const int slot = lane >> 1;
             continue_query(*ws, lane, slot < WM ? s_car[q2 * 16 + slot] : EMPTY_E, um_prev, qrow_p,

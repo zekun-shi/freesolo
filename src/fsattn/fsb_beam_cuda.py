@@ -484,6 +484,38 @@ def _sm80(device: torch.device) -> bool:
     return ok
 
 
+def stage_view(q: torch.Tensor, Tp: int, Bq: int, q_nq: int = None):
+    # (RPH, NQ) when the kernels can read the queries of Tp rows of Bq in place, else None. q is (T', n, Dh) with
+    # T' * RPH = Tp: view row v holds the queries of rows v * RPH .. (v + 1) * RPH - 1 back to back (row v * RPH + j at
+    # positions j * Bq + [0, Bq): the head-major stage rows of fsb_prefill_fast, block j of head v); positions >= NQ
+    # are pads that read zeros, NQ = min(q_nq, n, RPH * Bq) (q_nq beyond a view row: no pads). RPH = 1 with n = Bq is
+    # the packed (Tp, Bq, Dh) layout. In place needs unit stride along the head dim and 16-byte aligned rows (the
+    # kernels read 16-byte vectors)
+    if q.dim() != 3 or q.shape[0] <= 0 or Tp % q.shape[0] != 0:
+        return None
+    rph = Tp // q.shape[0]
+    nq = min(q.shape[1], rph * Bq, q.shape[1] if q_nq is None else int(q_nq))
+    esz = q.element_size()
+    if not (nq > 0 and q.stride(2) == 1 and q.stride(1) >= q.shape[2] and q.stride(1) * esz % 16 == 0
+            and q.stride(0) * esz % 16 == 0 and q.data_ptr() % 16 == 0):
+        return None
+    return rph, nq
+
+
+def packed_queries(q: torch.Tensor, Tp: int, Bq: int, q_nq: int = None) -> torch.Tensor:
+    # the packed (Tp, Bq, Dh) copy (16-byte aligned) of the queries stage_view describes, pads zero; a packed q that
+    # needs no padding is only made contiguous and aligned
+    T1, n, Dh = q.shape
+    rph = Tp // T1
+    nq = min(n, rph * Bq, n if q_nq is None else int(q_nq))
+    if rph == 1 and n == Bq and nq == Bq:
+        qc = q.contiguous()
+        return qc.clone() if qc.data_ptr() % 16 else qc
+    out = q.new_zeros((T1, rph * Bq, Dh))
+    out[:, :nq].copy_(q[:, :nq])
+    return out.view(Tp, Bq, Dh)
+
+
 def beam_rows_ok(F: dict, q: torch.Tensor, W_max: int) -> bool:
     # prefill rows: head dim 64, at least 32 queries per row, beam width <= 16, sm_80+ (cp.async, 40 KB of shared memory
     # per 64-query block). The row length first: decode beams (one query per row) then skip the switch lookups, which
@@ -514,7 +546,8 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     v2 = (cap is None and umax is None and qb is None and q.dtype == torch.bfloat16 and delta_max <= 2
           and beams[0][4] == 16 and beam_v2_on())
     cap, umax, qb = cap or _ROWS_CAP, umax or _ROWS_UMAX, qb or (128 if q.dtype == torch.bfloat16 else _ROWS_QB)
-    Tp, Bq, Dh = q.shape
+    Tp, Bq = beams[0][2].shape                             # the row tables' shape: q may be a stage view (stage_view)
+    Dh = q.shape[-1]
     R = 1 << delta_max
     WM = beams[0][4]
     rc_t = torch.is_tensor(radius_coef)
@@ -576,16 +609,12 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
                 warnings.warn(f"FS-B row-cooperative CUDA beam unavailable, using the warp-per-query kernel: {e!r}")
             return None
     fn, smem = ent
-    nq = Bq if q_nq is None else int(q_nq)
-    esz = q.element_size()
-    if (q.stride(2) == 1 and q.stride(1) >= Dh and q.stride(1) * esz % 16 == 0 and q.stride(0) * esz % 16 == 0
-            and q.data_ptr() % 16 == 0 and 0 < nq <= Bq):
-        qc, qst_t, qst_b = q, q.stride(0), q.stride(1)      # a strided stage view: kernel guards rows >= nq
+    qsv = stage_view(q, Tp, Bq, q_nq)
+    if qsv is not None:
+        (rph, nq), qc, qst_t, qst_b = qsv, q, q.stride(0), q.stride(1)     # read in place; the kernel guards pads
     else:
-        qc = q.contiguous()
-        if qc.data_ptr() % 16:
-            qc = qc.clone()                                                  # the kernel reads query rows as float4s/uint4s
-        qst_t, qst_b, nq = Bq * Dh, Dh, Bq
+        qc = packed_queries(q, Tp, Bq, q_nq)                                 # 16-byte aligned rows (float4s/uint4s)
+        rph, nq, qst_t, qst_b = 1, Bq, Bq * Dh, Dh
     qp = qpos.contiguous()
     lm, sg = lam.reshape(-1).contiguous(), sigv.reshape(-1).contiguous()
     rc = radius_coef.reshape(-1).float().contiguous() if rc_t else qc
@@ -606,7 +635,7 @@ def forest_beam_rows_cuda(beams, q: torch.Tensor, qpos: torch.Tensor, lam: torch
     P, I64, F32, I32 = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
     args = [ps[0], ps[1], P(qc.data_ptr()), P(qp.data_ptr()), P(rc.data_ptr()), F32(1.0 if rc_t else float(radius_coef)),
             P(lm.data_ptr()), P(sg.data_ptr()), I32(Bq), F32(float(scale)), F32(float(s)),
-            I64(qst_t), I64(qst_b), I32(nq), P(fallback.data_ptr() if fallback is not None else 0)]
+            I64(qst_t), I64(qst_b), I32(nq), P(fallback.data_ptr() if fallback is not None else 0), I32(rph)]
     launch(fn, Tp * len(beams) * (-(-Bq // qb)), 2 * qb, dev, args, smem=smem)
     return outs
 

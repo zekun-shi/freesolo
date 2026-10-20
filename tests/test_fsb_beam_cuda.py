@@ -764,6 +764,43 @@ def test_rows2_strided_stage_view(monkeypatch):
 
 
 @gpu
+@pytest.mark.parametrize("build", ["fast", "exact"])
+@pytest.mark.parametrize("pad", [0, 45, 300])
+def test_rows2_head_major_stage_views(monkeypatch, build, pad):
+    # FSB_PREFILL_NOCOPY's view at the released shape (16 heads of 64, both beams of width 16): row t * nbc + j (block
+    # j of head t) reads its queries in place from Q's (B, N, H, D)-transposed layout, and positions past the stage's
+    # last real query (pad of them, poisoned with NaNs beyond the view) read zeros. fsb_beam_rows2 on the view ==
+    # itself on the zero-padded packed copy, bitwise, and its exact build == fsb_beam_rows on the same view
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1" if build == "exact" else "0")
+    H, nbc = 16, 8
+    beams, q, qpos, lam, sigv = _bf16_pair(73 + pad, M=512, nbc=nbc)
+    rows, Bq, Dh = q.shape
+    nq, q0, Npad = nbc * Bq - pad, 3 * Bq, 12 * Bq
+    heads = q.view(H, nbc * Bq, Dh)                               # head t's stage queries, block j at j * Bq
+    base = torch.full((1, Npad, H, Dh), float("nan"), device="cuda", dtype=torch.bfloat16)
+    base[0, q0:q0 + nq] = heads[:, :nq].transpose(0, 1)
+    Q = base.transpose(1, 2)                                      # (B, H, N, D) view of (B, N, H, D)
+    qview = Q.as_strided((H, nq, Dh), (Q.stride(1), Q.stride(2), 1), Q.storage_offset() + q0 * Q.stride(2))
+    qpack = torch.zeros(H, nbc * Bq, Dh, device="cuda", dtype=torch.bfloat16)
+    qpack[:, :nq] = heads[:, :nq]
+    qpack = qpack.view(rows, Bq, Dh)
+    packs = []
+    real_pack = bc.packed_queries
+    monkeypatch.setattr(bc, "packed_queries", lambda *a, **k: packs.append(1) or real_pack(*a, **k))
+    names = _launch_names(monkeypatch)
+    args = (qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    ref = _rows2(monkeypatch, beams, qpack, *args)
+    got = _rows2(monkeypatch, beams, qview, *args, q_nq=nq)
+    assert names() == ["fsb_beam_rows2"] * 2 and not packs        # both ran the lean kernel, the view in place
+    assert int((got[0][0] >= 0).sum()) > 0
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
+    if build == "exact":
+        old = bc.forest_beam_rows_cuda(beams, qview, *args, q_nq=nq)
+        assert names() == ["fsb_beam_rows"] and not packs
+        assert all(torch.equal(a, b) for r, o in zip(old, got) for a, b in zip(r, o))
+
+
+@gpu
 def test_rows2_flag_dispatch_and_graph(monkeypatch):
     # FSB_BEAM_V2 unset launches fsb_beam_rows; 1 launches fsb_beam_rows2 for bf16 queries with up to 4 cells per
     # frontier node, while float queries, eight cells per slot and the tile / union test hooks keep fsb_beam_rows. The

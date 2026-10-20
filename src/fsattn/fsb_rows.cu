@@ -163,7 +163,7 @@ fsb_rows_fused2(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
                 const float* __restrict__ LAM, const i64 ls0, const float* __restrict__ SIG, const i64 ss0,
                 out_t* __restrict__ OUT, signed char* __restrict__ PROV, unsigned char* __restrict__ OVF,
                 const int Mc, const int ucap, const int Hh, const i64 sb, const i64 sh, const i64 sl,
-                const float scale, const i64 QST0, const i64 QST1, const int NQR) {
+                const float scale, const i64 QST0, const i64 QST1, const int NQR, const int RPH, const i64 OST0) {
     __shared__ unsigned short s_cells[512];        // 1 KB
     __shared__ short s_pu[CA + CB][128];           // <= 8 KB (stores rank pu in 0..511, or -1)
     __shared__ int wsum[4];
@@ -268,9 +268,12 @@ fsb_rows_fused2(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
     }
     __syncthreads();
 
-    // a strided stage view: rows >= NQR are pads and read zeros (the packed stage copy's fill values); QBF is
-    // row-t contiguous when QST1 == 64, the packed layout
-    const unsigned short* q_blk = QBF + (i64)r * QST0;
+    // a strided stage view (fsb_beam_cuda.stage_view): row r is block r % RPH of view row r / RPH, i.e. its positions
+    // (r % RPH) * 128 + [0, 128); positions >= NQR are pads and read zeros (the packed stage copy's fill values). QBF
+    // is row-r contiguous when RPH = 1 and QST1 == 64, the packed layout
+    const int qv_r = r / RPH, qv_p = (r - qv_r * RPH) * 128;
+    const unsigned short* q_blk = QBF + (i64)qv_r * QST0 + (i64)qv_p * QST1;
+    const int nq_r = NQR - qv_p;
     unsigned qa[2][4][4];
     float qpos_r[2][2];
 #pragma unroll
@@ -278,7 +281,7 @@ fsb_rows_fused2(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
         const int qbase = (wid * 2 + qm) * 16;
         qpos_r[qm][0] = QPOS[r * sq0 + (qbase + g) * sq1];
         qpos_r[qm][1] = QPOS[r * sq0 + (qbase + g + 8) * sq1];
-        const bool pok0 = qbase + g < NQR, pok1 = qbase + g + 8 < NQR;
+        const bool pok0 = qbase + g < nq_r, pok1 = qbase + g + 8 < nq_r;
         const unsigned* qr0 = reinterpret_cast<const unsigned*>(q_blk + (i64)(pok0 ? qbase + g : 0) * QST1);
         const unsigned* qr1 = reinterpret_cast<const unsigned*>(q_blk + (i64)(pok1 ? qbase + g + 8 : 0) * QST1);
 #pragma unroll
@@ -435,13 +438,15 @@ fsb_rows_fused2(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
         __syncthreads();
     }
 
+    // outputs in the same view layout: row r's cells at view row r / RPH (stride OST0), positions as for the queries
+    const i64 orow = (i64)qv_r * OST0 + (i64)(qv_p + tid) * KK;
 #pragma unroll
     for (int k = 0; k < KK; k++) {
         const bool ok = bv[k] > __int_as_float(0xff800000);
         const out_t val = ok ? (out_t)s_cells[s_pu[bs[k]][tid]] : (out_t)-1;
-        OUT[row * KK + k] = val;
+        OUT[orow + k] = val;
 #if PROV_ON
-        PROV[row * KK + k] = (signed char)(!ok ? -1 : (bs[k] >= CA ? PROV_BIT : 0));
+        PROV[orow + k] = (signed char)(!ok ? -1 : (bs[k] >= CA ? PROV_BIT : 0));
 #endif
     }
 }
@@ -618,7 +623,7 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
             const float* __restrict__ LAM, const i64 ls0, const float* __restrict__ SIG, const i64 ss0,
             out_t* __restrict__ OUT, signed char* __restrict__ PROV, unsigned char* __restrict__ OVF,
             const int Mc, const int ucap, const int Hh, const i64 sb, const i64 sh, const i64 sl,
-            const float scale, const i64 QST0, const i64 QST1, const int NQR) {
+            const float scale, const i64 QST0, const i64 QST1, const int NQR, const int RPH, const i64 OST0) {
     extern __shared__ __align__(16) unsigned char smem[];
     unsigned short* s_cells = reinterpret_cast<unsigned short*>(smem);
     unsigned char* s_need = smem + V3_OFF_NEED;
@@ -636,15 +641,18 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
 
     const int r = blockIdx.x, tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
 
-    // the warp's two 16-query tiles as mma A fragments (fused2's loads, in flight during the union; rows >= NQR, the
-    // pads of a strided stage view, read as zero queries)
+    // the warp's two 16-query tiles as mma A fragments (fused2's loads, in flight during the union), from fused2's
+    // stage view: row r is block r % RPH of view row r / RPH, its positions (r % RPH) * 128 + [0, 128); positions
+    // >= NQR are pads and read as zero queries
     unsigned qa[2][4][4];
     {
-        const unsigned short* q_blk = QBF + (i64)r * QST0;
+        const int qv_r = r / RPH, qv_p = (r - qv_r * RPH) * 128;
+        const unsigned short* q_blk = QBF + (i64)qv_r * QST0 + (i64)qv_p * QST1;
+        const int nq_r = NQR - qv_p;
 #pragma unroll
         for (int qm = 0; qm < 2; qm++) {
             const int qbase = (wid * 2 + qm) * 16;
-            const bool pok0 = qbase + g < NQR, pok1 = qbase + g + 8 < NQR;
+            const bool pok0 = qbase + g < nq_r, pok1 = qbase + g + 8 < nq_r;
             const unsigned* qr0 = reinterpret_cast<const unsigned*>(q_blk + (i64)(pok0 ? qbase + g : 0) * QST1);
             const unsigned* qr1 = reinterpret_cast<const unsigned*>(q_blk + (i64)(pok1 ? qbase + g + 8 : 0) * QST1);
 #pragma unroll
@@ -935,14 +943,17 @@ fsb_rows_v3(const i64* __restrict__ SELA, const i64* __restrict__ SELB,
     }
 #undef V3_ISSUE
 
-    const i64 row = (i64)r * 128 + tid;
+    // outputs in the same view layout (fused2's): row r's cells at view row r / RPH (stride OST0), positions as for
+    // the queries
+    const int ov_r = r / RPH;
+    const i64 orow = (i64)ov_r * OST0 + (i64)((r - ov_r * RPH) * 128 + tid) * KK;
 #pragma unroll
     for (int k = 0; k < KK; k++) {
         const bool ok = bv[k] > __int_as_float(0xff800000);
         const out_t val = ok ? (out_t)s_cells[s_ph[tid * SPW * 2 + bs[k]]] : (out_t)-1;
-        OUT[row * KK + k] = val;
+        OUT[orow + k] = val;
 #if PROV_ON
-        PROV[row * KK + k] = (signed char)(!ok ? -1 : (bs[k] >= CA ? PROV_BIT : 0));
+        PROV[orow + k] = (signed char)(!ok ? -1 : (bs[k] >= CA ? PROV_BIT : 0));
 #endif
     }
 }

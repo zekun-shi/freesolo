@@ -12,14 +12,15 @@ fixed-policy forest serve config this path computes the same selection with:
   both beams' widths and budgets and each row's lambda and sigma;
 - per stage (FSB_FAST_PREFILL_BLKCHUNK query blocks, default 128, fewer when the stage's scratch and the layer's
   tables would exceed FSB_FAST_PREFILL_SCRATCH_MB, default 2048, and at most fsb_prefill_blkchunk when that memory
-  bound is given as a kwarg or FSB_PREFILL_BLKCHUNK): the fp32 query copy, both beams in one launch of
+  bound is given as a kwarg or FSB_PREFILL_BLKCHUNK): the query copy, both beams in one launch of
   the row-cooperative CUDA kernel (fsb_fast_step.forest_beam_pair; one forest_beam_fused per beam where it does not
   apply) on slices of the layer's tables, the block-shared re-rank (fsb_rows.union_rerank_rows) and one int32 store
-  into the readout's cell table. With two or more stages a stage's re-rank runs on a side stream under the next
-  stage's beams (_stage_pipe, FSB_STAGE_PIPE default 1; the same op sequence per stage on disjoint stage slices,
-  joined before the readout, so the outputs are unchanged; FSB_CHECK_COMPACT or 0 restores the serial loop). The
-  beams write the stage loop's layout (fsb_tree.beam_delta_eff: 2^fsb_delta cell
-  slots per frontier node instead of 2^fsb_delta_max for the fixed policy, FSB_BEAM_COMPACT);
+  into the readout's cell table (FSB_PREFILL_NOCOPY=1: the beams and the re-rank read the queries from Q in place and
+  the re-rank writes the cell table directly, through head-major stage views). With two or more stages a stage's
+  re-rank runs on a side stream under the next stage's beams (_stage_pipe, FSB_STAGE_PIPE default 1; the same op
+  sequence per stage on disjoint stage slices, joined before the readout, so the outputs are unchanged;
+  FSB_CHECK_COMPACT or 0 restores the serial loop). The beams write the stage loop's layout (fsb_tree.beam_delta_eff:
+  2^fsb_delta cell slots per frontier node instead of 2^fsb_delta_max for the fixed policy, FSB_BEAM_COMPACT);
 - the re-rank's row-capacity check of the stage loop (fsb_rows, FSB_ROWS_DEFER): none when no row can hold more
   distinct candidates than the capacity (M <= UCAP); otherwise one device flag per stage, read once per layer after
   the readout is queued. A flagged stage is redone as the stage loop's own stages that cover it (traverse_forest with
@@ -456,21 +457,34 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
         q = pair = sel_a = sel_b = nv = nv_u = res = out = pv = None
         if fused:
             rc = attn.fsb_bound_radius_coef
+            # FSB_PREFILL_NOCOPY=1: the stages' beams and re-rank read their queries from Q in place and the re-rank
+            # stores its cells straight into sel32 (head-major stage views, fsb_beam_cuda.stage_view), for Q's
+            # (B, N, H, D)-transposed layout as for a contiguous one; same values as the copies (pads read zeros)
+            nocopy = (os.environ.get("FSB_PREFILL_NOCOPY", "0") == "1" and not chk and union
+                      and Q.dtype in (torch.bfloat16, torch.float32) and Q.stride(-1) == 1
+                      and (B == 1 or Q.stride(0) == H * Q.stride(1)))
 
             def _beam_stage(b0: int, b1: int):
-                # a stage's fp32 query copy and its beams (one pair launch when the union beam takes the tables)
+                # a stage's queries (a view of Q, or the fp32 / bf16 copy) and its beams (one pair launch when the
+                # union beam takes the tables)
                 nbc = b1 - b0
                 Tc, r0, r1, q0, q1 = T * nbc, T * b0, T * b1, b0 * Bq, b1 * Bq
                 nq = min(q1, N) - q0
-                if Q.is_contiguous() and Q.data_ptr() % 16 == 0:
-                    qs = Q.view(T, N, Dh)[:, q0:q0 + nq]     # the stage's query rows, no copy; the kernels
-                    q = qs if nq == nbc * Bq else qs.as_strided((Tc, nbc * Bq, Dh), (N * Dh, Dh, 1))
-                else:                                        # guard the pad rows (q_nq) instead of zero-filling
-                    q = torch.empty((Tc, Bq, Dh), dtype=torch.bfloat16 if q_bf16 else torch.float32, device=dev)
-                    qv = q.view(B, H, nbc * Bq, Dh)
+
+                def _q_copy():
+                    if q_bf16 and len(stages) == 1 and nq == nbc * Bq and Q.is_contiguous() and Q.data_ptr() % 16 == 0:
+                        return Q.view(Tc, Bq, Dh)                # the whole sequence in one stage: Q's own rows
+                    qc = torch.empty((Tc, Bq, Dh), dtype=torch.bfloat16 if q_bf16 else torch.float32, device=dev)
+                    qv = qc.view(B, H, nbc * Bq, Dh)
                     qv[:, :, :nq].copy_(Q[:, :, q0:q0 + nq])
                     if nq < nbc * Bq:
                         qv[:, :, nq:].zero_()
+                    return qc
+
+                # nocopy: head t's stage queries as one view row, its block j being row t * nbc + j (the pair kernel
+                # reads them in place; should it not run, the stage takes the copy below)
+                q = (Q.as_strided((T, nq, Dh), (Q.stride(1), Q.stride(2), 1), Q.storage_offset() + q0 * Q.stride(2))
+                     if nocopy else _q_copy())
                 # FSB_BEAM_V2: both forests' spines and the row tables from one launch (spines_tables_cuda, bitwise)
                 got = spines_tables_cuda(F, mb_rows[r0:r1], F2, mb2_rows[r0:r1] if F2 is not None else None,
                                          cst["t_rows"][r0:r1], cst["head_rows"][r0:r1], attn.sel_scale, sigma, Bq,
@@ -493,6 +507,11 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                     pair = forest_beam_pair(F, SPc, Wt, None, W_max, Fu, SPuc, Wut, None, Wu_max, q,
                                             qpos, lam, sigv, attn.scale, s, dm, attn.fsb_node_score, rc,
                                             bud=bt, bud_u=but)
+                    if pair is None and nocopy:
+                        q = _q_copy()
+                        pair = forest_beam_pair(F, SPc, Wt, None, W_max, Fu, SPuc, Wut, None, Wu_max, q,
+                                                qpos, lam, sigv, attn.scale, s, dm, attn.fsb_node_score, rc,
+                                                bud=bt, bud_u=but)
                 if pair is not None:
                     (sel_a, nv), (sel_b, nv_u) = pair
                 else:
@@ -527,8 +546,14 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                 s_sl = sel32[:, :, q0:q1]
                 p_sl = prov_full[:, :, q0:q1] if prov_full is not None else None
                 direct = s_sl.is_contiguous()
-                out_buf = s_sl.view(Tc, Bq, Kk) if direct else None
-                pv_buf = p_sl.view(Tc, Bq, Kk) if (direct and p_sl is not None) else None
+                if direct:
+                    out_buf = s_sl.view(Tc, Bq, Kk)
+                    pv_buf = p_sl.view(Tc, Bq, Kk) if p_sl is not None else None
+                elif nocopy:                                     # head-major stage views of the layer's tables
+                    out_buf = s_sl.view(T, nbc * Bq, Kk)
+                    pv_buf = p_sl.view(T, nbc * Bq, Kk) if p_sl is not None else None
+                else:
+                    out_buf = pv_buf = None
                 nf = len(flags)
                 res = union_rerank_rows(sel_a, sel_b, q, qpos, lam, sigv, F["cellA"], SPc["t_idx"], attn.scale, s,
                                         Kk, score, tokK, prov=prov_full is not None, ovf_out=flags, q_bf16=q_bf16,
@@ -539,7 +564,7 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
                     redo.append((b0, b1))                       # an overflowing row (FSB_ROWS_DEFER=0 host check)
                     return None
                 out, pv = res
-                if not direct:
+                if out_buf is None:
                     s_sl.copy_(out.view(B, H, nbc * Bq, Kk))
                     if p_sl is not None:
                         p_sl.copy_(pv.view(B, H, nbc * Bq, Kk))
