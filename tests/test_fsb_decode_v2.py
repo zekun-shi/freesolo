@@ -611,8 +611,8 @@ def test_async_ingest_completes_tall_chunks_on_the_device(monkeypatch, base, zer
 
 @gpu
 @torch.no_grad()
-@pytest.mark.parametrize("zeros", [False, True])
-def test_batched_async_ingests_match_host_decided(monkeypatch, zeros):
+@pytest.mark.parametrize("zeros,cap", [(False, None), (True, None), (True, 2)])
+def test_batched_async_ingests_match_host_decided(monkeypatch, zeros, cap):
     # FSB_DECODE_ASYNC's batched block change outside a decode graph (_ingest_async_many -> lean_dirty_build_many: one
     # append, record, build and spine launch for all forests) against each forest's own host-decided ingests: three
     # forests with different thresholds (different counts per head, heights and Kmax) through ingests that pass 512
@@ -620,9 +620,13 @@ def test_batched_async_ingests_match_host_decided(monkeypatch, zeros):
     # completes one; every table after each ingest and the settled host state equal bit for bit, every ingest after
     # the first in one batch of all three forests. zeros: head 0's first dimension is -0 in every cell but the first
     # (+0), as in test_async_ingest_rebuilds_chunks_under_a_new_fold_flag, so the flag changes the rows of forest 0's
-    # unmoved chunk: a batch that kept them would differ from the host's rebuild
+    # unmoved chunk: a batch that kept them would differ from the host's rebuild. cap: the most forests a batch holds
+    # (fsb_build_cuda.MANY_FORESTS, which its work list's forest numbers bound) lowered to 2, so the third forest takes
+    # its own device-decided ingest
     from src.fsattn import fsb_build_cuda as fbc
     from src.fsattn.fsb_tree import ForestCache, _async_readback, _ingest_async_many
+    if cap is not None:
+        monkeypatch.setattr(fbc, "MANY_FORESTS", cap)
     T, Dh, M_cap, dev = 16, 64, 544, torch.device("cuda")
     g = torch.Generator(device="cuda").manual_seed(13)
     Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
@@ -654,7 +658,11 @@ def test_batched_async_ingests_match_host_decided(monkeypatch, zeros):
                         fc._settle()
                     assert fc._async_ready(M_vis, need_live=True)
                     items.append((fc, Kbar, ceil, None, M_vis, tau))
-                assert _ingest_async_many(items) == []
+                rest = _ingest_async_many(items)
+                assert len(rest) == len(fcs) - nb_f and all(it[0] is fc for it, fc in zip(rest, fcs[nb_f:]))
+                for fc, _, _, _, _, tau in rest:            # the forests past the batch: their own device ingest
+                    assert fc._append_admitted(ceil, M_vis, tau) is fc._mc_nn
+                    fc._async_next = True
             for fc, tau in zip(fcs, taus):
                 fc.ingest(Kbar, ceil, M_vis, tau)
                 fc._stable_spines()
@@ -671,9 +679,11 @@ def test_batched_async_ingests_match_host_decided(monkeypatch, zeros):
             host.append((list(fc._m_known), fc._lean_meta, fc._height_h, dict(fc._fold_rows)))
         return tabs, host
 
+    nb_f = cap or len(taus)                                 # the forests one batch takes
     t0, h0 = run(False)
     t1, h1 = run(True)
-    assert batches == [3] * (len(seq) - 1) and not single, (batches, single)
+    n_own = (len(taus) - nb_f) * (len(seq) - 1)
+    assert batches == [nb_f] * (len(seq) - 1) and single == [1] * n_own, (batches, single)
     for a, b in zip(t0, t1):
         for fa, fb in zip(a, b):
             assert all(torch.equal(_bits(x), _bits(y)) for x, y in zip(fa, fb))

@@ -938,11 +938,14 @@ class _LeanDesc(ctypes.Structure):
 
 
 _MANY: dict = {}                # device -> [descriptor bytes on the device, their device copy, the work list]
+MANY_FORESTS = 1 << 15          # most forests in one lean_dirty_build_many batch: its work list holds each record that
+                                # builds as forest << 16 | record in an int32
 
 
 def lean_many_ok(entry) -> bool:
     # whether a forest's device-decided ingest can join lean_dirty_build_many: lean_dirty_build's inputs (no taller
-    # chunk proposals), fp32 ceilings for the append, a task buffer with room for its records
+    # chunk proposals), fp32 ceilings for the append, a task buffer with room for its records (the caller also stops a
+    # batch at MANY_FORESTS forests)
     ce, Kbar, lean = entry["ce"], entry["Kbar"], entry["lean"]
     T = Kbar.shape[0]
     tb = lean[11]
@@ -959,7 +962,10 @@ def lean_dirty_build_many(entries: list, n_seen: int, M_vis: int) -> None:
     # fsb_spine_lean16_many) instead of four per forest, every forest's tables, counts and spines as its own
     # append_admitted_fast + lean_dirty_build would leave them. entries (lean_many_ok each): dicts of the forest's
     # ceilings ce (B, H, M) and fp32 thresholds tau32 (B H), its adm / m_tot / mc_buf, and lean_dirty_build's
-    # Kbar, ceil_c, spread, lean, nk, skip; all with the same head count and M = lean[7], cells n_seen .. M_vis - 1 new
+    # Kbar, ceil_c, spread, lean, nk, skip; all with the same head count and M = lean[7], cells n_seen .. M_vis - 1 new;
+    # at most MANY_FORESTS of them
+    if len(entries) > MANY_FORESTS:
+        raise ValueError(f"lean_dirty_build_many: {len(entries)} forests in one batch, at most {MANY_FORESTS}")
     dev = entries[0]["Kbar"].device
     T, Dh = entries[0]["Kbar"].shape[0], entries[0]["Kbar"].shape[2]
     M = entries[0]["lean"][7]

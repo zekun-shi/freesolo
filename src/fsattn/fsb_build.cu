@@ -1970,7 +1970,7 @@ fsb_prep_lean_tasks(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
 // skips its rebuild where SKIP_MASK has the height's bit: the rows hold that chunk's build already, and a build is a
 // pure function of the chunk's cells (append-only admissions, completed cells) and of the height's fold flag
 // (fold_mask), so the caller sets the bit only where the rows were built with this launch's flag. NK <= 16; one CTA.
-// WORK (the batched launch, fsb_forest_build_lean16_multi): every record that builds is also listed there as
+// WORK (the batched launch, fsb_forest_build_lean16_many): every record that builds is also listed there as
 // (forest F << 16 | record), after the count WORK[0].
 __device__ __forceinline__ void prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
                                                 i64* __restrict__ JB0, const i64* __restrict__ MT0,

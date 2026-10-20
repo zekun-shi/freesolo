@@ -3430,17 +3430,17 @@ def _ingest_async_many(items: list) -> list:
     # the device-decided ingests of many forests in one batch (fsb_build_cuda.lean_dirty_build_many): each forest's
     # append and chunk rebuild as append_admitted_fast and _ingest_async would run them, in four launches for all of
     # them. items: (forest, the layer's completed cells, ceilings, spreads, visible cells, threshold) of forests that
-    # passed _async_go and are not appended yet. -> the forests left out (no batch for them: the caller appends them
-    # and takes the per-forest path)
-    from .fsb_build_cuda import lean_dirty_build_many, lean_many_ok
+    # passed _async_go and are not appended yet. -> the forests left out (no batch for them, or past the
+    # MANY_FORESTS a batch holds: the caller appends them and takes the per-forest path)
+    from .fsb_build_cuda import MANY_FORESTS, lean_dirty_build_many, lean_many_ok
     from .fsb_build_fast import fast_build_on
     if not fast_build_on():
         return items
     batch, rest = [], []
     for it in items:
         fc, Kbar_all, ceil_all, spread_all, M_vis, tau = it
-        if not (M_vis > fc.n_seen and ceil_all.is_cuda and fc._mc_buf is not None and fc._mc_buf.shape == (2, fc.T)
-                and fc.n_seen == items[0][0].n_seen and M_vis == items[0][4]):
+        if not (len(batch) < MANY_FORESTS and M_vis > fc.n_seen and ceil_all.is_cuda and fc._mc_buf is not None
+                and fc._mc_buf.shape == (2, fc.T) and fc.n_seen == items[0][0].n_seen and M_vis == items[0][4]):
             rest.append(it)
             continue
         if fc.adm.shape[1] < M_vis:                     # the append's room, as append_admitted_fast makes it
