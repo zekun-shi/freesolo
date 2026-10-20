@@ -298,6 +298,15 @@ if triton is not None:
         cols = tl.arange(0, HALF)
         pos_t = tl.load(PosT)
         nq = tl.load(NQ)
+        if SLOTS:
+            # the table read first, so its latency overlaps the new token's writes below
+            rows_s = pid_n * BN + tl.arange(0, BN)
+            w_s = tl.load(WinIdx + rows_s, mask=rows_s < Lw, other=0)
+            cell_s = w_s // S
+            slot = tl.load(CSLOT + b * sstb + h * ssth + cell_s, mask=(rows_s < Lw) & (w_s >= 0) & (w_s < nq),
+                           other=0)
+            prow = slot * S + (w_s - cell_s * S)
+            pcell = slot
         if pid_n == 0:
             hi_cur = pos_t - nq
             kp = K + b * skb + h * skh + cols
@@ -335,11 +344,7 @@ if triton is not None:
         is_hot = (w_idx >= nq)[:, None]
         hot_i = (w_idx - nq)[:, None]
         cell = w_idx // S
-        if SLOTS:
-            slot = tl.load(CSLOT + b * sstb + h * ssth + cell, mask=m & (w_idx >= 0) & (w_idx < nq), other=0)
-            prow = slot * S + (w_idx - cell * S)
-            pcell = slot
-        else:
+        if not SLOTS:
             prow = w_idx
             pcell = cell
 
