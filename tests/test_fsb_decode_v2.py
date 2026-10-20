@@ -369,6 +369,24 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq):
 
 @gpu
 @torch.no_grad()
+def test_graphed_decode_refuses_steps_past_its_reserve(monkeypatch):
+    # FSBGraphedDecoder's K / V store, forest cell capacity and RoPE table end at prompt + max_new_tokens + 8 positions:
+    # every step before that runs, the next one raises before it writes anything
+    m = _model(monkeypatch, 1024)
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(61)).cuda()
+    gd = _decoder(m, prompt, 40)
+    assert gd.end == 1024 + 40 + 16
+    while gd.pos < gd.end:
+        gd.step()
+    torch.cuda.synchronize()
+    nq = [c._n_q for c in gd.cache]
+    with pytest.raises(RuntimeError, match="past the decoder's K / V reserve"):
+        gd.step()
+    assert gd.pos == gd.end and [c._n_q for c in gd.cache] == nq
+
+
+@gpu
+@torch.no_grad()
 @pytest.mark.parametrize("L,tau_q,periodic", [(640, 0.0, False), (1408, 0.0, False), (2944, 0.3, False),
                                               (4096, 0.0, False), (4096, 0.3, True), (2944, 0.0, True)])
 def test_prefix_beams_match_pair_kernel(monkeypatch, L, tau_q, periodic):

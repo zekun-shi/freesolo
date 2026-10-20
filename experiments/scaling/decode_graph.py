@@ -327,6 +327,9 @@ class FSBGraphedDecoder:
             logits = _lm_head_fp32(m, hidden[:, -1:, :], 4096)[:, 0, :]
         self.next_tok = logits.argmax(dim=-1)
         self.pos = P
+        # the positions the step graph may write: the K / V reserve, the forests' cell capacity and the RoPE table
+        # all end here (step refuses to go past it rather than write out of bounds)
+        self.end = P + self.max_new + 8
         self.pos_t = torch.zeros((), dtype=torch.int64, device=self.dev)
         self.win_idx = torch.zeros(self.W + 1, dtype=torch.int64, device=self.dev)
         self.win_pos = torch.zeros(self.W + 1, dtype=torch.float32, device=self.dev)
@@ -383,6 +386,10 @@ class FSBGraphedDecoder:
     @torch.no_grad()
     def step(self):
         p = self.pos
+        if p >= self.end:
+            raise RuntimeError(f"FSBGraphedDecoder: a step at position {p} would write past the decoder's K / V reserve "
+                               f"(positions < {self.end} = prompt + max_new_tokens + 8); create the decoder with a "
+                               f"larger max_new_tokens")
         self.tok_static.copy_(self.next_tok.view(1, 1))
         self.pos_t.fill_(p)
         if self.graph is None:
