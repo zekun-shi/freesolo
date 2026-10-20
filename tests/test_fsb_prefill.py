@@ -6,7 +6,7 @@ flags and bf16 queries, both beams in one forest_beam_pair launch in the compact
 the KV cache, the fused readout's hand-off across an overflow redo); the window branch forked next to the long-range
 branch (FSB_WINDOW_OVERLAP) against the serial prefill, eager and CUDA-graph captured; the trimmed forest build, the
 in-place stage views and the faster re-rank and beam kernels (FSB_BUILD_PREFILL_TRIM, FSB_PREFILL_NOCOPY, FSB_ROWS_V3,
-FSB_BEAM_V2) in every combination at the released shape."""
+FSB_BEAM_V2) in every combination at the released shape, with the beam's exact or AKEY build (FSB_BEAM_LONG)."""
 import os
 import sys
 
@@ -1043,7 +1043,7 @@ def test_mb_max_is_the_device_bound():
 
 
 PREFILL_SWITCHES = ("FSB_BUILD_PREFILL_TRIM", "FSB_PREFILL_NOCOPY", "FSB_WINDOW_OVERLAP", "FSB_ROWS_V3", "FSB_BEAM_V2",
-                    "FSB_BEAM_V2_EXACT")
+                    "FSB_BEAM_V2_EXACT", "FSB_BEAM_LONG")
 
 
 @gpu
@@ -1233,15 +1233,17 @@ def _poison_trimmed(monkeypatch):
 
 @gpu
 @pytest.mark.parametrize("N,blk", [(4096, "0"), (3000, "8"), (9000, "16"), (17000, "32")])
-def test_prefill_switches_at_released_shape(monkeypatch, N, blk):
+@pytest.mark.parametrize("beam_long", ["0", "1"])
+def test_prefill_switches_at_released_shape(monkeypatch, N, blk, beam_long):
     # the released shape (16 heads of 64, top 4 cells): every combination of FSB_BUILD_PREFILL_TRIM,
-    # FSB_PREFILL_NOCOPY, FSB_ROWS_V3 and FSB_BEAM_V2 (its exact build) gives the stage loop's output, cells,
-    # statistics and read accumulators bit for bit, over one stage or several with a partial last one (the stage pipe;
-    # 17000 tokens: more cells than the re-rank capacity, deferred flags), and each switch runs its kernels. The
-    # trimmed builds' unwritten chunks are poisoned, so none of the kernels may read them
+    # FSB_PREFILL_NOCOPY, FSB_ROWS_V3 and FSB_BEAM_V2 (its exact build, or with FSB_BEAM_LONG its AKEY build) gives
+    # the stage loop's output, cells, statistics and read accumulators bit for bit, over one stage or several with a
+    # partial last one (the stage pipe; 17000 tokens: more cells than the re-rank capacity, deferred flags), and each
+    # switch runs its kernels. The trimmed builds' unwritten chunks are poisoned, so none of the kernels may read them
     from src.fsattn import fsb_beam_cuda as bc
     monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", blk)
     monkeypatch.setenv("FSB_BEAM_V2_EXACT", "1")
+    monkeypatch.setenv("FSB_BEAM_LONG", beam_long)
     seen = []
     real_launch = bc.launch
     monkeypatch.setattr(bc, "launch", lambda fn, *a, **k: seen.append(fn.value) or real_launch(fn, *a, **k))
