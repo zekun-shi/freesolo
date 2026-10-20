@@ -2363,12 +2363,15 @@ def _fsb_graph_pool():
 
 
 @torch.no_grad()
-def prefill_forests(attn, Kbar_s, ceil_s, E, spread_s=None):
+def prefill_forests(attn, Kbar_s, ceil_s, E, spread_s=None, mb_max=None):
     # the prefill forest (admission fsb_tau) and, with union tau on, the second beam's forest, with the per-block
-    # prefix counts m_b = searchsorted(adm, E); one CUDA build of both when FSB_BUILD_CUDA covers the inputs
+    # prefix counts m_b = searchsorted(adm, E); one CUDA build of both when FSB_BUILD_CUDA covers the inputs (mb_max:
+    # a caller that reads the forests only through spines of these m_b may let that build skip the chunks no such
+    # spine reads, fsb_build_cuda.build_forests_cuda)
     T, M, Dh = Kbar_s.shape
     from .fsb_build_cuda import forests_cuda
-    got = forests_cuda(Kbar_s, ceil_s, spread_s, [attn.fsb_tau] + ([attn.fsb_tau_union] if union_tau_on(attn) else []), E)
+    taus = [attn.fsb_tau] + ([attn.fsb_tau_union] if union_tau_on(attn) else [])
+    got = forests_cuda(Kbar_s, ceil_s, spread_s, taus, E, mb_max=mb_max)
     if got is not None:
         F, m_b_all = got[0]
         if len(got) > 1:
@@ -2386,8 +2389,8 @@ def prefill_forests(attn, Kbar_s, ceil_s, E, spread_s=None):
 
 
 @torch.no_grad()
-def _forest_build_stage(attn, Kbar_s, ceil_s, blk_start, s, spread_s=None):
-    F, m_b_all = prefill_forests(attn, Kbar_s, ceil_s, (blk_start / s).floor().long(), spread_s)
+def _forest_build_stage(attn, Kbar_s, ceil_s, blk_start, s, spread_s=None, mb_max=None):
+    F, m_b_all = prefill_forests(attn, Kbar_s, ceil_s, (blk_start / s).floor().long(), spread_s, mb_max=mb_max)
     if getattr(attn, "fsb_read_top", 0) > 0:
         F["cellK"] = Kbar_s; F["cellA"] = ceil_s
     if hybrid_on(attn):

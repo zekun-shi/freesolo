@@ -281,12 +281,15 @@ def _host_syncs(fn) -> int:
 
 
 @gpu
-def test_no_host_sync(monkeypatch):
-    # M = 256 cells <= UCAP: no row can overflow the re-rank, so neither path waits for the GPU (FSB_ROWS_DEFER)
+@pytest.mark.parametrize("trim", ["0", "1"])
+def test_no_host_sync(monkeypatch, trim):
+    # M = 256 cells <= UCAP: no row can overflow the re-rank, so neither path waits for the GPU (FSB_ROWS_DEFER);
+    # the trimmed build's spine bound is host arithmetic
     attn = _attn(H=8)
     Q, K, V, sigma = _inputs(9, 1, 8, 8192)
     _set_tau(attn, K)
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", trim)
     attn._fsb_read_acc = None
 
     def one():
@@ -852,3 +855,85 @@ def test_fsb_graphed_decoder_single_capture_across_blocks(monkeypatch):
         gd.step()
     assert captures[0] == 1, captures[0]
 
+
+@gpu
+@pytest.mark.parametrize("N,tau_q,case", [(4096, None, "utau"), (3000, 0.3, "utau"), (20000, None, "utau"),
+                                          (1100, 0.25, "no_union"), (2500, None, "union_no_tau"),
+                                          (700, None, "leaf_radius")])
+def test_prefill_trim_same_selection(monkeypatch, N, tau_q, case):
+    # FSB_BUILD_PREFILL_TRIM=1 builds only the forest chunks the layer's spines read: output, cells, statistics and
+    # read accumulators bit for bit as with the full build, over several stages (and the stage pipe)
+    from src.fsattn import fsb_build_cuda as bc
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "8")
+    seen = []
+    real = bc._tasks
+    monkeypatch.setattr(bc, "_tasks", lambda *a, **k: seen.append(k.get("mb_max")) or real(*a, **k))
+    attn = _attn(**CASES[case])
+    Q, K, V, sigma = _inputs(90 + N, 1, 4, N)
+    _set_tau(attn, K, tau_q=tau_q)
+    out = {}
+    for trim in ("0", "1"):
+        monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", trim)
+        seen.clear()
+        out[trim] = _run(monkeypatch, attn, Q, K, V, sigma, fast=True, acc=True, stats=True)
+        nb = -(-N // 128)
+        assert seen == [((nb - 1) * 4 if trim == "1" else None)], seen    # cell_stride 32, 128-query blocks
+    _assert_same(out["1"], out["0"])
+
+
+@gpu
+def test_mb_max_is_the_device_bound():
+    # the host's _mb_max(nb, Bq, s, M) equals min(E[nb - 1], M) for the device's E = floor(blk_start / s) of
+    # _consts and _forest_build_stage, for every nb up to 3000 and some past fp32's exact integers, also where the fp32
+    # reciprocal of s rounds (s not a power of two)
+    from src.fsattn.fsb_prefill import _mb_max
+    for Bq in (1, 3, 32, 100, 128, 129):
+        for s in (1, 3, 7, 10, 24, 32, 33, 100, 127):
+            E = (torch.arange(3000, device="cuda", dtype=torch.float32) * Bq / s).floor().long().tolist()
+            assert [_mb_max(nb, Bq, s, 1 << 40) for nb in range(1, 3001)] == E, (Bq, s)
+            assert _mb_max(3000, Bq, s, 5) == min(E[-1], 5)
+    for nb in ((1 << 24) + 3, 40000017):
+        for Bq, s in ((1, 3), (3, 7), (128, 24)):
+            e = int((torch.arange(nb, device="cuda", dtype=torch.float32) * Bq / s).floor()[-1])
+            assert _mb_max(nb, Bq, s, 1 << 40) == e, (nb, Bq, s)
+
+
+@gpu
+def test_graphed_prefill_trim_matches_full_build(monkeypatch):
+    # the trimmed build inside a captured prefill (several stages on the stage pipe): replays equal the eager
+    # prefill with the full build bit for bit
+    import bench_efficiency as be
+    from decode_graph import GraphedPrefiller
+    from experiments.scaling.model import FreeSoloLM
+    from kv_cache import _trunk_cached, make_caches
+    from longctx_infer import _lm_head_fp32
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
+    monkeypatch.setenv("FS_FUSED_SELECT", "0")
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "4")
+    kw = be.serve_kwargs("fsb", 0.5)
+    torch.manual_seed(13)
+    L = 3000
+    m = FreeSoloLM(vocab_size=512, d_model=256, n_layers=2, n_heads=4, d_ff=512, max_seq_len=L + 64,
+                   attn_type="fsattn", **kw).cuda().to(torch.bfloat16).eval()
+    g = torch.Generator().manual_seed(27)
+    x1 = torch.randint(0, 512, (1, L), generator=g).cuda()
+    x2 = torch.randint(0, 512, (1, L), generator=g).cuda()
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        cs = make_caches(m)
+        _trunk_cached(m, x1, cs)
+        for blk, c in zip(m.blocks, cs):
+            blk.attn.fsattn.fsb_tau.fill_(0.0)
+            blk.attn.fsattn.fsb_tau_union.copy_(c._ceil[0].float().median(dim=-1).values)
+    monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", "1")
+    gp = GraphedPrefiller(m, L, B=1, device="cuda", dtype=torch.bfloat16, tail_tokens=64)
+    gp.capture(x1)                                         # its eager warm-up builds the trimmed task tables
+    monkeypatch.setenv("FSB_BUILD_PREFILL_TRIM", "0")
+    for x in (x1, x2):
+        gp.run(x)
+        got_tail = gp.tail_logits().clone()
+        cs = make_caches(m)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            h = _trunk_cached(m, x, cs)
+            ref_tail = _lm_head_fp32(m, h[:, -64:, :], 4096)
+        assert _same(got_tail, ref_tail)

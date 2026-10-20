@@ -7,8 +7,9 @@ fixed-policy forest serve config this path computes the same selection with:
 
 - per-forward constants (block starts, query positions, stage-major (head, block) row tables), cached per shape and
   shared by every layer;
-- per layer: one spine launch per forest over every (head, block) row and one launch that writes both beams' widths
-  and budgets and each row's lambda and sigma;
+- per layer: the forests' CUDA build (FSB_BUILD_PREFILL_TRIM=1: only the chunks the layer's spines can read,
+  fsb_build_cuda.spine_chunks), one spine launch per forest over every (head, block) row and one launch that writes
+  both beams' widths and budgets and each row's lambda and sigma;
 - per stage (FSB_FAST_PREFILL_BLKCHUNK query blocks, default 128, fewer when the stage's scratch and the layer's
   tables would exceed FSB_FAST_PREFILL_SCRATCH_MB, default 2048, and at most fsb_prefill_blkchunk when that memory
   bound is given as a kwarg or FSB_PREFILL_BLKCHUNK): the fp32 query copy, both beams in one launch of
@@ -34,7 +35,9 @@ are the stage loop's formulas, so the selected cells, the layer output and the s
 """
 from __future__ import annotations
 
+import math
 import os
+import struct
 from collections import OrderedDict
 from collections.abc import MutableMapping
 
@@ -276,6 +279,22 @@ def _consts(dev, B: int, H: int, nb: int, Bq: int, stages: tuple) -> dict:
     return hit
 
 
+def _f32(x: float) -> float:
+    # x rounded to fp32 (to nearest even)
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def _mb_max(nb: int, Bq: int, s: int, M: int) -> int:
+    # the largest per-block prefix count m_b the forest build can return: m_b <= min(E[b], M) with E[b] =
+    # floor(blk_start[b] / s) nondecreasing in b, so E[nb - 1] bounds every block of both forests. Computed on the host
+    # without a tensor (no device or host sync inside a captured prefill) with the device's fp32 roundings: _consts'
+    # blk_start[b] = fp32(b) * fp32(Bq), and _forest_build_stage's division of a CUDA tensor by a host scalar, which
+    # torch runs as a multiply by the scalar's fp32 reciprocal. A double product or quotient of fp32 values rounded
+    # once to fp32 is the fp32 operation's result (doubles carry more than 2 * 24 + 2 bits)
+    blk = _f32(_f32(float(nb - 1)) * _f32(float(Bq)))
+    return min(math.floor(_f32(blk * _f32(1.0 / _f32(float(s))))), M)
+
+
 def _row_tables(attn, SP: dict, SP2, sel_scale, sigma, head_rows, Bq: int, union: bool):
     rows = SP["height"].shape[0]
     dev = SP["height"].device
@@ -363,6 +382,7 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
     # fsb_long_range for the configurations of prefill_fast_ok; same output, selection and statistics
     from .fsb_fast_step import fast_beam_ok, forest_beam_fused, forest_beam_pair
     from .fsb_rows import UCAP, union_rerank_rows
+    from .fsb_build_cuda import prefill_trim_on
     from .fsb_tree import (_check_compact, _det_sum, _forest_build_stage, beam_delta_eff, build_spines, fsb_read_acc,
                            fsb_utau_acc, masked_readout, readout_handoff, union_tau_on)
     B, H, _, Dh = Q.shape
@@ -409,8 +429,11 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
             dK = Kpv.float() - Kbar[..., None, :]
             spread = _det_sum(dK * dK, -1).amax(dim=-1).sqrt()
             del dK
+        # FSB_BUILD_PREFILL_TRIM=1: every read of these forests below goes through the spines of the layer's m_b
+        # (the beams descend from their chunk roots), so the CUDA build may skip the chunks no such spine reads
         F, m_b_all = _forest_build_stage(attn, Kbar.reshape(T, M, Dh), ceil_c.reshape(T, M), blk_start, s,
-                                         spread.reshape(T, M) if spread is not None else None)
+                                         spread.reshape(T, M) if spread is not None else None,
+                                         mb_max=_mb_max(nb, Bq, s, M) if prefill_trim_on() else None)
         F["chunks"] = {}
         F2 = F.get("utau_F") if utau else None
         m_b2_all = F.get("utau_mba") if F2 is not None else None

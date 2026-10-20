@@ -604,3 +604,123 @@ def test_captured_build_survives_many_later_shapes():
         time.sleep(0.01)
     del junk
     _exact(K1, c1, None, taus1, E1, H1, out1)
+
+
+# ---- prefill builds of the spine chunks only (FSB_BUILD_PREFILL_TRIM, mb_max) ----
+
+def _sentinel_empty(monkeypatch):
+    # torch.empty with every element set to a sentinel (NaN, or -7 for integers): rows a build never writes keep it
+    real = torch.empty
+
+    def empty(*a, **k):
+        t = real(*a, **k)
+        t.fill_(float("nan") if t.is_floating_point() else -7)
+        return t
+
+    monkeypatch.setattr(torch, "empty", empty)
+    return lambda: monkeypatch.setattr(torch, "empty", real)
+
+
+def _chunk_rows(F, k, j):
+    # node rows (bf16 means as raw bits, fp32 aggregates as raw bits) and leaf rows of chunk (k, j), all heads
+    nb, npr, lb = F["bases"][k], F["nodes_per"][k], F["leafbases"][k]
+    mu = F["node_mu"][:, nb + j * npr:nb + (j + 1) * npr].contiguous().view(torch.int16)
+    ax = F["node_aux"][:, nb + j * npr:nb + (j + 1) * npr].contiguous().view(torch.int32)
+    return mu, ax, F["leaf"][:, lb + (j << k):lb + ((j + 1) << k)]
+
+
+@pytest.mark.parametrize("T,M,Dh", [(16, 512, 64), (4, 4096, 64), (2, 8192, 64), (8, 1000, 32), (4, 7, 64),
+                                    (16, 300, 64), (2, 2048, 32)])
+def test_prefill_trim_builds_exactly_the_spine_chunks(monkeypatch, T, M, Dh):
+    # a build with mb_max writes every chunk a spine of some m_b <= mb_max reads, with the full build's bits, and no
+    # other chunk; the prologue's tables and every spine of the layer's m_b are unchanged (both forests, random,
+    # all-but-one, none and all admitted, with and without spreads, prefill block starts and random ones)
+    bc = _bc()
+    monkeypatch.setenv("FSB_BUILD_GROUP", "4")
+    g = torch.Generator().manual_seed(17 * M + T + Dh)
+    K = _keys("randn", T, M, Dh, g).to(DEV)
+    ce = torch.rand(T, M, generator=g).to(DEV)
+    spread = torch.rand(T, M, generator=g).to(DEV)
+    H = 4 if T % 4 == 0 else T
+    nb = max(1, M * 32 // 128)
+    starts = {"prefill": (torch.arange(nb, device=DEV, dtype=torch.float32) * 128 / 32).floor().long(),
+              "random": torch.randint(0, M + 1, (29,), generator=g).sort().values.to(DEV)}
+    for ename, E in starts.items():
+        mbx = min(int(E.max()), M)
+        for pair in (("zero", "q50"), ("rand", "none"), ("allbut1", "rand")):
+            taus = [_taus(p, ce, H, g).float().to(DEV) for p in pair]
+            for sp in (None, spread):
+                full = bc.forests_cuda(K, ce, sp, taus, E)
+                restore = _sentinel_empty(monkeypatch)
+                try:
+                    trim = bc.forests_cuda(K, ce, sp, taus, E, mb_max=mbx)
+                finally:
+                    restore()
+                assert full is not None and trim is not None
+                for (F, mb), (G, gb) in zip(full, trim):
+                    assert _same(F["adm"], G["adm"]) and _same(F["m_tot"], G["m_tot"]) and _same(mb, gb)
+                    for k in F["ks"]:
+                        ja, jsh, nj = bc.spine_chunks(M, k, mbx)
+                        keep = set(range(ja, ja + (nj << jsh), 1 << jsh))
+                        for j in range(F["Cmaxs"][k]):
+                            got, ref = _chunk_rows(G, k, j), _chunk_rows(F, k, j)
+                            if j in keep:
+                                assert all(torch.equal(a, b) for a, b in zip(got, ref)), (ename, pair, k, j)
+                            else:                          # never written: still the sentinel
+                                assert bool((got[0] == _bits(torch.tensor(float("nan"), dtype=torch.bfloat16)
+                                                             .view(torch.int16))).all()), (ename, pair, k, j)
+                                assert bool((got[2] == -7).all()), (ename, pair, k, j)
+                    # every spine of the layer's prefix counts (and of every m_b <= min(mb_max, m_tot)) reads only
+                    # kept chunks, so the spines of both builds agree bit for bit
+                    lim = torch.minimum(F["m_tot"], torch.tensor(mbx, device=DEV)) + 1
+                    rnd = (torch.rand(T * 64, generator=g).to(DEV) * lim.repeat_interleave(64)).long()
+                    for m_b, rep in ((mb.reshape(-1), mb.shape[1]), (rnd, 64)):
+                        ti = torch.arange(T, device=DEV).repeat_interleave(rep)
+                        S0, S1 = ft.build_spines(F, m_b, ti), ft.build_spines(G, m_b, ti)
+                        for key in ("node", "root", "height"):
+                            assert _same(S0[key], S1[key]), (ename, pair, key)
+
+
+def test_spine_chunks_cover_every_spine():
+    # spine_chunks(M, k, mb_max) holds every chunk (k, (m >> (k + 1)) << 1) with bit k of m set, m <= mb_max, and
+    # only such chunks; mb_max = None keeps every chunk
+    bc = _bc()
+    for M in (1, 7, 64, 300, 1000, 4096, 8192):
+        Kmax = int(math.floor(math.log2(M)))
+        for mbx in sorted({0, 1, 2, 3, M // 3, M // 2, M - 4, M - 1, M}):
+            if not 0 <= mbx <= M:
+                continue
+            for k in range(Kmax + 1):
+                ja, jsh, nj = bc.spine_chunks(M, k, mbx)
+                kept = set(range(ja, ja + (nj << jsh), 1 << jsh))
+                read = {(m >> (k + 1)) << 1 for m in range(mbx + 1) if (m >> k) & 1}
+                assert kept == read and all(((j + 1) << k) <= M for j in kept), (M, mbx, k)
+            assert bc.spine_chunks(M, Kmax, None) == (0, 0, M >> Kmax)
+
+
+def test_prefill_trim_graph_capture():
+    # the trimmed table is static per shape and bound: a captured trimmed build replays bit-identically on new inputs
+    bc = _bc()
+    T, M, Dh, H = 16, 2500, 64, 16
+    g = torch.Generator().manual_seed(23)
+    K = torch.randn(T, M, Dh, generator=g).to(DEV)
+    ce = torch.rand(T, M, generator=g).to(DEV)
+    taus = [torch.zeros(H, device=DEV), torch.full((H,), 0.5, device=DEV)]
+    E = (torch.arange(M // 4, device=DEV) * 4).long()
+    mbx = int(E.max())
+    bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = bc.forests_cuda(K, ce, None, taus, E, mb_max=mbx)
+    K.copy_(torch.randn(T, M, Dh, generator=g).to(DEV))
+    ce.copy_(torch.rand(T, M, generator=g).to(DEV))
+    graph.replay()
+    torch.cuda.synchronize()
+    full = bc.forests_cuda(K, ce, None, taus, E)
+    for (F, mb), (G, gb) in zip(full, out):
+        assert _same(mb, gb)
+        for k in F["ks"]:
+            ja, jsh, nj = bc.spine_chunks(M, k, mbx)
+            for j in range(ja, ja + (nj << jsh), 1 << jsh):
+                assert all(torch.equal(a, b) for a, b in zip(_chunk_rows(G, k, j), _chunk_rows(F, k, j))), (k, j)

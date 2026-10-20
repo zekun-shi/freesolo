@@ -51,6 +51,24 @@ _warned: set = set()                                      # per-call failures al
 _ONLY_K = None                                            # debug: restrict the task table to these heights
 
 
+def prefill_trim_on() -> bool:
+    # FSB_BUILD_PREFILL_TRIM=1: the inference prefill (fsb_prefill_fast) builds only the chunks its spines can read
+    # (spine_chunks); 0 (the default) builds every chunk
+    return os.environ.get("FSB_BUILD_PREFILL_TRIM", "0") == "1"
+
+
+def spine_chunks(M: int, k: int, mb_max) -> tuple:
+    # (first chunk, log2 stride, count) of the height-k chunks a whole-forest build writes: all M >> k of them, or
+    # with mb_max (an upper bound on every m_b a spine row of the forest can have) the chunks a spine can read. The
+    # spine of a prefix of m_b admitted cells (build_spines) reads chunk (k, j) only when bit k of m_b is set, with
+    # j = (m_b >> (k + 1)) << 1 (even) and (j + 1) 2^k <= m_b; over every m_b <= mb_max that is each even j with
+    # (j + 1) 2^k <= mb_max (m_b = (j + 1) 2^k reads it). Chunks outside that set are never read by a spine, by the
+    # beams that descend from the spines' chunk roots, or by their cell epilogues (leaf rows of the chunk itself)
+    if mb_max is None:
+        return 0, 0, M >> k
+    return 0, 1, ((min(int(mb_max), M) >> k) + 1) // 2
+
+
 def build_cuda_on() -> bool:
     # FSB_BUILD_CUDA=1 replaces the fused (Triton) build it reproduces bit for bit: without that build (FSB_FAST_BUILD=0
     # restores the reference builder, or no Triton) it steps aside as well
@@ -234,18 +252,25 @@ def _table_store(key, hit) -> None:
         gc.collect()
 
 
-def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, only_layv: bool = False):
-    # static task table of one launch and the layout vector, cached per shape and grouping: an LRU of the _TABLES_MAX
-    # most recently used shapes, plus every table a CUDA graph captured (_table_lookup). Built outside graph capture:
-    # the first call of a shape runs before any capture of it, as for the kernels.
-    # Records (10 ints): type, f, t, k, j, nsub, l, n, flag, dep. type 0: batch of nsub chunks of height k <= 9; type 1:
-    # G node (level l, index n) of a chunk of height >= 10, raising flag when its slot lists are written; type 2: the
-    # 512-cell subtree n (at level k - 9) of such a chunk. dep: the flag a task waits for (its parent G node), -1 none.
+def _table_key(T: int, M: int, nf: int, g: int, kmax_cuda: int, dev: torch.device, mb_max=None) -> tuple:
+    return (T, M, nf, g, kmax_cuda, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)), mb_max)
+
+
+def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, only_layv: bool = False,
+           mb_max=None):
+    # static task table of one launch and the layout vector, cached per shape, grouping and spine bound: an LRU of the
+    # _TABLES_MAX most recently used shapes, plus every table a CUDA graph captured (_table_lookup). Built outside
+    # graph capture: the first call of a shape runs before any capture of it, as for the kernels.
+    # Records (10 ints): type, f, t, k, j, nsub, l, n, flag, dep. type 0: batch of nsub chunks j + (i << l) of height
+    # k <= 9; type 1: G node (level l, index n) of a chunk of height >= 10, raising flag when its slot lists are
+    # written; type 2: the 512-cell subtree n (at level k - 9) of such a chunk. dep: the flag a task waits for (its
+    # parent G node), -1 none. The chunks of each height are spine_chunks(M, k, mb_max): every chunk, or with mb_max
+    # only those a prefill spine can read (every other chunk, batched with l = 1).
     # Order: G roots (tallest first), then the batches longest first; each dependent task is inserted once the
     # estimated dispatch time (sum of earlier task costs / SMs) passes its parent's estimated finish, so waits are
     # rare; a task only ever waits for an earlier one, which is resident or finished by then (blocks start in index
     # order: see wait_flag in the kernel source).
-    key = (T, M, nf, g, kmax_cuda, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)))
+    key = _table_key(T, M, nf, g, kmax_cuda, dev, mb_max)
     hit, pinned = _table_lookup(key)
     if hit is None and only_layv:
         lay = forest_layout(M)
@@ -254,7 +279,8 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
         _table_store(key, hit)
     elif hit is None or (not only_layv and hit[0] is None):
         lay = forest_layout(M)
-        use = [k for k in lay["ks"] if k <= kmax_cuda and (_ONLY_K is None or k in _ONLY_K)]
+        chunks = {k: spine_chunks(M, k, mb_max) for k in lay["ks"]}
+        use = [k for k in lay["ks"] if k <= kmax_cuda and (_ONLY_K is None or k in _ONLY_K) and chunks[k][2] > 0]
         big = sorted((k for k in use if k >= 10), reverse=True)
         nsm = torch.cuda.get_device_properties(dev).multi_processor_count
         rows = []
@@ -278,9 +304,10 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
         flags: dict = {}
         roots = []
         for k in big:                                      # G nodes and subtrees of chunks of height >= 10
+            ja, jsh, nj = chunks[k]
             for f in range(nf):
                 for t in range(T):
-                    for j in range(lay["Cmaxs"][k]):
+                    for j in range(ja, ja + (nj << jsh), 1 << jsh):
                         flags[(f, t, k, j, 0, 0)] = len(flags)
                         roots.append([1, f, t, k, j, 0, 0, 0, flags[(f, t, k, j, 0, 0)], -1])
                         for d in range(1, k - 9):
@@ -295,12 +322,12 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
             push(rec)
         for k in sorted((k for k in use if k <= 9), reverse=True):
             per = 512 >> k
-            C = lay["Cmaxs"][k]
+            ja, jsh, nj = chunks[k]
             for f in range(nf):
                 for t in range(T):
-                    for j0 in range(0, C, per):
+                    for i0 in range(0, nj, per):
                         flush()
-                        push([0, f, t, k, j0, min(per, C - j0), 0, 0, -1, -1])
+                        push([0, f, t, k, ja + (i0 << jsh), min(per, nj - i0), jsh, 0, -1, -1])
         while ready:
             flush(force=True)
         assert not children
@@ -358,16 +385,18 @@ def _tau32(tau: torch.Tensor) -> torch.Tensor:
     return t.contiguous()
 
 
-def forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, sel=None, lean=None):
+def forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, sel=None, lean=None,
+                 mb_max=None):
     # build_forests_cuda when the kernels cover the inputs, else None (the caller runs the existing builder). Running out
     # of memory propagates (the existing builder needs more) and so does any failure inside a graph capture; a variant
     # that cannot be set up falls back from then on (_functions); any other failure falls back for this call only,
     # with a warning. sel = [(k, [j per head or None])] restricts the build to those dirty aligned chunks (a decode
-    # ingest's); out-of-layout selections fall through to the whole-forest build inside build_forests_cuda.
+    # ingest's); out-of-layout selections fall through to the whole-forest build inside build_forests_cuda. mb_max:
+    # see build_forests_cuda.
     if not build_cuda_ok(Kbar, ceil_c, spread, taus, E):
         return None
     try:
-        return build_forests_cuda(Kbar, ceil_c, spread, taus, E, sel=sel, lean=lean)
+        return build_forests_cuda(Kbar, ceil_c, spread, taus, E, sel=sel, lean=lean, mb_max=mb_max)
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception as e:
@@ -431,7 +460,7 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
             for j in js:
                 if j is not None and (j < 0 or j >= Ck):
                     raise _SelLayout(f"fsb_build_cuda: chunk (k={k}, j={j}) is outside the M={M} layout")
-        tkey = (T, M, nf, g, kmax_cuda, dev.index, None if _ONLY_K is None else tuple(sorted(_ONLY_K)))
+        tkey = _table_key(T, M, nf, g, kmax_cuda, dev)
         if tkey not in _tables and tkey not in _pinned:
             _tasks(T, M, nf, g, dev, kmax_cuda, only_layv=True)
         _functions(dev, Dh)
@@ -585,13 +614,16 @@ def _chunks_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: tor
 
 @torch.no_grad()
 def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, sel=None,
-                       _kmax_cuda: int = 99, lean=None):
+                       _kmax_cuda: int = 99, lean=None, mb_max=None):
     # forests for admission thresholds taus (1 or 2 tensors of shape (H,), head t uses tau[t % H]); returns
     # [(F, m_b_all)] per tau: build_forest's prefill dict (chunks empty), except the node tables land split — means
     # in bf16 (node_mu, with each row's bf16 rounding error folded into the radius in node_aux[..., 0]) and the nine
     # aggregates in fp32 (node_aux) — and searchsorted(adm, E). T = 0 heads give empty tables of the same layout,
     # without a launch. sel = [(k, [j per head or None])] builds only those dirty aligned chunks (a decode ingest's;
     # node/leaf rows outside them are not written); an out-of-layout selection falls through to the whole-forest build.
+    # mb_max (whole-forest builds only): a host bound on every m_b the caller's spines will use (each m_b is at most
+    # min(max(E), M)); the build then writes only the chunks such spines can read (spine_chunks), each with the bits of
+    # the full build, and leaves the other node/leaf rows unwritten.
     if sel is not None and Kbar.shape[0] > 0 and any(j is not None for _, js in sel for j in js):
         try:
             return _chunks_build(Kbar, ceil_c, spread, taus, E, sel, _kmax_cuda, lean=lean)
@@ -613,7 +645,7 @@ def build_forests_cuda(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E
     H = taus[0].shape[0]
     lay = forest_layout(M)
     if T > 0:
-        tasks, layv, bounds, nbig, nflags = _tasks(T, M, nf, _group(), dev, _kmax_cuda)
+        tasks, layv, bounds, nbig, nflags = _tasks(T, M, nf, _group(), dev, _kmax_cuda, mb_max=mb_max)
         if torch.cuda.is_current_stream_capturing() and _variant(dev.index, Dh) not in _fns:
             raise RuntimeError("fsb_build_cuda: kernels must be compiled before graph capture")
         pro = _functions(dev, Dh)[0]

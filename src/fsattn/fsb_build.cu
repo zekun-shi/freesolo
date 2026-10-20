@@ -556,6 +556,7 @@ struct Rec {                  // where a warp's records go
     float* node_aux;          // its fp32 aggregates (lean16)
     i64* leaf;                // leaf table of head t: (Ltot,)
     int k, ks, l0, n0, jb;    // chunk height, subtree height, subtree root level/index, chunk of subtree 0
+    int jsh;                  // log2 of the chunk stride: subtree i belongs to chunk jb + (i << jsh)
     int base, leafbase;       // bases[k], leafbases[k]
     int nfull;                // subtrees (relative to jb) that belong to full chunks: index < nfull
     int zsh;                  // log2 of the rows per chunk inside a warp (min(k, 5)): chunk of a warp row = r >> zsh
@@ -563,7 +564,7 @@ struct Rec {                  // where a warp's records go
 // record of the node of V rows that starts at batch slot gs (V = 2^lv)
 __device__ __forceinline__ void rec_pos(const Rec& R, const int gs, const int lv, int& row, int& h, int& idx, int& j) {
     const int i = gs >> R.ks, local = gs & ((1 << R.ks) - 1), d = R.ks - lv;
-    j = R.jb + i;
+    j = R.jb + (i << R.jsh);
     const int l = R.l0 + d;
     idx = (R.n0 << d) + (local >> lv);
     h = (1 << l) - 1 + idx;
@@ -620,7 +621,7 @@ __device__ __forceinline__ void w_level(float (&x)[32][PER], int& cell, float& c
 #pragma unroll
     for (int n = 0; n < NN; n++) {
         const bool wr = node_full(R, gs0 + n * V);
-        const i64 moff = n + ((n * V) >> R.ks) * (nodes - npc);
+        const i64 moff = n + ((n * V) >> R.ks) * ((nodes << R.jsh) - npc);
         float* mp = m16 ? nullptr : mp0 + moff * NC;
         unsigned short* mpb = m16 ? mp0b + moff * DH : nullptr;
         float e2 = 0.0f;
@@ -831,7 +832,7 @@ __device__ __forceinline__ void h_level(float (&x)[16][PER], int& cell, float& c
 #pragma unroll
     for (int n = 0; n < NN; n++) {
         const bool wr = node_full(R, gsh + n * V);
-        const i64 moff = n + ((n * V) >> R.ks) * (nodes - npc);
+        const i64 moff = n + ((n * V) >> R.ks) * ((nodes << R.jsh) - npc);
         float* mp = m16 ? nullptr : mp0 + moff * NC;
         unsigned short* mpb = m16 ? mp0b + moff * DH : nullptr;
         float e2 = 0.0f;
@@ -1365,13 +1366,15 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
 // >>> SECTION: _BUILD <<<
 
 // ---- K1: forest construction tasks (512 threads; dynamic shared memory) ----
-// task record (8 ints): type, f, t, k, j0, nsub, l0, n0.  type 0: batch of nsub consecutive chunks of height
-// k <= 9 (nsub << k <= 512 slots); LAY: bases[16] | leafbases[16] | fold mask (bit k: Kpad(k) > k)
+// task record (8 ints): type, f, t, k, j0, nsub, l0, n0.  type 0: batch of nsub chunks j0 + (i << l0) of height
+// k <= 9 (nsub << k <= 512 slots; l0 = 0: consecutive chunks, 1: every other chunk); LAY: bases[16] | leafbases[16] |
+// fold mask (bit k: Kpad(k) > k)
 
-// records of chunks [ja, jb) of height k that hold no admitted cell: mu = signed zeros of Kbar[t, 0] (the cell an
-// empty slot reads), rad = amax = 0, pmin = 2^30, static fields; leaves -1. One warp per node record.
-__device__ void empty_chunks(const Args& A, const int f, const int t, const int k, const int ja, const int jb) {
-    if (ja >= jb) return;
+// records of the n chunks ja + (c << jsh) of height k that hold no admitted cell: mu = signed zeros of Kbar[t, 0] (the
+// cell an empty slot reads), rad = amax = 0, pmin = 2^30, static fields; leaves -1. One warp per node record.
+__device__ void empty_chunks(const Args& A, const int f, const int t, const int k, const int ja, const int n,
+                             const int jsh) {
+    if (n <= 0) return;
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const int nodes = (2 << k) - 1, base = A.lay[k], lbase = A.lay[16 + k];
     const bool m16 = A.node_mu[f] != nullptr;
@@ -1381,10 +1384,10 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
     float z[PER];
 #pragma unroll
     for (int i = 0; i < PER; i++) z[i] = f_sz(sgn(A.kb[(i64)t * A.M * DH + lane + 32 * i]));
-    const int tot = (jb - ja) * nodes;
+    const int tot = n * nodes;
     for (int it = wid; it < tot; it += nw) {
         {
-            const int jj = ja + it / nodes, h = it - (it / nodes) * nodes;
+            const int jj = ja + ((it / nodes) << jsh), h = it - (it / nodes) * nodes;
             const int rb = base + jj * nodes;
             const int l = 31 - __clz(h + 1), idx = h + 1 - (1 << l), V = 1 << (k - l);
             if (m16) {
@@ -1425,7 +1428,17 @@ __device__ void empty_chunks(const Args& A, const int f, const int t, const int 
         }
     }
     i64* lt = A.leaf[f] + (i64)t * A.Ltot + lbase;
-    for (int e2 = threadIdx.x; e2 < (jb - ja) << k; e2 += blockDim.x) lt[(ja << k) + e2] = -1;
+    for (int e2 = threadIdx.x; e2 < n << k; e2 += blockDim.x)
+        lt[((ja + ((e2 >> k) << jsh)) << k) + (e2 & ((1 << k) - 1))] = -1;
+}
+
+// adm position of batch slot s: the slot's chunk i = s >> k of the batch is chunk j0 + (i << jsh)
+__device__ __forceinline__ int slot_pos(const int j0, const int k, const int jsh, const int s) {
+    return ((j0 + ((s >> k) << jsh)) << k) + (s & ((1 << k) - 1));
+}
+// the batch's chunks that are full (j0 + (i << jsh) < mt >> k, a prefix of the batch)
+__device__ __forceinline__ int batch_full(const int mt, const int k, const int j0, const int nsub, const int jsh) {
+    return max(0, min(((mt >> k) - j0 + (1 << jsh) - 1) >> jsh, nsub));
 }
 
 // rows of the 512 slots from S.cell (cell 0's row for -1 slots: finite filler, never recorded); all loads first
@@ -1453,15 +1466,15 @@ __device__ __forceinline__ void zb_of_row(const SM& S, const int ci, const int r
 // type 0, k <= 5: a batch of nsub chunks of height k, one warp per 32 slots
 template <bool LEAN = false>
 __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const int t, const int k, const int j0, const int nsub,
-                                         const bool fold) {
+                                         const int jsh, const bool fold) {
     extern __shared__ float smem[];
     const SM S = carve(smem);
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     const int M = A.M, has_sp = A.has_sp;
     const int mt = (int)A.mt[f][t];
-    const int nfull = max(0, min((mt >> k) - j0, nsub));
+    const int nfull = batch_full(mt, k, j0, nsub, jsh);
     const int jo = LEAN ? 0 : j0;
-    empty_chunks(A, f, t, k, jo + nfull, jo + nsub);
+    empty_chunks(A, f, t, k, jo + (nfull << jsh), nsub - nfull, jsh);
     const int gs0 = 32 * wid;
     if (gs0 >= (nfull << k)) return;
     Rec R;
@@ -1469,7 +1482,7 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
     R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
     R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
     R.leaf = A.leaf[f] + (i64)t * A.Ltot;
-    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo;
+    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo; R.jsh = jsh;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = min(k, 5);
     float* Xw = S.Xs + wid * 32 * XS;
@@ -1478,7 +1491,7 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
     u64 zb = 0;
     const int s = gs0 + lane;
     const bool ok = s < (nfull << k);
-    int cell = ok ? (int)A.adm[f][(i64)t * M + (j0 << k) + s] : -1;
+    int cell = ok ? (int)A.adm[f][(i64)t * M + slot_pos(j0, k, jsh, s)] : -1;
     float ce = ok ? A.ce[(i64)t * M + cell] : 0.0f;
     float sp = (ok && has_sp) ? A.spr[(i64)t * M + cell] : 0.0f;
     const float* kt = A.kb + (i64)t * M * DH + lane;
@@ -1530,27 +1543,27 @@ __device__ __forceinline__ void cw_phases(const int lv0, float (&x)[32][PER], co
 // type 0, 6 <= k <= 9: a batch of nsub chunks of height k (512 slots), C phase then W phase
 template <bool LEAN = false>
 __device__ __forceinline__ void task_cbatch(const Args& A, const int f, const int t, const int k, const int j0, const int nsub,
-                                         const bool fold) {
+                                         const int jsh, const bool fold) {
     extern __shared__ float smem[];
     const SM S = carve(smem);
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     const int M = A.M, has_sp = A.has_sp;
     const int mt = (int)A.mt[f][t];
-    const int nfull = max(0, min((mt >> k) - j0, nsub));
+    const int nfull = batch_full(mt, k, j0, nsub, jsh);
     const int jo = LEAN ? 0 : j0;
-    empty_chunks(A, f, t, k, jo + nfull, jo + nsub);
+    empty_chunks(A, f, t, k, jo + (nfull << jsh), nsub - nfull, jsh);
     if (nfull == 0) return;
     Rec R;
     R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
     R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
     R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
     R.leaf = A.leaf[f] + (i64)t * A.Ltot;
-    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo;
+    R.k = k; R.ks = k; R.l0 = 0; R.n0 = 0; R.jb = jo; R.jsh = jsh;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = nfull; R.zsh = 5;
     const int nrow = nfull << k;
     {
-        const int c = tid < nrow ? (int)A.adm[f][(i64)t * M + (j0 << k) + tid] : -1;
+        const int c = tid < nrow ? (int)A.adm[f][(i64)t * M + slot_pos(j0, k, jsh, tid)] : -1;
         S.cell[tid] = c;
         S.ce[tid] = c >= 0 ? A.ce[(i64)t * M + c] : 0.0f;
         S.sp[tid] = (c >= 0 && has_sp) ? A.spr[(i64)t * M + c] : 0.0f;
@@ -1580,7 +1593,7 @@ __device__ __forceinline__ void task_gnode(const Args& A, const int f, const int
     if (!full) {
         if (l0 == 0) {
             const int jo = LEAN ? 0 : j0;
-            empty_chunks(A, f, t, k, jo, jo + 1);
+            empty_chunks(A, f, t, k, jo, 1, 0);
         }
         return;
     }
@@ -1610,7 +1623,7 @@ __device__ __forceinline__ void task_sub(const Args& A, const int f, const int t
     R.node_mu = A.node_mu[f] != nullptr ? A.node_mu[f] + (i64)t * A.Ntot * DH : nullptr;
     R.node_aux = A.node_aux[f] != nullptr ? A.node_aux[f] + (i64)t * A.Ntot * NA : nullptr;
     R.leaf = A.leaf[f] + (i64)t * A.Ltot;
-    R.k = k; R.ks = 9; R.l0 = k - 9; R.n0 = n0; R.jb = LEAN ? 0 : j0;
+    R.k = k; R.ks = 9; R.l0 = k - 9; R.n0 = n0; R.jb = LEAN ? 0 : j0; R.jsh = 0;
     R.base = A.lay[k]; R.leafbase = A.lay[16 + k];
     R.nfull = 1; R.zsh = 5;
     {
@@ -1667,8 +1680,8 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
     const bool fold = (LAY[32] >> k) & 1;
     DBG_MARK(0);
     if (type == 0) {
-        if (k <= 5) task_wbatch<LEAN>(A, f, t, k, j0, nsub, fold);
-        else task_cbatch<LEAN>(A, f, t, k, j0, nsub, fold);
+        if (k <= 5) task_wbatch<LEAN>(A, f, t, k, j0, nsub, l0, fold);
+        else task_cbatch<LEAN>(A, f, t, k, j0, nsub, l0, fold);
     } else if (type == 1) {
         task_gnode<LEAN>(A, f, t, k, j0, l0, n0, fold, flag, dep);
     } else {
