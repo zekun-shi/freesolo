@@ -952,11 +952,40 @@ def build_forest(Kbar: torch.Tensor, ceil_c: torch.Tensor, admit: torch.Tensor, 
 
 
 _STATIC_CACHE = {}
+_STATIC_EVENTS = {}             # key -> (event, stream) of a cached table made on a block change's side stream
+_SIDE_PHASE = [False]           # fsb_decode_prepare_all's side streams are in flight
+
+
+def _static_get(key):
+    # a cached table (device index tensors and layouts shared by every forest); one that a block change's other side
+    # stream made is waited for first, since its kernels may still be writing it
+    hit = _STATIC_CACHE.get(key)
+    ev = _STATIC_EVENTS.get(key) if hit is not None and _STATIC_EVENTS else None
+    if ev is not None:
+        cur = torch.cuda.current_stream(ev[1].device)
+        if cur != ev[1]:
+            cur.wait_event(ev[0])
+    return hit
+
+
+def _static_put(key, value, dev=None):
+    # cache a table made on this stream (dev: its device, None for host values); while side streams are in flight the
+    # cache neither clears (another stream may still read an entry) nor hands an entry to another stream unordered
+    if len(_STATIC_CACHE) > 512 and not _SIDE_PHASE[0]:
+        _STATIC_CACHE.clear()
+        _STATIC_EVENTS.clear()
+    _STATIC_CACHE[key] = value
+    if _SIDE_PHASE[0] and dev is not None and torch.device(dev).type == "cuda":
+        st = torch.cuda.current_stream(dev)
+        ev = torch.cuda.Event()
+        ev.record(st)
+        _STATIC_EVENTS[key] = (ev, st)
+    return value
 
 
 def _static_chunk(k: int, Cmax: int, T: int, nbase: int, lbase: int, dev):
     key = ("chunk", k, Cmax, T, nbase, lbase, str(dev))
-    hit = _STATIC_CACHE.get(key)
+    hit = _static_get(key)
     if hit is not None:
         return hit
     size = 1 << k; nodes = 2 * size - 1
@@ -973,11 +1002,7 @@ def _static_chunk(k: int, Cmax: int, T: int, nbase: int, lbase: int, dev):
     off = lbase + j[:, None] * size + noff[None]
     blk = torch.stack([chl.float(), chr_.float(), torch.ones(Cmax, nodes, device=dev), off.float(),
                        nlen[None].expand(Cmax, -1).float()], dim=-1)
-    hit = {"static": blk, "cnt": nlen.float()}
-    if len(_STATIC_CACHE) > 512:
-        _STATIC_CACHE.clear()
-    _STATIC_CACHE[key] = hit
-    return hit
+    return _static_put(key, {"static": blk, "cnt": nlen.float()}, dev)
 
 
 def _chunk_tables(tr: dict, k: int, T: int, Cmax: int, cid, rows=slice(None), Kpad=None) -> dict:
@@ -1048,7 +1073,7 @@ def build_spines(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, out: dict | No
     K = F["Kmax"]; Dh = F["Dh"]; Nt = F["Ntot"]
     S = K + 1
     ckey = ("spine", S, tuple(sorted(F["bases"].items())), tuple(sorted(F["nodes_per"].items())), str(dev))
-    consts = _STATIC_CACHE.get(ckey)
+    consts = _static_get(ckey)
     if consts is None:
         hk = torch.tensor([k in F["bases"] for k in range(S)], device=dev)
         consts = (torch.arange(S, device=dev),
@@ -1056,7 +1081,7 @@ def build_spines(F: dict, m_b: torch.Tensor, t_idx: torch.Tensor, out: dict | No
                   torch.tensor([F["nodes_per"].get(k, 1) for k in range(S)], device=dev),
                   hk,
                   hk.to(torch.int8))
-        _STATIC_CACHE[ckey] = consts
+        _static_put(ckey, consts, dev)
     if m_b.is_cuda:
         from .fsb_build_fast import build_spines_fast, fast_spines_ok
         if fast_spines_ok(F, m_b):
@@ -1419,6 +1444,9 @@ class ForestCache:
         self._async_next = False          # the next ingest decides its dirty chunks on the device (FSB_DECODE_ASYNC)
         self._rb = None                   # (pinned host copy, row, event, device source) of such an ingest's counts
         self._eff_open = False            # that ingest's budgets may differ from the host's height key's
+        self._fold_rows = {}              # height -> the fold flag the arena's rows of that height were built with
+        self._fold_pend = None            # (fold mask, heights) of an async ingest, applied to _fold_rows when settled
+        self._meta_m = None               # settled counts whose chunk metadata _meta_now derives when needed
         self._plan = None                 # the V3 fused read's per-row cache of its prefix walk (fsb_decode_cuda)
 
     def _get_tau32(self, tau):
@@ -1439,10 +1467,10 @@ class ForestCache:
         T = self.T
         nn = M_vis - self.n_seen
         rkey = ("arange_1d", nn, str(self.dev))
-        r = _STATIC_CACHE.get(rkey)
+        r = _static_get(rkey)
         if r is None:
             r = torch.arange(nn, device=self.dev)[None]
-            _STATIC_CACHE[rkey] = r
+            _static_put(rkey, r, self.dev)
         ce = ceil_all[:, :, self.n_seen:M_vis].reshape(T, -1).float()
         ids = self.n_seen + r
         adm_new = ce >= tau.view(T, 1)
@@ -1506,7 +1534,7 @@ class ForestCache:
         emp = self._get_emp_buf(Kbar_all)
         ks_t = tuple(ks)
         ckey = ("pack_lean_fast", F_cuda["Ntot"], F_cuda["Ltot"], ks_t, str(self.dev))
-        idx_c = _STATIC_CACHE.get(ckey)
+        idx_c = _static_get(ckey)
         if idx_c is None:
             dev = self.dev
             k_n = torch.cat([torch.full((2 * (1 << k) - 1,), k, dtype=torch.int32, device=dev) for k in ks_t])
@@ -1520,7 +1548,7 @@ class ForestCache:
             u_l = torch.cat([torch.arange(1 << k, dtype=torch.int32, device=dev) for k in ks_t])
             dst_l = torch.cat([torch.arange((1 << k) - 1, (1 << k) - 1 + (1 << k), dtype=torch.int32, device=dev) for k in ks_t])
             idx_c = (k_n, base_n, str_n, u_n, dst_n, k_l, base_l, str_l, u_l, dst_l)
-            _STATIC_CACHE[ckey] = idx_c
+            _static_put(ckey, idx_c, self.dev)
         from .fsb_build_fast import pack_lean_chunks_fast
         return pack_lean_chunks_fast(self, F_cuda, emp, Kmax, idx_c)
 
@@ -1540,7 +1568,7 @@ class ForestCache:
         self._ensure_lean_arena(F["Kmax"])
         ks_t = tuple(F["ks"])
         lkey = ("lean_lay", ks_t)
-        lay = _STATIC_CACHE.get(lkey)
+        lay = _static_get(lkey)
         if lay is None:
             bases, leafbases, nodes_per, Cmaxs = {}, {}, {}, {}
             for k in ks_t:
@@ -1551,7 +1579,7 @@ class ForestCache:
                 nodes_per[k] = nodes
                 Cmaxs[k] = 1
             lay = (bases, leafbases, nodes_per, Cmaxs)
-            _STATIC_CACHE[lkey] = lay
+            _static_put(lkey, lay)
         bases, leafbases, nodes_per, Cmaxs = lay
         contig = F["chunks"].get("_contig")
         if contig is not None:
@@ -1731,7 +1759,7 @@ class ForestCache:
         T, Dh, dev = self.T, self.Dh, self.dev
         ks_t = tuple(ks)
         ckey = ("chunk_all", F_cuda["Ntot"], F_cuda["Ltot"], ks_t, str(dev))
-        idx_c = _STATIC_CACHE.get(ckey)
+        idx_c = _static_get(ckey)
         if idx_c is None:
             k_n = torch.cat([torch.full((2 * (1 << k) - 1,), k, dtype=torch.long, device=dev) for k in ks_t])
             base_n = torch.cat([torch.full((2 * (1 << k) - 1,), F_cuda["bases"][k], dtype=torch.long, device=dev) for k in ks_t])[None]
@@ -1742,7 +1770,7 @@ class ForestCache:
             str_l = torch.cat([torch.full((1 << k,), 1 << k, dtype=torch.long, device=dev) for k in ks_t])[None]
             u_l = torch.cat([torch.arange(1 << k, device=dev) for k in ks_t])[None]
             idx_c = (k_n, base_n, str_n, u_n, k_l, base_l, str_l, u_l)
-            _STATIC_CACHE[ckey] = idx_c
+            _static_put(ckey, idx_c, self.dev)
         k_n, base_n, str_n, u_n, k_l, base_l, str_l, u_l = idx_c
         nrs = base_n + jbase[:, k_n] * str_n + u_n
         lrs = base_l + jbase[:, k_l] * str_l + u_l
@@ -1776,11 +1804,14 @@ class ForestCache:
         # from the new counts is the same for every count the append can produce (each head gains at most the
         # M_vis - n_seen new cells): Kmax, no chunk taller than DIRTY_KMAX moves and, where it decides whether the
         # layer reads (need_live), the forest is live already. Called before the append.
-        from .fsb_build_cuda import DIRTY_KMAX
+        from .fsb_build_cuda import DIRTY_KMAX, _failed, _variant, build_cuda_on
         m = self._m_known
         if (m is None or self.F is None or not (self.fast and self.lean) or self._task_buf is None
                 or self._sp_stable is None or self._jbase_buf is None or self._rb is not None):
             return False
+        idx = torch.device(self.dev).index
+        if not build_cuda_on() or _variant(torch.cuda.current_device() if idx is None else idx, self.Dh) in _failed:
+            return False                                # no CUDA build: the device cannot rebuild the chunks
         dm = M_vis - self.n_seen
         if dm <= 0 or (need_live and max(m) <= 0):
             return False
@@ -1810,20 +1841,25 @@ class ForestCache:
         # bits) and rebuilds the spines, with no host read. The host-side state the counts determine follows one block
         # late (_settle); until then it holds values the checks proved equal to the exact ones (Kmax, liveness, the
         # budget keys) or that only the exact path reads (_lean_meta, F's height list). False: nothing launched.
-        from .fsb_build_cuda import lean_dirty_build
+        from .fsb_build_cuda import DIRTY_KMAX, lean_dirty_build, lean_fold_mask
         T, dev = self.T, self.dev
         if not Kbar_all.is_cuda or torch.cuda.is_current_stream_capturing() or self._mc_buf is None:
             return False
         Kmax = self.F["Kmax"]
         sp_out = self._sp_stable
         M_pad = max(512, 1 << (M_vis - 1).bit_length())
+        # a chunk that stays in place keeps its rows only at heights whose rows this layout's fold flag built (the
+        # host-decided ingest rebuilds every chunk of a dirty height with the current flag)
+        fold, nk = lean_fold_mask(M_pad), min(Kmax, DIRTY_KMAX) + 1
+        skip = sum(1 << k for k in range(nk) if self._fold_rows.get(k) == (fold >> k) & 1)
         lean_arg = (self._arena_mu, self._arena_aux, self._leaf_arena, self.adm, self.m_tot, self._jbase_buf, Kmax,
                     M_pad, sp_out["node"], sp_out["root"], sp_out["height"], self._task_buf)
         Kbar, ceil_c, spread_c = self._forest_inputs(Kbar_all, ceil_all, M_vis, spread_all, lean_arg)
         if self._zero_e is None:
             self._zero_e = torch.zeros(1, dtype=torch.long, device=dev)
         try:
-            ok = lean_dirty_build(Kbar, ceil_c, spread_c, [self._get_tau32(tau)], self._zero_e, self._mc_nn, lean_arg)
+            ok = lean_dirty_build(Kbar, ceil_c, spread_c, [self._get_tau32(tau)], self._zero_e, self._mc_nn, lean_arg,
+                                  skip_mask=skip)
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception as e:                                  # the host-decided path builds this block instead
@@ -1832,6 +1868,7 @@ class ForestCache:
             return False
         if not ok:
             return False
+        self._fold_pend = (fold, nk)
         sp_out["m_b"] = self.m_tot
         sp_out["t_idx"] = self._t_idx_rows()
         F = dict(self.F)
@@ -1847,30 +1884,46 @@ class ForestCache:
         self._m_known = None
         return True
 
-    def _settle(self):
-        # the counts an async ingest left on the device, read one block later (their copy has long completed): the
-        # host state the host-decided ingest derives from them (m_tot per head, _m_max_h, _height_h, the per-height
-        # chunk metadata the next host-decided ingest compares against, F's height list and layout tables)
-        host, i, ev, _ = self._rb
+    def _settle(self, row=None):
+        # the counts an async ingest left on the device, read one block later (their copy has long completed; row: this
+        # forest's (admitted, m_tot) lists when _settle_all read them for every forest at once): m_tot per head,
+        # _m_max_h and _height_h, the fold flags of the heights the device rebuilt, and the counts the next
+        # host-decided ingest derives its chunk metadata from (_meta_m)
+        if row is None:
+            host, i, ev, _ = self._rb
+            ev.synchronize()
+            row = host[i].tolist()
         self._rb = None
-        ev.synchronize()
-        nn_h, m_h = host[i].tolist()
+        nn_h, m_h = row
         self._m_known = list(m_h)
         self._m_max_h = max(m_h)
         self._height_h = tuple((mi - 1).bit_length() if mi > 1 else 0 for mi in m_h)
-        if not any(nn_h):
-            return
-        Kmax = self.F["Kmax"]
+        if self._fold_pend is not None:
+            # the heights fsb_prep_lean_dirty found dirty: every chunk row there now carries that ingest's fold flag
+            fold, nk = self._fold_pend
+            self._fold_pend = None
+            m0_h = [mi - ni for mi, ni in zip(m_h, nn_h)]
+            for k in range(nk):
+                h1 = [(mi >> k) & 1 for mi in m_h]
+                h0 = [(mi >> k) & 1 for mi in m0_h]
+                moved = any(a != b or (a and (x >> (k + 1)) != (y >> (k + 1)))
+                            for a, b, x, y in zip(h1, h0, m_h, m0_h))
+                if any(h1) and (not any(h0) or moved):
+                    self._fold_rows[k] = (fold >> k) & 1
+        if any(nn_h):
+            self._meta_m = list(m_h)
+
+    def _meta_now(self):
+        # _lean_meta (per height: each head's chunk index and presence) of the counts a settled async ingest left, for
+        # the host-decided ingest's comparison; derived only when that ingest runs
+        m_h, self._meta_m = self._meta_m, None
         meta = {}
-        for k in range(Kmax + 1):
+        for k in range(self.F["Kmax"] + 1):
             bits = [(mi >> k) & 1 for mi in m_h]
             if any(bits):
                 meta[k] = (tuple(((mi >> (k + 1)) << 1) if b else 0 for mi, b in zip(m_h, bits)),
                            tuple(bool(b) for b in bits))
         self._lean_meta = meta
-        self.F["ks"] = sorted(meta)
-        self.F["chunks"] = {}
-        self._pack_lean(self.F, set())
 
     @torch.no_grad()
     def _ingest_lean(self, Kbar_all, ceil_all, M_vis, tau, spread_all=None):
@@ -1930,8 +1983,11 @@ class ForestCache:
             for k in ks_n:
                 meta[k] = (tuple(row[k] for row in jb_h), tuple(bool(row[k]) for row in bits_h))
             if old is not None:
+                if self._meta_m is not None:
+                    self._meta_now()
                 reuse = {k: self._lean_meta.get(k) == meta[k] for k in ks_n if k in self._lean_meta}
             dset = [k for k in ks_n if not reuse.get(k, False)]
+            built = list(dset)
             if dset:
                 # one partial build of this forest's own dirty chunks (the pair latch joined both taus' whole-forest
                 # builds; the chunk build is cheap enough to run per forest, and each forest's aligned chunks differ
@@ -1982,10 +2038,21 @@ class ForestCache:
                     dirty.update(dset)
                     dset = []
             ks_loop = dset
+            if built:
+                # the fold flags the CUDA builds of this ingest's layout used, per rebuilt height (the per-level
+                # builder below has its own numerics: unknown there), for _ingest_async's reuse of unmoved chunks
+                from .fsb_build_cuda import lean_fold_mask
+                fold = lean_fold_mask(max(512, 1 << (M_vis - 1).bit_length()))
+                for k in built:
+                    if k in ks_loop:
+                        self._fold_rows.pop(k, None)
+                    else:
+                        self._fold_rows[k] = (fold >> k) & 1
         else:
             jbase = torch.tensor(jb_h, dtype=torch.long, device=dev)
             bits = torch.tensor(bits_h, dtype=torch.bool, device=dev).t()
             ks_loop = range(Kmax + 1)
+            self._fold_rows = {}
         for k in ks_loop:
             if not need[k]:
                 continue
@@ -2990,6 +3057,24 @@ def _budgets_on_device(attn, fc, utau, tk, ukw, uw: int) -> bool:
     return True
 
 
+def _budget_key(attn, fc):
+    # _forest_budgets' host key of the fixed policy's per-head budgets, from the heights the host holds for the layer's
+    # main and union forests: (key, the main forest's (W, delta, union W) per head, the union forest's (W, delta)), or
+    # None where it holds none
+    utau = getattr(fc, "utau", None)
+    h_main = getattr(fc, "_height_h", None) if getattr(fc, "lean", False) else None
+    h_utau = (getattr(utau, "_height_h", None) if getattr(utau, "lean", False) else None) if utau is not None else ()
+    if h_main is None or h_utau is None:
+        return None
+    d_cfg = int(attn.fsb_delta)
+    w_cfg = int(attn.fsb_width)
+    uw_cfg = int(getattr(attn, "fsb_union_width", 0) or 0)
+    eff_main = tuple((min(w_cfg, 1 << max(0, h - d_cfg)), min(h, d_cfg), min(uw_cfg, 1 << max(0, h - d_cfg)))
+                     for h in h_main)
+    eff_utau = tuple((min(uw_cfg, 1 << max(0, h - d_cfg)), min(h, d_cfg)) for h in h_utau)
+    return (eff_main, eff_utau), eff_main, eff_utau
+
+
 @torch.no_grad()
 def _forest_budgets(attn, fc, B, H, dev):
     # _forest_token's per-block traversal state of the fixed policy (query-independent: the block's spines, the
@@ -3007,65 +3092,63 @@ def _forest_budgets(attn, fc, B, H, dev):
     if tk is not None and tk["key"] == key:
         return tk
     utau = getattr(fc, "utau", None)
-    h_main = getattr(fc, "_height_h", None) if getattr(fc, "lean", False) else None
-    h_utau = (getattr(utau, "_height_h", None) if getattr(utau, "lean", False) else None) if utau is not None else ()
     cfg_key = key[1:] + (union_tau_on(attn),)
-    if h_main is not None and h_utau is not None:
-        d_cfg = int(attn.fsb_delta)
-        w_cfg = int(attn.fsb_width)
-        uw_cfg = int(getattr(attn, "fsb_union_width", 0) or 0)
-        eff_main = tuple((min(w_cfg, 1 << max(0, h - d_cfg)), min(h, d_cfg), min(uw_cfg, 1 << max(0, h - d_cfg))) for h in h_main)
-        eff_utau = tuple((min(uw_cfg, 1 << max(0, h - d_cfg)), min(h, d_cfg)) for h in h_utau)
-        h_key = (eff_main, eff_utau)
-    else:
-        h_key = None
+    uw_cfg = int(getattr(attn, "fsb_union_width", 0) or 0)
+    got = _budget_key(attn, fc)
+    h_key, eff_main, eff_utau = got if got is not None else (None, None, None)
+    # FSB_DECODE_ASYNC's device-decided ingests leave the host's heights one block old; eff_open: this block's budgets
+    # may differ from the ones those heights give, so only the spines' heights on the device decide them
+    eff_open = getattr(fc, "_eff_open", False) or (utau is not None and getattr(utau, "_eff_open", False))
     if tk is not None and h_key is not None and tk.get("_cfg_key") == cfg_key:
         ukw = tk.get("ukw")
         if ukw and utau is not None:
             ukw["union_F"] = utau.F
             ukw["union_SP"] = utau.SP
-        eff_open = getattr(fc, "_eff_open", False) or (utau is not None and getattr(utau, "_eff_open", False))
         if tk.get("_h_key") == h_key and not eff_open:
             tk["key"] = key
             return tk
-        if os.environ.get("FSB_DECODE_ASYNC", "0") == "1" and _budgets_on_device(attn, fc, utau, tk, ukw, uw_cfg):
+        if getattr(fc, "_async_block", False) and _budgets_on_device(attn, fc, utau, tk, ukw, uw_cfg):
             # the heights may be one block old on the host (or the new budgets unknown to it): the device computes
-            # them, and the host key is known again once the counts are read back
+            # them, and the host key is known again once the counts are read back (fsb_decode_prepare_all restores it
+            # from the settled heights at the next block change)
             tk["key"] = key
             tk["_h_key"] = None if eff_open else h_key
             tk["_eff_main"] = None if eff_open else eff_main
             tk["_eff_utau"] = None if eff_open else eff_utau
+            tk["_h_open"] = eff_open
             return tk
-        if tk.get("_eff_main") != eff_main:
-            tk["W"].copy_(torch.tensor([[w_t] for w_t, _, _ in eff_main], dtype=torch.long))
-            tk["delta"].copy_(torch.tensor([[d_t] for _, d_t, _ in eff_main], dtype=torch.long))
-            tk["bud"].copy_(torch.tensor([[1 << d_t] for _, d_t, _ in eff_main], dtype=torch.long))
-        if uw_cfg > 0:
-            if utau is not None and union_tau_on(attn):
-                if ukw is None:
-                    ukw = {"union_F": utau.F, "union_SP": utau.SP}
-                if tk.get("_eff_utau") != eff_utau or "union_delta" not in ukw or "union_W" not in ukw:
-                    du_c = torch.tensor([[du_t] for _, du_t in eff_utau], dtype=torch.long)
-                    uw_c = torch.tensor([[uw_t] for uw_t, _ in eff_utau], dtype=torch.long)
-                    bu_c = torch.tensor([[1 << du_t] for _, du_t in eff_utau], dtype=torch.long)
-                    if "union_delta" in ukw:
-                        ukw["union_delta"].copy_(du_c)
-                    else:
-                        ukw["union_delta"] = du_c.to(dev)
-                    if "union_W" in ukw:
-                        ukw["union_W"].copy_(uw_c)
-                    else:
-                        ukw["union_W"] = uw_c.to(dev)
-                    tk["bud_u"].copy_(bu_c)
-                tk["ukw"] = ukw
-            elif tk.get("_eff_main") != eff_main and tk.get("union_W") is not None:
-                tk["union_W"].copy_(torch.tensor([[uw_t] for _, _, uw_t in eff_main], dtype=torch.long))
-                tk["bud_u"].copy_(torch.tensor([[1 << d_t] for _, d_t, _ in eff_main], dtype=torch.long))
-        tk["key"] = key
-        tk["_h_key"] = h_key
-        tk["_eff_main"] = eff_main
-        tk["_eff_utau"] = eff_utau
-        return tk
+        if not eff_open:
+            if tk.get("_eff_main") != eff_main:
+                tk["W"].copy_(torch.tensor([[w_t] for w_t, _, _ in eff_main], dtype=torch.long))
+                tk["delta"].copy_(torch.tensor([[d_t] for _, d_t, _ in eff_main], dtype=torch.long))
+                tk["bud"].copy_(torch.tensor([[1 << d_t] for _, d_t, _ in eff_main], dtype=torch.long))
+            if uw_cfg > 0:
+                if utau is not None and union_tau_on(attn):
+                    if ukw is None:
+                        ukw = {"union_F": utau.F, "union_SP": utau.SP}
+                    if tk.get("_eff_utau") != eff_utau or "union_delta" not in ukw or "union_W" not in ukw:
+                        du_c = torch.tensor([[du_t] for _, du_t in eff_utau], dtype=torch.long)
+                        uw_c = torch.tensor([[uw_t] for uw_t, _ in eff_utau], dtype=torch.long)
+                        bu_c = torch.tensor([[1 << du_t] for _, du_t in eff_utau], dtype=torch.long)
+                        if "union_delta" in ukw:
+                            ukw["union_delta"].copy_(du_c)
+                        else:
+                            ukw["union_delta"] = du_c.to(dev)
+                        if "union_W" in ukw:
+                            ukw["union_W"].copy_(uw_c)
+                        else:
+                            ukw["union_W"] = uw_c.to(dev)
+                        tk["bud_u"].copy_(bu_c)
+                    tk["ukw"] = ukw
+                elif tk.get("_eff_main") != eff_main and tk.get("union_W") is not None:
+                    tk["union_W"].copy_(torch.tensor([[uw_t] for _, _, uw_t in eff_main], dtype=torch.long))
+                    tk["bud_u"].copy_(torch.tensor([[1 << d_t] for _, d_t, _ in eff_main], dtype=torch.long))
+            tk["key"] = key
+            tk["_h_key"] = h_key
+            tk["_eff_main"] = eff_main
+            tk["_eff_utau"] = eff_utau
+            return tk
+        # eff_open without device budgets: the recompute below takes the heights from the spines on the device
     head_id = torch.arange(H, device=dev)[None, :].expand(B, H).reshape(T)
     lam = attn.sel_scale.float()[head_id].view(T, 1, 1)
     sig = attn.sigma
@@ -3114,6 +3197,8 @@ def _forest_budgets(attn, fc, B, H, dev):
     tk["ukw"] = ukw
     tk["key"] = key
     tk["_cfg_key"] = cfg_key
+    h_key = None if eff_open else h_key                   # the host's heights describe another block's budgets
+    tk["_h_open"] = eff_open
     tk["_h_key"] = h_key
     tk["_eff_main"] = h_key[0] if h_key is not None else None
     tk["_eff_utau"] = h_key[1] if h_key is not None else None
@@ -3223,7 +3308,8 @@ def _async_go(fc, attn, M_vis: int, union: bool, main_live: bool) -> bool:
 
 def _async_readback(forests: list):
     # the admitted counts and m_tot of this block's device-decided ingests, copied to pinned host memory behind them on
-    # the stream; each forest settles its copy at its next ingest, when the copy has long completed
+    # the stream; the next block change settles them all with one wait and one read (_settle_all), when the copy has
+    # long completed
     if not forests:
         return
     src = torch.stack([f._mc_buf for f in forests])
@@ -3233,6 +3319,20 @@ def _async_readback(forests: list):
     ev.record()
     for i, f in enumerate(forests):
         f._rb = (host, i, ev, src)
+
+
+def _settle_all(forests: list):
+    # _settle for every forest with a pending readback: one event wait and one host read per readback copy
+    groups: dict = {}
+    for f in forests:
+        if f is not None and f._rb is not None:
+            groups.setdefault(id(f._rb[0]), []).append(f)
+    for fs in groups.values():
+        host, _, ev, _ = fs[0]._rb
+        ev.synchronize()
+        rows = host.tolist()
+        for f in fs:
+            f._settle(rows[f._rb[1]])
 
 
 _PREP_STREAMS: dict = {}
@@ -3247,6 +3347,24 @@ def _prep_streams(dev) -> list:
     return ss
 
 
+def _layer_caps(attn, cache, fc, pos):
+    # fsb_decode_prepare's capacity bookkeeping of a layer's forest (m_cap, k_cap from the KV reserve and the graph's
+    # cell bound) -> (block start, visible cells, ceilings) of the block at pos, (None, 0, None) without completed cells
+    s = attn.cell_stride
+    if fc.fast and fc.lean and getattr(cache, "_k_buf", None) is not None:
+        fc.m_cap = max(fc.m_cap, cache._k_buf.shape[2] // s)
+    if fc.fast and fc.lean and getattr(cache, "_qk_buf", None) is not None:
+        fc.m_cap = max(fc.m_cap, cache._qk_buf.shape[2] // s)
+    g_cap = getattr(cache, "_fsb_graph_m_cap", 0)
+    if fc.fast and fc.lean and g_cap > 0:
+        fc.m_cap = max(fc.m_cap, g_cap)
+        fc.k_cap = max(fc.k_cap, int(math.floor(math.log2(max(g_cap, 1)))))
+    blk_start = (pos // attn._cell_block) * attn._cell_block
+    _, ceil_all, ncell = cache.completed_cells()
+    M_vis = min(blk_start // s, ncell) if ncell > 0 else 0
+    return blk_start, M_vis, ceil_all
+
+
 @torch.no_grad()
 def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
     # fsb_decode_prepare for every layer at a block change, the newly completed cells appended to all forests first and
@@ -3254,15 +3372,44 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
     # this block's counts on the host (_async_go) skip that read and decide their chunk rebuilds on the device, so the
     # block change enqueues behind the decode steps still running instead of waiting for them; and the layers' updates
     # (independent forests) run on side streams forked from this stream after the steps before the block and joined
-    # back before the next one, so their many small kernels overlap
+    # back before the next one, so their many small kernels overlap. A block in which some forest needs its counts on
+    # the host takes that read for every forest: it waits for the queue anyway
     T = B * H
     async_on = os.environ.get("FSB_DECODE_ASYNC", "0") == "1"
+    capturing = torch.device(dev).type == "cuda" and torch.cuda.is_current_stream_capturing()
+    forests = []
+    for cache in caches:
+        fc = getattr(cache, "_fsb_forest", None)
+        if fc is None:
+            fc = ForestCache(T, Dh, dev, lean=os.environ.get("FSB_DECODE_LEAN", "1") == "1")
+            cache._fsb_forest = fc
+        fc._async_block = async_on
+        forests.append(fc)
+    # the previous block's device-decided counts, read together; the budgets the device wrote then are those of the
+    # heights now known (_budget_key), so a block whose budgets cannot change skips them again
+    _settle_all([g for fc in forests for g in (fc, fc.utau)])
+    for attn, fc in zip(attns, forests):
+        tk = getattr(fc, "_tok", None)
+        if tk is not None and tk.get("_h_open") and tk.get("_h_key") is None:
+            got = _budget_key(attn, fc)
+            if got is not None:
+                tk["_h_key"], tk["_eff_main"], tk["_eff_utau"] = got
+            tk["_h_open"] = False
     main = streams = None
-    if async_on and torch.device(dev).type == "cuda" and not torch.cuda.is_current_stream_capturing():
+    if async_on and not capturing:
         main = torch.cuda.current_stream(dev)
+        # the shared static chunk tables (count and child columns of every height a lean arena may grow to this block)
+        # made on this stream before the fork, so no side stream reads one another stream is still writing
+        kmax = 0
+        for attn, cache, fc in zip(attns, caches, forests):
+            _, M_vis, _ = _layer_caps(attn, cache, fc, pos)
+            kmax = max(kmax, max(fc.m_cap, M_vis, 1).bit_length() - 1, fc.F["Kmax"] if fc.F is not None else 0)
+        for k in range(kmax + 1):
+            _static_chunk(k, 1, T, (2 << k) - k - 2, (1 << k) - 1, dev)
         streams = _prep_streams(dev)
         for st in streams:
             st.wait_stream(main)
+        _SIDE_PHASE[0] = True
 
     def on_side(i):
         return torch.cuda.stream(streams[i % len(streams)]) if streams else contextlib.nullcontext()
@@ -3272,27 +3419,13 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
             for st in streams:
                 main.wait_stream(st)
     staged, on_device = [], []
-    for li, (attn, cache) in enumerate(zip(attns, caches)):
-        with on_side(li):
-            s = attn.cell_stride
-            Bq = attn._cell_block
-            blk_start = (pos // Bq) * Bq
-            fc = getattr(cache, "_fsb_forest", None)
-            if fc is None:
-                fc = ForestCache(T, Dh, dev, lean=os.environ.get("FSB_DECODE_LEAN", "1") == "1")
-                cache._fsb_forest = fc
-            if fc.fast and fc.lean and getattr(cache, "_k_buf", None) is not None:
-                fc.m_cap = max(fc.m_cap, cache._k_buf.shape[2] // s)
-            if fc.fast and fc.lean and getattr(cache, "_qk_buf", None) is not None:
-                fc.m_cap = max(fc.m_cap, cache._qk_buf.shape[2] // s)
-            g_cap = getattr(cache, "_fsb_graph_m_cap", 0)
-            if fc.fast and fc.lean and g_cap > 0:
-                fc.m_cap = max(fc.m_cap, g_cap)
-                fc.k_cap = max(fc.k_cap, int(math.floor(math.log2(max(g_cap, 1)))))
-            if fc.fast and fc.lean and fc.blk_start != blk_start:
-                _, ceil_all, ncell = cache.completed_cells()
-                M_vis = min(blk_start // s, ncell) if ncell > 0 else 0
-                if M_vis > 0 and ceil_all.is_cuda and not torch.cuda.is_current_stream_capturing():
+    try:
+        for li, (attn, cache, fc) in enumerate(zip(attns, caches, forests)):
+            with on_side(li):
+                blk_start, M_vis, ceil_all = _layer_caps(attn, cache, fc, pos)
+                if not (fc.fast and fc.lean and fc.blk_start != blk_start):
+                    continue
+                if M_vis > 0 and ceil_all.is_cuda and not capturing:
                     if M_vis > fc.n_seen:
                         go = async_on and _async_go(fc, attn, M_vis, False, False)
                         tau_m = attn.fsb_tau.view(1, H).expand(B, H).reshape(T)
@@ -3307,6 +3440,7 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
                         fc.utau._pad_src = weakref.ref(fc)
                         fc.utau.m_cap = fc.m_cap
                         fc.utau.k_cap = fc.k_cap
+                        fc.utau._async_block = async_on
                         if M_vis > fc.utau.n_seen:
                             main_live = fc._m_known is not None and max(fc._m_known, default=0) > 0
                             go = async_on and _async_go(fc.utau, attn, M_vis, True, main_live)
@@ -3316,18 +3450,25 @@ def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
                                 (on_device if go else staged).append(fc.utau)
                             elif nnu is not None:
                                 fc.utau._pend_mc = (nnu.cpu().tolist(), fc.utau.m_tot.cpu().tolist())
-    if staged:
-        join()                                      # the counts were written on the side streams
-        all_mc = torch.stack([f._mc_buf for f in staged]).cpu().tolist()
-        for f, mc_val in zip(staged, all_mc):
-            f._pend_mc = mc_val
-    for f in on_device:
-        f._async_next = True
-    res = []
-    for li, (a, c) in enumerate(zip(attns, caches)):
-        with on_side(li):
-            res.append(fsb_decode_prepare(a, c, B, H, Dh, dev, pos))
-    join()
+        if staged:
+            # this read waits for the queue anyway: the forests that could have gone without it join it
+            staged += on_device
+            on_device = []
+            join()                                      # the counts were written on the side streams
+            all_mc = torch.stack([f._mc_buf for f in staged]).cpu().tolist()
+            for f, mc_val in zip(staged, all_mc):
+                f._pend_mc = mc_val
+                f._eff_open = False
+        for f in on_device:
+            f._async_next = True
+        res = []
+        for li, (a, c) in enumerate(zip(attns, caches)):
+            with on_side(li):
+                res.append(fsb_decode_prepare(a, c, B, H, Dh, dev, pos))
+        join()
+    finally:
+        _SIDE_PHASE[0] = False
+        _STATIC_EVENTS.clear()          # the join ordered every side stream's tables before this stream's later work
     for f in on_device:
         f._async_next = False
     # the forests that did ingest on the device (the others fell back to a host read: their m_tot is known again)

@@ -296,6 +296,15 @@ def _forest_tables(fc):
     return [t.clone() for t in out]
 
 
+def _bits(t):
+    # a tensor's bit pattern (NaN-safe, signed zeros distinct) for bit-for-bit comparisons
+    if t.dtype in (torch.bfloat16, torch.float16):
+        return t.view(torch.int16)
+    if t.dtype == torch.float32:
+        return t.view(torch.int32)
+    return t
+
+
 def _budget_tables(fc):
     # a layer's per-head beam budgets as the captured decode step reads them
     tk = fc._tok
@@ -306,27 +315,50 @@ def _budget_tables(fc):
 
 @gpu
 @torch.no_grad()
-@pytest.mark.parametrize("L,uq", [(1024, 0.5), (4096, 0.5), (1024, 0.97)])
-def test_async_block_change_matches_host_decided(monkeypatch, L, uq):
+@pytest.mark.parametrize("L,uq,dev_budgets,busy,mix", [(1024, 0.5, True, True, None), (4096, 0.5, True, True, None),
+                                                       (1024, 0.97, True, True, None), (1024, 0.97, False, True, None),
+                                                       (1024, 0.5, True, False, None),
+                                                       (1024, 0.5, True, True, "decline")])
+def test_async_block_change_matches_host_decided(monkeypatch, L, uq, dev_budgets, busy, mix):
     # FSB_DECODE_ASYNC=1: a block change whose counts the host provably does not need appends, decides the dirty chunk
-    # heights on the device and rebuilds them with no synchronizing call (checked with torch's sync debug mode); across
-    # many teacher-forced block changes every forest table, the beam budgets, the read cells and the logits equal the
-    # host-decided path's bit for bit, and the host state that follows one block late (counts, chunk metadata, height
-    # list) agrees. uq: the union forest's threshold quantile (0.97: a few cells per head, so the beam widths grow
-    # during the decode and are recomputed on the device)
+    # heights on the device and rebuilds them with no synchronizing call (checked with torch's sync debug mode, with
+    # earlier work still queued on the stream: busy); across many teacher-forced block changes every forest table, the
+    # beam budgets, the read cells and the logits equal the host-decided path's bit for bit, and the host state that
+    # follows one block late (counts, chunk metadata, height list) agrees. uq: the union forest's threshold quantile
+    # (0.97: a few cells per head, so the beam widths grow during the decode and are recomputed on the device).
+    # dev_budgets False: the device cannot write the budgets in place (_budgets_on_device declines) while the host's
+    # heights are a block old, so they are recomputed from the spines' heights on the device, never from the stale host
+    # heights. busy False: the stream is idle at every block change (a loop that synchronises every token). mix
+    # "decline": every other device-decided ingest declines (its forest reads its counts and takes the host-decided
+    # path inside a block whose other forests stay on the device), so blocks mix the two paths (no sync guard then)
     from src.fsattn import fsb_build_cuda as fbc
+    from src.fsattn import fsb_tree as ft
     m = _model(monkeypatch, L, n_layers=2)
     prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(101)).cuda()
     forced = torch.randint(0, 512, (700,), generator=torch.Generator().manual_seed(103)).cuda()
     monkeypatch.setenv("FSB_DECODE_V2", "1")
     monkeypatch.setenv("FSB_DECODE_FORK", "1")
     ran, real = [], fbc.lean_dirty_build
-    monkeypatch.setattr(fbc, "lean_dirty_build", lambda *a: ran.append(real(*a)) or ran[-1])
+
+    def spy_build(*a, **k):
+        ran.append(False if mix == "decline" and len(ran) % 2 else real(*a, **k))
+        return ran[-1]
+    monkeypatch.setattr(fbc, "lean_dirty_build", spy_build)
+    opened, real_bud = [], ft._forest_budgets
+
+    def spy_budgets(attn, fc, *a):
+        u = getattr(fc, "utau", None)
+        opened.append(bool(fc._eff_open or (u is not None and u._eff_open)))
+        return real_bud(attn, fc, *a)
+    monkeypatch.setattr(ft, "_forest_budgets", spy_budgets)
+    if not dev_budgets:
+        monkeypatch.setattr(ft, "_budgets_on_device", lambda *a, **k: False)
     restore = _taus(m)
     runs = {}
     for asy in ("0", "1"):
         monkeypatch.setenv("FSB_DECODE_ASYNC", asy)
         ran.clear()
+        opened.clear()
         restore()
         gd = _decoder(m, prompt, len(forced))
         if uq != 0.5:
@@ -335,13 +367,16 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq):
         logits, sels, tabs = [], [], []
         for i, t in enumerate(forced):
             gd.next_tok = t.view(1)
-            if asy == "1" and i > 0 and gd.pos % gd.Bq == 0:
-                torch.cuda.set_sync_debug_mode("error")
+            if asy == "1" and i > 0 and gd.pos % gd.Bq == 0 and busy:
+                torch.cuda._sleep(20_000_000)                # earlier work still queued when the block changes
+                torch.cuda.set_sync_debug_mode("error" if mix != "decline" else "default")
                 try:
                     gd.step()
                 finally:
                     torch.cuda.set_sync_debug_mode("default")
             else:
+                if gd.pos % gd.Bq == 0:
+                    torch.cuda.synchronize()
                 gd.step()
             logits.append(gd.static_logits.float().clone())
             sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
@@ -354,17 +389,147 @@ def test_async_block_change_matches_host_decided(monkeypatch, L, uq):
             for f in (c._fsb_forest, c._fsb_forest.utau):
                 if f._rb is not None:
                     f._settle()
-                host.append((list(f._m_known), f._lean_meta, list(f.F["ks"]), f._height_h, f._m_max_h))
+                if f._meta_m is not None:
+                    f._meta_now()                            # the chunk metadata the next host-decided ingest compares
+                host.append((list(f._m_known), f._lean_meta, f._height_h, f._m_max_h, dict(f._fold_rows)))
         runs[asy] = (torch.stack(logits), torch.stack(sels), tabs, host)
-        assert (len(ran) > 0 and all(ran)) == (asy == "1"), (asy, ran)
+        if mix == "decline":
+            assert (asy == "1") == (any(ran) and not all(ran)), (asy, ran)
+        else:
+            assert (len(ran) > 0 and all(ran)) == (asy == "1"), (asy, ran)
+        assert any(opened) if (asy == "1" and uq == 0.97) else (asy == "1" or not any(opened)), opened
     (l0, s0, t0, h0), (l1, s1, t1, h1) = runs["0"], runs["1"]
     assert len(t0) == len(t1) >= 5
     for a, b in zip(t0, t1):
         for fa, fb in zip(a, b):
-            assert all(torch.equal(x, y) for x, y in zip(fa, fb))
+            assert all(torch.equal(_bits(x), _bits(y)) for x, y in zip(fa, fb))
     assert h0 == h1
     assert torch.equal(s0, s1) and (s0 >= 0).float().mean() > 0.9
     assert torch.equal(l0, l1)
+
+
+def _ingests(Kbar, ceil, tau, m_cap, seq, asy):
+    # one decode forest through the ingests of seq (visible cell counts, the first one host-decided): FSB_DECODE_ASYNC's
+    # device-decided ingest wherever it qualifies (asy), else the host-decided one; every table after each ingest, the
+    # settled host state at the end, and the visible counts of the ingests that went to the device
+    from src.fsattn.fsb_tree import ForestCache, _async_readback
+    T, Dh = Kbar.shape[1], Kbar.shape[3]
+    fc = ForestCache(T, Dh, Kbar.device, lean=True)
+    fc.m_cap, fc.k_cap = m_cap, m_cap.bit_length() - 1
+    tabs, on_dev = [], []
+    for M_vis in seq:
+        if asy and fc.F is not None:
+            if fc._rb is not None:
+                fc._settle()
+            if fc._async_ready(M_vis, need_live=True):
+                assert fc._append_admitted(ceil, M_vis, tau) is fc._mc_nn
+                fc._async_next = True
+                on_dev.append(M_vis)
+        fc.ingest(Kbar, ceil, M_vis, tau)
+        fc._stable_spines()
+        if asy and fc._m_known is None:
+            _async_readback([fc])
+        torch.cuda.synchronize()
+        tabs.append(_forest_tables(fc))
+    if fc._rb is not None:
+        fc._settle()
+    if fc._meta_m is not None:
+        fc._meta_now()
+    return tabs, (list(fc._m_known), fc._lean_meta, fc._height_h, dict(fc._fold_rows)), on_dev
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("zeros", [False, True])
+def test_async_ingest_rebuilds_chunks_under_a_new_fold_flag(monkeypatch, zeros):
+    # FSB_DECODE_ASYNC's device-decided ingest against the host-decided one when the layout's fold flag of a dirty
+    # height changes under a chunk that stays in place: the visible cells pass 512 (M_pad 512 -> 1024 turns height 9's
+    # flag on) while head 0 keeps its 512-cell chunk and head 1 completes one, so height 9 is dirty with head 0's chunk
+    # unmoved. The host path rebuilds that chunk with the new flag, so the device path must too (it keeps unmoved chunks
+    # only where their rows carry the launch's flag): every forest table, the spines, the chunk index table and the
+    # settled host state agree bit for bit at every ingest. zeros: head 0's first dimension is -0 in every cell but the
+    # chunk's first (+0), so each node without that cell sums to -0 there and the folded build's pad zero (the chunk's
+    # first cell's sign) makes its mean +0: the flag changes those rows, and rows kept from the old flag would differ
+    from src.fsattn import fsb_build_cuda as fbc
+    T, Dh, M_cap, dev = 16, 64, 544, torch.device("cuda")
+    g = torch.Generator(device="cuda").manual_seed(7)
+    Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
+    if zeros:
+        Kbar[0, 0, :, 0] = -0.0
+        Kbar[0, 0, 0, 0] = 0.0
+    ceil = torch.rand(1, T, M_cap, device=dev, generator=g) + 0.5
+    ceil[0, 1, 100] = -1.0                                  # head 1 admits 511 of the first 512 cells
+    tau = torch.zeros(T, device=dev)
+    skips, real = [], fbc.lean_dirty_build
+    monkeypatch.setattr(fbc, "lean_dirty_build", lambda *a, **k: skips.append(k.get("skip_mask")) or real(*a, **k))
+    seq = (512, 516, 520, 524, 528)
+    t0, h0, _ = _ingests(Kbar, ceil, tau, M_cap, seq, False)
+    t1, h1, on_dev = _ingests(Kbar, ceil, tau, M_cap, seq, True)
+    assert on_dev == list(seq[1:]) and len(skips) == 4, (on_dev, skips)
+    assert not (skips[0] >> 9) & 1 and all((sk >> 9) & 1 for sk in skips[1:]), skips
+    for a, b in zip(t0, t1):
+        assert all(torch.equal(_bits(x), _bits(y)) for x, y in zip(a, b))
+    assert h0 == h1 and h1[3][9] == 1
+    m = t0[1][4]
+    assert m[0].item() == 516 and m[1].item() == 515      # head 0's chunk of height 9 stays, head 1's appears
+    if zeros:
+        # the flag matters for this input: the host rebuild at the new flag changed head 0's unmoved chunk rows
+        nb, nodes = 2 * (1 << 9) - 9 - 2, 2 * (1 << 9) - 1
+        assert not all(torch.equal(_bits(t0[0][i][0, nb:nb + nodes]), _bits(t0[1][i][0, nb:nb + nodes]))
+                       for i in (0, 1))
+
+
+@gpu
+@torch.no_grad()
+def test_async_ingest_needs_the_cuda_build(monkeypatch):
+    # FSB_DECODE_ASYNC: only the CUDA build rebuilds chunks on the device, so with FSB_BUILD_CUDA=0, or with its kernel
+    # variant failed to set up, a forest takes the host-decided ingest from the start (its counts in the block's one
+    # batched read) instead of a device-decided one that falls back to a read of its own
+    from src.fsattn import fsb_build_cuda as fbc
+    from src.fsattn.fsb_tree import ForestCache
+    T, Dh, M_cap, dev = 16, 64, 544, torch.device("cuda")
+    g = torch.Generator(device="cuda").manual_seed(5)
+    Kbar = torch.randn(1, T, M_cap, Dh, device=dev, generator=g)
+    ceil = torch.rand(1, T, M_cap, device=dev, generator=g) + 0.5
+    fc = ForestCache(T, Dh, dev, lean=True)
+    fc.m_cap, fc.k_cap = M_cap, M_cap.bit_length() - 1
+    fc.ingest(Kbar, ceil, 512, torch.zeros(T, device=dev))
+    fc._stable_spines()
+    assert fc._async_ready(516, need_live=True)
+    monkeypatch.setenv("FSB_BUILD_CUDA", "0")
+    assert not fc._async_ready(516, need_live=True)
+    monkeypatch.setenv("FSB_BUILD_CUDA", "1")
+    monkeypatch.setitem(fbc._failed, fbc._variant(torch.cuda.current_device(), Dh), "setup failed")
+    assert not fc._async_ready(516, need_live=True)
+
+
+@gpu
+@torch.no_grad()
+def test_static_tables_from_a_side_stream_reach_the_others_in_order(monkeypatch):
+    # while a block change's side streams are in flight (FSB_DECODE_ASYNC), a shared static table that one of them made
+    # (its kernels possibly still writing it) reaches another stream only behind an event, and the cache does not clear
+    # under them; the block change makes the tables it can foresee before the fork, so this is the fallback
+    from src.fsattn import fsb_tree as ft
+    monkeypatch.setattr(ft, "_STATIC_CACHE", {})
+    monkeypatch.setattr(ft, "_STATIC_EVENTS", {})
+    monkeypatch.setattr(ft, "_SIDE_PHASE", [True])
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    t = torch.zeros(1 << 20, device="cuda")
+    torch.cuda.synchronize()
+    with torch.cuda.stream(a):
+        torch.cuda._sleep(50_000_000)                   # the maker's kernels run late
+        t.fill_(1.0)
+        ft._static_put(("t",), t, t.device)
+    with torch.cuda.stream(b):
+        s = ft._static_get(("t",)).sum()
+    torch.cuda.synchronize()
+    assert s.item() == float(1 << 20)
+    for i in range(600):
+        ft._static_put(("x", i), i)
+    assert ("t",) in ft._STATIC_CACHE
+    ft._SIDE_PHASE[0] = False
+    ft._static_put(("y",), 0)
+    assert ("t",) not in ft._STATIC_CACHE and not ft._STATIC_EVENTS
 
 
 @gpu

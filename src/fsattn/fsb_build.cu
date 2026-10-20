@@ -1770,13 +1770,14 @@ fsb_prep_lean_tasks(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
 // NN (the admitted counts the append added, so m_tot before it is MT0 - NN). Clean heights get nsub = 0 records,
 // which the build kernel leaves without a write; dirty ones get fsb_prep_lean_tasks' records, so the build writes the
 // same rows with the same bits, except that a head whose chunk at the height is the one it held before (same index)
-// skips its rebuild: the rows hold that chunk's build already, and a build is a pure function of the chunk's cells
-// (append-only admissions, completed cells). NK <= 16; one CTA.
+// skips its rebuild where SKIP_MASK has the height's bit: the rows hold that chunk's build already, and a build is a
+// pure function of the chunk's cells (append-only admissions, completed cells) and of the height's fold flag
+// (fold_mask), so the caller sets the bit only where the rows were built with this launch's flag. NK <= 16; one CTA.
 extern "C" __global__ void __launch_bounds__(256)
 fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
                     i64* __restrict__ JB0, const i64* __restrict__ MT0, const i64* __restrict__ NN,
                     const int NK, const int T, const int fold_mask, const int Kmax_lean,
-                    const int M_adm0, const int M_kb, const int M_ce, const int M_spr) {
+                    const int M_adm0, const int M_kb, const int M_ce, const int M_spr, const int skip_mask) {
     __shared__ int s_now[16], s_was[16], s_moved[16];
     const int tid = threadIdx.x;
     if (tid < 16) { s_now[tid] = 0; s_was[tid] = 0; s_moved[tid] = 0; }
@@ -1795,7 +1796,8 @@ fsb_prep_lean_dirty(int* __restrict__ TASKS_OUT, int* __restrict__ LAY_OUT,
     for (int r = tid; r < nrec; r += 256) {
         const int k = r / T, t = r - k * T;
         const i64 mi = MT0[t], m0 = mi - NN[t];
-        const bool kept = ((mi >> k) & 1ll) != 0 && ((m0 >> k) & 1ll) != 0 && (mi >> (k + 1)) == (m0 >> (k + 1));
+        const bool kept = ((skip_mask >> k) & 1) != 0 && ((mi >> k) & 1ll) != 0 && ((m0 >> k) & 1ll) != 0
+                          && (mi >> (k + 1)) == (m0 >> (k + 1));
         const bool dirty = s_now[k] != 0 && (s_was[k] == 0 || s_moved[k] != 0) && !kept;
         const int j0 = ((mi >> k) & 1ll) ? (int)((mi >> (k + 1)) << 1) : ((int)(mi >> k) + 1);
         int* tk = TASKS_OUT + 10 * r;

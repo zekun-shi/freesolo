@@ -590,6 +590,12 @@ def _lean_layout_info(M: int, g: int) -> tuple:
     return lay, fold_mask, nbig
 
 
+def lean_fold_mask(M: int) -> int:
+    # the fold flags (bit k: height k builds as part of a taller padded group) every CUDA build of a forest laid out
+    # for M cells uses: the one input of a chunk's rows besides its cells, so rows built for different M may differ
+    return _lean_layout_info(M, _group())[1]
+
+
 def _lean_operands(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, lean):
     # the lean build's inputs as its kernels read them: row-strided (T, M_x, .) views where the layout allows (M_kb,
     # M_ce, M_spr, M_adm0 their per-head row strides), contiguous copies otherwise; the spread slot falls back to the
@@ -786,14 +792,16 @@ DIRTY_KMAX = 9                                            # tallest chunk lean_d
 
 @torch.no_grad()
 def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: torch.Tensor, nn: torch.Tensor,
-                     lean) -> bool:
+                     lean, skip_mask: int = 0) -> bool:
     # _chunks_build's lean single-forest path for a decode ingest whose dirty chunk heights the device decides from the
     # append's admitted counts nn (fsb_prep_lean_dirty): records for every height up to min(Kmax, DIRTY_KMAX), the
     # clean ones empty, then the build and the spines; three launches and no host read, so a block change can be
     # enqueued while earlier decode steps still run. The rows it writes are those the host-decided path writes, with
-    # the same bits; the caller guarantees that no taller chunk changes. Kbar, ceil_c, spread, taus, E and lean as
-    # forests_cuda gets them for that path (lean with its spine outputs and task buffer). False (nothing launched)
-    # where the CUDA build does not cover the inputs.
+    # the same bits; the caller guarantees that no taller chunk changes, and sets skip_mask's bit k only where the
+    # arena's rows of height k were built with this layout's fold flag (lean_fold_mask of M = lean[7]): there a chunk
+    # that stays in place keeps its rows, elsewhere it is rebuilt as the host-decided path rebuilds it. Kbar, ceil_c,
+    # spread, taus, E and lean as forests_cuda gets them for that path (lean with its spine outputs and task buffer).
+    # False (nothing launched) where the CUDA build does not cover the inputs.
     T, _, Dh = Kbar.shape
     M = lean[7]
     dev = Kbar.device
@@ -815,7 +823,8 @@ def lean_dirty_build(Kbar: torch.Tensor, ceil_c: torch.Tensor, spread, taus, E: 
     lay_ptr = tasks_ptr + 40 * nrec
     _launch(prep_dirty, 1, 256, 0, dev,
             [P(tasks_ptr), P(lay_ptr), P(jb0.data_ptr()), P(mt0.data_ptr()), P(nn.data_ptr()), I32(nk), I32(T),
-             I32(fold_mask), I32(int(Kmax_lean)), I32(int(M_adm0)), I32(int(M_kb)), I32(int(M_ce)), I32(int(M_spr))])
+             I32(fold_mask), I32(int(Kmax_lean)), I32(int(M_adm0)), I32(int(M_kb)), I32(int(M_ce)), I32(int(M_spr)),
+             I32(int(skip_mask))])
     _launch(bld_lean16, nrec, _THREADS, _smem_bytes(Dh), dev,
             [P(tasks_ptr), P(lay_ptr), P(Kbar.data_ptr()), P(ceil_c.data_ptr()),
              P(sp.data_ptr()), P(adm0.data_ptr()), P(0), P(mt0.data_ptr()), P(mt0.data_ptr()),
