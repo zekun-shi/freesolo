@@ -890,6 +890,36 @@ class FSAttn(nn.Module):
             raise NotImplementedError(
                 "FSKVCache requires sel_strict_causal=1 (block-causal path is non-cacheable).")
 
+    def _kv_token_major_ok(self, x, cache, pre=None) -> bool:
+        # FSB_GLUE_KV=1 (FS-B layers; default 0): a standard prefill whose cache keeps no K / V (retain_kv=False, as in
+        # the prefill benchmarks) takes K and V as (B, H, N, D) views of the projections' token-major (B, N, H * D)
+        # output instead of copying them into the (B, H, N, D) layout. Every reader of them in the prefill (the window
+        # branch, the cell statistics, the re-rank's token keys, the readout) takes them through their strides, so it
+        # reads the same values. With the cache's preallocated buffers (pre) the projections are written into those
+        # buffers' storage (_project_into), which keeps the prefill's memory where it was.
+        if not (self.fsb_enabled and os.environ.get("FSB_GLUE_KV", "0") == "1"
+                and not getattr(cache, "retain_kv", True) and x.is_cuda and not torch.is_grad_enabled()
+                and not compiling()):
+            return False
+        if pre is None:
+            return True
+        from ..utils import trunk_triton as tt
+        adt = tt.autocast_dtype()
+        return (x.dim() == 3 and x.is_contiguous() and adt in (None, x.dtype)
+                and all(lin.bias is None and lin.weight.dtype == x.dtype for lin in (self.W_k, self.W_v))
+                and all(b.dtype == x.dtype and b.is_contiguous() for b in (pre[2], pre[3])))
+
+    @staticmethod
+    def _project_into(lin, x, buf):
+        # lin(x) for a bias-free projection, written token-major ((B * N, H * D) row-major) into the storage of the
+        # (B, H, cap, D) buffer buf and returned as its (B, H, N, D) view: F.linear runs this matrix product on the
+        # folded (B * N, C) input (in x's dtype, which autocast leaves as is), so the values are the same bits
+        B, N, C = x.shape
+        H, D = buf.shape[1], buf.shape[3]
+        out = buf.view(-1)[:B * N * H * D].view(B * N, H * D)
+        torch.mm(x.view(B * N, C), lin.weight.t(), out=out)
+        return out.view(B, N, H, D).transpose(1, 2)
+
     def _forward_cached(self, x, cache):
         B, N, _ = x.shape
         self._assert_cacheable(phase="prefill" if (cache.pos == 0 and N > 1) else "decode")
@@ -900,8 +930,13 @@ class FSAttn(nn.Module):
         pre = getattr(cache, "_prealloc", None) if (is_std_prefill and not torch.is_grad_enabled()
                                                     and pre_ok and not compiling()) else None
         cap = N + max(0, int(getattr(cache, "reserve", 0))) if pre is not None else 0
-        if (pre is not None and torch.is_tensor(pre[2]) and pre[0] == B and pre[1] == N
-                and tuple(pre[2].shape) == (B, H, cap, D) and pre[2].device == x.device):
+        pre_kv = (pre is not None and torch.is_tensor(pre[2]) and pre[0] == B and pre[1] == N
+                  and tuple(pre[2].shape) == (B, H, cap, D) and pre[2].device == x.device)
+        if pre_kv and self._kv_token_major_ok(x, cache, pre):
+            K = self._project_into(self.W_k, x, pre[2])
+            V = self._project_into(self.W_v, x, pre[3])
+            Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+        elif pre_kv:
             wk = self.W_k(x).view(B, N, H, D).transpose(1, 2)
             if wk.dtype == pre[2].dtype:
                 K = pre[2][:, :, :N]
@@ -918,8 +953,12 @@ class FSAttn(nn.Module):
                 del wk
                 V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
         elif is_std_prefill and not torch.is_grad_enabled() and pre_ok and not compiling() and N > 4096:
-            K = self.W_k(x).view(B, N, H, D).transpose(1, 2).contiguous()
-            V = self.W_v(x).view(B, N, H, D).transpose(1, 2).contiguous()
+            if self._kv_token_major_ok(x, cache):
+                K = self.W_k(x).view(B, N, H, D).transpose(1, 2)
+                V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
+            else:
+                K = self.W_k(x).view(B, N, H, D).transpose(1, 2).contiguous()
+                V = self.W_v(x).view(B, N, H, D).transpose(1, 2).contiguous()
             Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
         else:
             Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
