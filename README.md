@@ -61,7 +61,7 @@ Both variants retrieve single needles at 262k — 64x the training length — wi
 | Raven-full | 102.3 / 112.4 / 101.6 / 88.5 | 234.8 / 232.6 / 211.7 / 182.7 | 1.0 / 1.9 / 5.5 / 10.3 | 1.1 / 2.1 / 6.0 / 11.3 |
 | **FS** | 138.7 / 173.3 / 154.4 / 132.6 | 337.5 / 321.3 / 273.2 / 227.5 | 1.3 / 2.5 / 7.4 / 14.0 | 1.3 / 2.5 / 7.5 / 14.1 |
 | **FS-L** (masked) | 134.3 / 176.7 / 181.1 / 181.5 | 342.7 / 339.9 / 340.5 / 340.6 | 1.3 / 2.5 / 7.4 / 14.0 | 1.3 / 2.5 / 7.5 / 14.1 |
-| **FS-B** | 85.9 / 94.2 / 82.2 / 76.2 | 340.2 / 322.1 / 304.9 / 300.0 | 1.3 / 2.8 / 8.1 / 15.2 | 1.3 / 2.8 / 8.3 / 15.9 |
+| **FS-B** | 83.7 / 114.9 / 107.4 / 101.8 | 332.0 / 315.1 / 299.7 / 291.2 | 0.8 / 1.0 / 1.8 / 2.7 | 1.0 / 1.9 / 5.1 / 9.2 |
 
 ## Models
 
@@ -106,8 +106,8 @@ The command downloads the checkpoint (and portable thresholds for FS-B), then in
 paper's benchmark with bf16, batch 1, one warm-up, three measured repetitions,
 256 decode steps, and no memory cap. It prints eager and CUDA-graph measurements;
 compare the graph columns with **154.4/132.6 Ktok/s prefill** and **273.2/227.5 tok/s decode** for `FreeSolo-341M`, **181.1/181.5 Ktok/s prefill** and
-**340.5/340.6 tok/s decode** for `FreeSolo-L-341M`, or **82.2/76.2 Ktok/s prefill** and
-**304.9/300.0 tok/s decode** for `FreeSolo-B-341M` at 64k/131k. GPU clocks, host load, and software versions
+**340.5/340.6 tok/s decode** for `FreeSolo-L-341M`, or **107.4/101.8 Ktok/s prefill** and
+**299.7/291.2 tok/s decode** for `FreeSolo-B-341M` at 64k/131k. GPU clocks, host load, and software versions
 affect timing. The JSON includes graph/eager logit checks and kernel fallback status.
 The reference stack uses PyTorch 2.5.1+cu121 and Triton 3.1.0.
 
