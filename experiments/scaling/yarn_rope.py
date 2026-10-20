@@ -95,6 +95,25 @@ class YaRNRotaryEmbedding(nn.Module):
         self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len: int):
+        old = getattr(self, "cos_cached", None)
+        if self.inv_freq.dtype != torch.float32 and old is not None and seq_len > old.shape[0]:
+            # a module cast to low precision (model.to(torch.bfloat16)): bf16 positions collapse above 256 and bf16
+            # frequencies drift by whole turns at long positions, so keep the entries the table has (built in fp32,
+            # then cast) and compute only the new positions, in fp32 from the fp32 frequencies __init__ uses, cast
+            # like the rest
+            inv_freq = compute_yarn_inv_freq(
+                dim=self.dim, base=self.base, scale=self.scale, original_max_seq_len=self.original_max_seq_len,
+                beta_fast=self.beta_fast, beta_slow=self.beta_slow,
+            ).to(self.inv_freq.device)
+            t = torch.arange(old.shape[0], seq_len, dtype=torch.float32, device=inv_freq.device)
+            freqs = torch.outer(t, inv_freq)
+            emb = torch.cat([freqs, freqs], dim=-1)
+            cos = torch.cat([old, (emb.cos() * self.mscale).to(old.dtype)])
+            sin = torch.cat([self.sin_cached, (emb.sin() * self.mscale).to(old.dtype)])
+            self.register_buffer("cos_cached", cos, persistent=False)
+            self.register_buffer("sin_cached", sin, persistent=False)
+            self._cached_len = seq_len
+            return
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
