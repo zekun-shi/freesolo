@@ -1,3 +1,4 @@
+import functools
 import math
 import os
 
@@ -251,6 +252,11 @@ class FSAttn(nn.Module):
         # chunked-RoPE window branch runs concurrently with the long-range branch (_window_fork), which does not read
         # the window output before its join (the readout's hand-off or _combine); 0 runs it serially
         return os.environ.get("FSB_WINDOW_OVERLAP" if self.fsb_enabled else "FS_WINDOW_OVERLAP", "1") == "1"
+
+    def _chunked_rope_window(self, Q, K, V, cos, sin, adt, T):
+        # the chunked-RoPE window branch of a standard prefill (_forward_cached), serial or forked (_window_fork)
+        from ..utils.local_attention import _batched_sliding_window_rope
+        return self.dropout(_batched_sliding_window_rope(Q, K, V, cos, sin, adt, self.window_size, self.scale, T=T))
 
     @staticmethod
     def _window_fork(fn, dev):
@@ -944,21 +950,21 @@ class FSAttn(nn.Module):
                 cos = self.rope.cos_cached[cache.pos:end]
                 sin = self.rope.sin_cached[cache.pos:end]
                 from ..utils import trunk_triton as tt
-                from ..utils.local_attention import _batched_sliding_window_rope
                 adt = tt.autocast_dtype()
                 dt_sr = adt or Q.dtype
                 T_blk = 64 if D <= 64 else 128
                 if (tt.rope_ok(Q, cos) and tt.rope_ok(K, cos) and sin.stride(-1) == 1 and sin.shape == cos.shape
                         and D <= 128 and D % 8 == 0 and self.window_size % T_blk == 0 and N >= self.window_size
                         and dt_sr in (torch.bfloat16, torch.float16) and V.stride(-1) == 1):
-                    def window():
-                        return self.dropout(_batched_sliding_window_rope(
-                            Q, K, V, cos, sin, adt, self.window_size, self.scale, T=T_blk
-                        ))
+                    # the fork gets a temporary partial, not a nested function: a closure would turn these locals into
+                    # cells of the whole forward, whose graph breaks dynamo then cannot resume
+                    # (tests/test_compile_guard.py), and a partial kept in a local would hold Q, K and V past their
+                    # del below
                     if self._window_overlap_on():
-                        out_short, ev = self._window_fork(window, Q.device)
+                        out_short, ev = self._window_fork(
+                            functools.partial(self._chunked_rope_window, Q, K, V, cos, sin, adt, T_blk), Q.device)
                     else:
-                        out_short, ev = window(), None
+                        out_short, ev = self._chunked_rope_window(Q, K, V, cos, sin, adt, T_blk), None
                     sr_inplace = True                   # (a forked window too: the readout writes after the join)
                     Q_lr, K_lr = Q, K
                     used_chunk_rope = True
