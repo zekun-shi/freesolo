@@ -429,17 +429,20 @@ def test_prefix_beams_match_pair_kernel(monkeypatch, L, tau_q, periodic):
 def test_prefix_decode_matches_level_loop(monkeypatch):
     # FSB_DECODE_V3=1 in the whole-step decode (with the fork, the one-kernel join and the device-decided block
     # changes): teacher-forced steps across query blocks give the read cells and the logits of the level-by-level
-    # descent bit for bit
+    # descent bit for bit; both arms read through the fused kernel at every call (a silent fallback to the kernel
+    # chain would compare the chain with itself)
     m = _model(monkeypatch, 2944, n_layers=2)
     prompt = torch.randint(0, 512, (1, 2944), generator=torch.Generator().manual_seed(113)).cuda()
     forced = torch.randint(0, 512, (400,), generator=torch.Generator().manual_seed(127)).cuda()
     for k, v in (("FSB_DECODE_V2", "1"), ("FSB_DECODE_FORK", "1"), ("FSB_DECODE_JOIN", "1"), ("FSB_DECODE_ASYNC", "1")):
         monkeypatch.setenv(k, v)
     restore = _taus(m)
+    ran = _spy(monkeypatch)
     runs = {}
     for pre in ("0", "1"):
         monkeypatch.setenv("FSB_DECODE_V3", pre)
         restore()
+        ran.clear()
         gd = _decoder(m, prompt, len(forced))
         logits, sels = [], []
         for t in forced:
@@ -448,6 +451,8 @@ def test_prefix_decode_matches_level_loop(monkeypatch):
             logits.append(gd.static_logits.float().clone())
             sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
         runs[pre] = (torch.stack(logits), torch.stack(sels))
+        assert ran and all(r is not None for r in ran), (pre, len(ran))
+    assert not dcu._failed
     (l0, s0), (l1, s1) = runs["0"], runs["1"]
     assert (s0 >= 0).float().mean() > 0.9
     assert torch.equal(s0, s1)
