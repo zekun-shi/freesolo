@@ -242,12 +242,11 @@ class GraphedDecoder:
 
     def kv_faults(self) -> tuple:
         # bounded store only: (slot overflows, readable pool cells without a slot) over all layers, both 0 by
-        # construction (kv_bounded); a host sync
-        tot = [0, 0]
-        for c in self.cache if self.bounded_kv else ():
-            o, m = c._slots.faults()
-            tot[0] += o; tot[1] += m
-        return tuple(tot)
+        # construction (kv_bounded); one host sync
+        if not self.bounded_kv:
+            return (0, 0)
+        o, m = torch.stack([c._slots.flags for c in self.cache]).sum(0).tolist()
+        return (int(o), int(m))
 
     @torch.no_grad()
     def _advance_cache_bookkeeping(self):
@@ -440,6 +439,9 @@ def graphed_generate(model, prompt_ids, max_new_tokens, device="cuda", dtype="bf
         if eos_token_id is not None and bool((gen[-1] == eos_token_id).all()):
             break
         gen.append(gd.step().clone())
+    if any(gd.kv_faults()):
+        raise RuntimeError(f"bounded K / V store fault (slot overflows, pool cells without a slot) = {gd.kv_faults()}: "
+                           "the decode read cells it does not hold; rerun with FSL_KV_BOUNDED=0")
     out = torch.stack(gen, dim=1)
     return torch.cat([seq, out], dim=1)
 

@@ -407,3 +407,24 @@ def test_bounded_store_refuses_history_reads_and_stays_off_where_unsupported(mon
     dense = GraphedDecoder(_model(serve="dense"), prompt, Lmax=2048 + 64, device="cuda", dtype=torch.bfloat16)
     dense.prefill()
     assert not dense.bounded_kv and dense.cache[0]._qk_buf is not None
+
+
+@torch.no_grad()
+def test_graphed_generate_raises_on_a_store_fault(monkeypatch):
+    # a fault counter above zero means a read missed the store: graphed_generate must not return those tokens
+    from decode_graph import graphed_generate
+    _env(monkeypatch)
+    monkeypatch.setenv("FSL_KV_BOUNDED", "1")
+    m = _model()
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(3)).cuda()
+    out = graphed_generate(m, prompt, 8)
+    assert out.shape == (1, 1032)
+    orig = kvb.SlotStore.prefill
+
+    def faulty(self, *a, **k):
+        orig(self, *a, **k)
+        self.flags[1] += 1
+
+    monkeypatch.setattr(kvb.SlotStore, "prefill", faulty)
+    with pytest.raises(RuntimeError, match="bounded K / V store fault"):
+        graphed_generate(m, prompt, 8)
