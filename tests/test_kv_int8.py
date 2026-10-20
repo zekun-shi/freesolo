@@ -364,6 +364,10 @@ def test_fsl_fs_int8_graphed_decode_across_blocks(monkeypatch, serve):
     from decode_graph import GraphedDecoder
     from experiments.scaling.model import FreeSoloLM
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    # the full int8 store and the serial decode step (the bounded store and the forked read give these logits bit for
+    # bit: tests/test_kv_bounded.py, tests/test_fs_overlap.py)
+    monkeypatch.setenv("FSL_KV_BOUNDED", "0")
+    monkeypatch.setenv("FS_DECODE_FORK", "0")
     kw = be.serve_kwargs(serve, 0.5)
     torch.manual_seed(52)
     L = 1024

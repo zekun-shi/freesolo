@@ -16,8 +16,8 @@ GRAPH_FLAGS = ("FSB_DECODE_GRAPH", "FSB_DECODE_GRAPH_CHECK", "FSB_TRAIN_GRAPH")
 ROWS_FLAGS = {"FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP": "1", "FSB_ROWS_LSE_SPLIT": "4",
               "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
               "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
-              "FSB_WINDOW_OVERLAP": "0", "FSB_BUILD_PREFILL_TRIM": "0", "FSB_PREFILL_NOCOPY": "0", "FSB_ROWS_V3": "0",
-              "FSB_BEAM_V2": "0", "FSB_BEAM_V2_EXACT": "0"}
+              "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
+              "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1"}
 
 
 @pytest.fixture
@@ -66,8 +66,8 @@ def ruler_driver(monkeypatch):
     {**{name: "0" for name in FAST_FLAGS}, "FSB_DECODE_GRAPH": "0"},
     {"FSB_DECODE_GRAPH": "0"},
     {"FSB_DECODE_GRAPH_CHECK": "1"},
-    {"FSB_DECODE_V2": "1"},
-    {"FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1"},
+    {"FSB_DECODE_V2": "0"},
+    {"FSB_DECODE_V2": "0", "FSB_DECODE_FORK": "0"},
     {"FSB_BEAM_CUDA": "0"},
     {"FSB_BEAM_ROWS": "0"},
     {"FSB_TRAVERSE_TRITON": "0"},
@@ -77,9 +77,10 @@ def ruler_driver(monkeypatch):
      "FSB_BEAM_COMPACT": "0", "FSB_CHECK_COMPACT": "1"},
     {"FSB_FAST_PREFILL": "0", "FSB_FAST_PREFILL_BLKCHUNK": "32", "FSB_FAST_PREFILL_SCRATCH_MB": "512",
      "FSB_PREFILL_STATS": "1"},
-    {"FSB_WINDOW_OVERLAP": "1"},
-    {"FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1", "FSB_BEAM_V2": "1",
-     "FSB_BEAM_V2_EXACT": "1"},
+    {"FSB_WINDOW_OVERLAP": "0"},
+    {"FSB_BUILD_PREFILL_TRIM": "0", "FSB_PREFILL_NOCOPY": "0", "FSB_ROWS_V3": "0", "FSB_BEAM_V2": "0",
+     "FSB_BEAM_V2_EXACT": "0"},
+    {"FSB_BEAM_V2_EXACT": "0"},
 ])
 def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, tmp_path, capsys, overrides):
     for name, value in overrides.items():
@@ -97,7 +98,7 @@ def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, t
     assert report["results"]["niah_single_1"]["n"] == 1
     flags = report["meta"]["fsb_execution_env"]
     expected = {**dict.fromkeys(FAST_FLAGS, "1"), "FSB_DECODE_GRAPH": "1",
-                "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "0", "FSB_DECODE_FORK": "0", "FSB_TRAIN_GRAPH": "0",
+                "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1", "FSB_TRAIN_GRAPH": "0",
                 **ROWS_FLAGS, **overrides}
     assert flags == expected
     env_line = next(line for line in capsys.readouterr().out.splitlines() if "FS-B eval env:" in line)
@@ -120,13 +121,14 @@ ATTN_DEFAULTS = {"FSL_SLIDING_MODE": "chunked", "FSL_WINDOW_BATCHED": "1", "FSL_
                  "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1", "FSL_PREFILL_CELL_REUSE": "1",
                  "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0", "FSL_READOUT_G": "64", "FSL_READOUT_WARPS": "4",
                  "FSL_READOUT_STAGES": "2", "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1",
-                 "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0"}
+                 "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1"}
 ATTN_FLAGS = tuple(k for k in ATTN_DEFAULTS if k != "FSL_SLIDING_MODE")
 
 
 @pytest.mark.parametrize("fsb", [True, False])
 @pytest.mark.parametrize("overrides", [{}, {name: "0" for name in ATTN_FLAGS}, {"FSL_SLIDING_MODE": "off"},
-                                       {"FSL_WINDOW_STREAM": "1"}, {"FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1"}])
+                                       {"FSL_WINDOW_STREAM": "1"}, {"FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0"},
+                                       {"FSL_KV_BOUNDED": "0"}])
 def test_attention_execution_env_recorded(ruler_driver, monkeypatch, tmp_path, capsys, fsb, overrides):
     for name in (*ATTN_FLAGS, "FSL_SLIDING_MODE"):
         monkeypatch.delenv(name, raising=False)

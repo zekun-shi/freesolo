@@ -28,6 +28,7 @@ def _model(monkeypatch, L, n_layers=1, seed=41):
     from experiments.scaling.model import FreeSoloLM
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
     monkeypatch.setenv("FS_KV_INT8", "1")
+    monkeypatch.setenv("FSB_DECODE_FORK", "0")         # the serial step; test_forked_read_matches_serial_step forks it
     torch.manual_seed(seed)
     m = FreeSoloLM(vocab_size=512, d_model=1024, n_layers=n_layers, n_heads=16, d_ff=1024, max_seq_len=L + 1024,
                    attn_type="fsattn", **be.serve_kwargs("fsb", 0.5)).cuda().to(torch.bfloat16).eval()
@@ -127,15 +128,20 @@ def test_fused_readout_matches_reference_released_shape(monkeypatch):
 @gpu
 @torch.no_grad()
 def test_fused_decode_flag_and_envelope(monkeypatch):
-    # FSB_DECODE_V2 unset or 0 keeps the chain; configurations outside the kernel's envelope (here the bf16 KV store)
-    # fall back to it without a launch
+    # FSB_DECODE_V2=0 keeps the chain and unset (the default) runs the fused read; configurations outside the
+    # kernel's envelope (here the bf16 KV store) fall back to the chain without a launch
     m = _model(monkeypatch, 1024)
     prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(61)).cuda()
-    monkeypatch.delenv("FSB_DECODE_V2", raising=False)
+    monkeypatch.setenv("FSB_DECODE_V2", "0")
     ran = _spy(monkeypatch)
     gd = _decoder(m, prompt, 4)
     gd.step()
     assert ran == []
+    monkeypatch.delenv("FSB_DECODE_V2")
+    gd = _decoder(m, prompt, 4)
+    gd.step()
+    assert ran and all(r is not None for r in ran)
+    ran.clear()
     monkeypatch.setenv("FSB_DECODE_V2", "1")
     monkeypatch.setenv("FS_KV_INT8", "0")
     gd = _decoder(m, prompt, 4)

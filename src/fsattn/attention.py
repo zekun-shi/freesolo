@@ -247,10 +247,10 @@ class FSAttn(nn.Module):
         return out, ev
 
     def _window_overlap_on(self) -> bool:
-        # FSB_WINDOW_OVERLAP=1 (FS-B layers) / FS_WINDOW_OVERLAP=1 (FS and FS-L layers): a prefill's chunked-RoPE
-        # window branch runs concurrently with the long-range branch (_window_fork), which does not read the window
-        # output before its join (the readout's hand-off or _combine)
-        return os.environ.get("FSB_WINDOW_OVERLAP" if self.fsb_enabled else "FS_WINDOW_OVERLAP", "0") == "1"
+        # FSB_WINDOW_OVERLAP=1 (FS-B layers) / FS_WINDOW_OVERLAP=1 (FS and FS-L layers), the defaults: a prefill's
+        # chunked-RoPE window branch runs concurrently with the long-range branch (_window_fork), which does not read
+        # the window output before its join (the readout's hand-off or _combine); 0 runs it serially
+        return os.environ.get("FSB_WINDOW_OVERLAP" if self.fsb_enabled else "FS_WINDOW_OVERLAP", "1") == "1"
 
     @staticmethod
     def _window_fork(fn, dev):
@@ -1389,7 +1389,7 @@ class FSAttn(nn.Module):
         sig = tk.get("sigma") if tk is not None and tk.get("sigma") is not None else self.sigma
         win_pos = buf.get("win_pos")
         pos_f = win_pos[-1:] if win_pos is not None else None
-        if Q.is_cuda and getattr(fc, "_live", False) and os.environ.get("FSB_DECODE_FORK", "0") == "1" and not compiling():
+        if Q.is_cuda and getattr(fc, "_live", False) and os.environ.get("FSB_DECODE_FORK", "1") == "1" and not compiling():
             # FSB_DECODE_FORK: the long-range read and the window only meet at the combine, so the read forks to its
             # own stream and runs beside the window (in a captured decode step, two parallel branches of the graph)
             cur = torch.cuda.current_stream(Q.device)
@@ -1433,7 +1433,7 @@ class FSAttn(nn.Module):
                                    "materialized history whose baked shape goes stale at replay")
             kbuf, vbuf = cache.read_full_kv()
         pool = buf["pool"]
-        if (Q.is_cuda and not pool.get("empty", False) and os.environ.get("FS_DECODE_FORK", "0") == "1"
+        if (Q.is_cuda and not pool.get("empty", False) and os.environ.get("FS_DECODE_FORK", "1") == "1"
                 and not compiling()):
             # FS_DECODE_FORK: the long-range read needs the window output only in its last step (the combine), so it
             # forks to its own stream and runs beside the window (in a captured decode step, two parallel branches of

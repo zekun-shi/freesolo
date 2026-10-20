@@ -16,6 +16,13 @@ from src.fsattn.fsb_rerank import cell_token_scores
 gpu = pytest.mark.skipif(not (torch.cuda.is_available() and rows._HAVE_TRITON), reason="needs CUDA and Triton")
 
 
+@pytest.fixture(autouse=True)
+def _rows_fused2(monkeypatch):
+    # rows_fused_cuda runs fsb_rows_v3 by default (FSB_ROWS_V3=1, the same cells bit for bit): the fused-path tests
+    # here run fsb_rows_fused2, and the v3 tests switch FSB_ROWS_V3 on themselves
+    monkeypatch.setenv("FSB_ROWS_V3", "0")
+
+
 def _stage(seed, M, H=4, nbc=8, Bq=128, D=64, s=32):
     # one prefill traversal stage with clustered keys and queries, so that the queries of a block share candidate
     # cells as on real prompts; bf16 keys, two forests, both beams from the fused kernel

@@ -19,6 +19,16 @@ def _nvrtc_ok():
 gpu = pytest.mark.skipif(not (torch.cuda.is_available() and fast._HAVE_TRITON and _nvrtc_ok()),
                          reason="needs CUDA, Triton and NVRTC")
 
+
+@pytest.fixture(autouse=True)
+def _rows_kernel_first(monkeypatch):
+    # forest_beam_rows_cuda runs fsb_beam_rows2's exact build by default (FSB_BEAM_V2=1, FSB_BEAM_V2_EXACT=1): the
+    # tests here start on fsb_beam_rows and the lean kernel's fast build, and the lean kernel's tests switch
+    # FSB_BEAM_V2 / FSB_BEAM_V2_EXACT on themselves
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "0")
+
+
 if fast._HAVE_TRITON:
     import triton
     import triton.language as tl
@@ -802,15 +812,20 @@ def test_rows2_head_major_stage_views(monkeypatch, build, pad):
 
 @gpu
 def test_rows2_flag_dispatch_and_graph(monkeypatch):
-    # FSB_BEAM_V2 unset launches fsb_beam_rows; 1 launches fsb_beam_rows2 for bf16 queries with up to 4 cells per
-    # frontier node, while float queries, eight cells per slot and the tile / union test hooks keep fsb_beam_rows. The
-    # lean kernel replays in a CUDA graph equal to eager, also after its inputs change in place
+    # FSB_BEAM_V2=0 launches fsb_beam_rows; unset (the default) or 1 launches fsb_beam_rows2 for bf16 queries with up
+    # to 4 cells per frontier node, while float queries, eight cells per slot and the tile / union test hooks keep
+    # fsb_beam_rows. The lean kernel replays in a CUDA graph equal to eager, also after its inputs change in place
     beams, q, qpos, lam, sigv = _bf16_pair(81, nbc=4)
     names = _launch_names(monkeypatch)
-    monkeypatch.delenv("FSB_BEAM_V2", raising=False)
     off = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
     assert names() == ["fsb_beam_rows"]
+    monkeypatch.delenv("FSB_BEAM_V2")
+    monkeypatch.delenv("FSB_BEAM_V2_EXACT")
+    assert bc.beam_v2_on() and bc.beam_v2_exact()                 # the default: the lean kernel's exact build
+    bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    assert names() == ["fsb_beam_rows2"]
     monkeypatch.setenv("FSB_BEAM_V2", "1")
+    monkeypatch.setenv("FSB_BEAM_V2_EXACT", "0")
     for qq, dm, kw in ((q.float(), 0, {}), (q, 3, {}), (q, 0, {"umax": 128})):
         bc.forest_beam_rows_cuda(beams, qq, qpos, lam, sigv, 0.125, 32, dm, "bound", 8.0, **kw)
         assert names() == ["fsb_beam_rows"], (qq.dtype, dm, kw)

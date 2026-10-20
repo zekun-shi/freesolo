@@ -1,4 +1,5 @@
-"""Bounded long-range KV storage for the masked FS-L graph decode (FSL_KV_BOUNDED=1; GraphedDecoder only).
+"""Bounded long-range KV storage for the masked FS-L graph decode (FSL_KV_BOUNDED=1, the default; 0 keeps the full
+int8 store; GraphedDecoder only).
 
 Masked FS-L (cell_prune_kernel=1) reads, per head, the cells of its block pool and its local window. The pool of the
 query block that starts at token b holds topk(ceil[:M], P) (M = b // s cells completed before the block; a cell's
@@ -45,7 +46,7 @@ except Exception:
 
 
 def bounded_on() -> bool:
-    return os.environ.get("FSL_KV_BOUNDED", "0") == "1"
+    return os.environ.get("FSL_KV_BOUNDED", "1") == "1"
 
 
 def _cfg(attn):

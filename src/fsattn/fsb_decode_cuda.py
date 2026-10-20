@@ -1,4 +1,4 @@
-"""The FS-B decode read of one layer as one CUDA kernel (FSB_DECODE_V2=1; the default 0 keeps the kernel chain).
+"""The FS-B decode read of one layer as one CUDA kernel (FSB_DECODE_V2=1, the default; 0 keeps the kernel chain).
 
 decode_read_fused runs, for every (batch, head) row of a decode token, both beam descents, the union re-rank, the
 top-K selection and the readout with lr_norm and the window combine in one launch (fsb_decode.cu), in place of the
@@ -29,7 +29,7 @@ _CELLS = None        # test hook: an int64 CUDA tensor (rows, 2 W_max 2^delta) -
 
 
 def v2_on() -> bool:
-    return os.environ.get("FSB_DECODE_V2", "0") == "1" and not _failed and not compiling()
+    return os.environ.get("FSB_DECODE_V2", "1") == "1" and not _failed and not compiling()
 
 
 class _DecBeam(ctypes.Structure):

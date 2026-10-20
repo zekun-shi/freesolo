@@ -52,9 +52,9 @@ _ONLY_K = None                                            # debug: restrict the 
 
 
 def prefill_trim_on() -> bool:
-    # FSB_BUILD_PREFILL_TRIM=1: the inference prefill (fsb_prefill_fast) builds only the chunks its spines can read
-    # (spine_chunks); 0 (the default) builds every chunk
-    return os.environ.get("FSB_BUILD_PREFILL_TRIM", "0") == "1"
+    # FSB_BUILD_PREFILL_TRIM=1 (the default): the inference prefill (fsb_prefill_fast) builds only the chunks its
+    # spines can read (spine_chunks); 0 builds every chunk
+    return os.environ.get("FSB_BUILD_PREFILL_TRIM", "1") == "1"
 
 
 def spine_chunks(M: int, k: int, mb_max) -> tuple:

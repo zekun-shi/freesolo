@@ -9,9 +9,10 @@ the list, its count and the positions are the torch glue's, exactly. A row with 
 a device flag that the caller reads when it chooses (fsb_rows defers it to once per layer). Compiled with NVRTC at
 first use and launched through fsb_beam_cuda's driver-API helpers; without NVRTC fsb_rows keeps its Triton path.
 
-rows_fused_cuda runs the whole re-rank of a stage in one launch: fsb_rows_fused2, or with FSB_ROWS_V3=1 (contexts of
-up to V3_MC_MAX cells) fsb_rows_v3, which computes every (query, cell) score with fused2's arithmetic in fused2's
-order, so both give the same cells and provenance bit for bit, at about 0.68 of fused2's time on A100 prefill stages.
+rows_fused_cuda runs the whole re-rank of a stage in one launch: with FSB_ROWS_V3=1 (the default; contexts of up to
+V3_MC_MAX cells) fsb_rows_v3, else fsb_rows_fused2. fsb_rows_v3 computes every (query, cell) score with fused2's
+arithmetic in fused2's order, so both give the same cells and provenance bit for bit, at about 0.68 of fused2's time on
+A100 prefill stages.
 """
 from __future__ import annotations
 
@@ -141,8 +142,8 @@ _V3 = dict(NC=1, NST=2, UTILE=40, MINB=4)
 
 
 def rows_v3_on() -> bool:
-    # FSB_ROWS_V3=1: fsb_rows_v3 instead of fsb_rows_fused2 (the same cells and provenance bit for bit)
-    return os.environ.get("FSB_ROWS_V3", "0") == "1" and not _v3_failed
+    # FSB_ROWS_V3=1 (the default): fsb_rows_v3 instead of fsb_rows_fused2 (the same cells and provenance bit for bit)
+    return os.environ.get("FSB_ROWS_V3", "1") == "1" and not _v3_failed
 
 
 def _v3_cfg_ok(Mc: int, Ca: int, Cb: int) -> bool:

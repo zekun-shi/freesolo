@@ -7,18 +7,18 @@ fixed-policy forest serve config this path computes the same selection with:
 
 - per-forward constants (block starts, query positions, stage-major (head, block) row tables), cached per shape and
   shared by every layer;
-- per layer: the forests' CUDA build (FSB_BUILD_PREFILL_TRIM=1: only the chunks the layer's spines can read,
-  fsb_build_cuda.spine_chunks), one spine launch per forest over every (head, block) row and one launch that writes
-  both beams' widths and budgets and each row's lambda and sigma;
+- per layer: the forests' CUDA build (FSB_BUILD_PREFILL_TRIM=1, the default: only the chunks the layer's spines can
+  read, fsb_build_cuda.spine_chunks), one spine launch per forest over every (head, block) row and one launch that
+  writes both beams' widths and budgets and each row's lambda and sigma;
 - per stage (FSB_FAST_PREFILL_BLKCHUNK query blocks, default 128, fewer when the stage's scratch and the layer's
   tables would exceed FSB_FAST_PREFILL_SCRATCH_MB, default 2048, and at most fsb_prefill_blkchunk when that memory
   bound is given as a kwarg or FSB_PREFILL_BLKCHUNK): the query copy, both beams in one launch of
   the row-cooperative CUDA kernel (fsb_fast_step.forest_beam_pair; one forest_beam_fused per beam where it does not
   apply) on slices of the layer's tables, the block-shared re-rank (fsb_rows.union_rerank_rows) and one int32 store
-  into the readout's cell table (FSB_PREFILL_NOCOPY=1: the beams and the re-rank read the queries from Q in place and
-  the re-rank writes the cell table directly, through head-major stage views). With two or more stages a stage's
-  re-rank runs on a side stream under the next stage's beams (_stage_pipe, FSB_STAGE_PIPE default 1; the same op
-  sequence per stage on disjoint stage slices, joined before the readout, so the outputs are unchanged;
+  into the readout's cell table (FSB_PREFILL_NOCOPY=1, the default: the beams and the re-rank read the queries from Q
+  in place and the re-rank writes the cell table directly, through head-major stage views). With two or more stages a
+  stage's re-rank runs on a side stream under the next stage's beams (_stage_pipe, FSB_STAGE_PIPE default 1; the same
+  op sequence per stage on disjoint stage slices, joined before the readout, so the outputs are unchanged;
   FSB_CHECK_COMPACT or 0 restores the serial loop). The beams write the stage loop's layout (fsb_tree.beam_delta_eff:
   2^fsb_delta cell slots per frontier node instead of 2^fsb_delta_max for the fixed policy, FSB_BEAM_COMPACT);
 - the re-rank's row-capacity check of the stage loop (fsb_rows, FSB_ROWS_DEFER): none when no row can hold more
@@ -463,7 +463,7 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
             # FSB_PREFILL_NOCOPY=1: the stages' beams and re-rank read their queries from Q in place and the re-rank
             # stores its cells straight into sel32 (head-major stage views, fsb_beam_cuda.stage_view), for Q's
             # (B, N, H, D)-transposed layout as for a contiguous one; same values as the copies (pads read zeros)
-            nocopy = (os.environ.get("FSB_PREFILL_NOCOPY", "0") == "1" and not chk and union
+            nocopy = (os.environ.get("FSB_PREFILL_NOCOPY", "1") == "1" and not chk and union
                       and Q.dtype in (torch.bfloat16, torch.float32) and Q.stride(-1) == 1
                       and (B == 1 or Q.stride(0) == H * Q.stride(1)))
 

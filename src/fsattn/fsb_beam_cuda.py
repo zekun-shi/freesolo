@@ -7,12 +7,13 @@ about one to two times a query's own 32 children), stages those nodes in shared 
 (each holding half of the query's columns) score the query's children from there. A level whose union outgrows the
 shared tables hands the block's queries to the warp-per-query descent, which continues each from that level.
 
-fsb_beam_rows2 (FSB_BEAM_V2=1, default 0): the bf16 tensor-core configuration of fsb_beam_rows (128 queries per block,
-width 16) as a lean kernel: per-lane sorting networks on packed (score, child) keys instead of rank counting, register
-frontiers, two block barriers per level and warp-local dots. Its selections match fsb_beam_rows except where two
-children's scores agree in their top 27 bits (they are then ordered by child index). FSB_BEAM_V2_EXACT=1 builds it to
-find such ties among a query's kept ranks and the first dropped one and to select that level again with 64-bit keys
-(fsb_beam_rows' selections exactly); its key64 test build selects with 64-bit keys at every level.
+fsb_beam_rows2 (FSB_BEAM_V2=1, the default; 0 keeps fsb_beam_rows): the bf16 tensor-core configuration of
+fsb_beam_rows (128 queries per block, width 16) as a lean kernel: per-lane sorting networks on packed (score, child)
+keys instead of rank counting, register frontiers, two block barriers per level and warp-local dots. Its 32-bit keys
+order two children whose scores agree in their top 27 bits by child index; the exact build (FSB_BEAM_V2_EXACT=1, the
+default) finds such ties among a query's kept ranks and the first dropped one and selects that level again with
+64-bit keys, so its selections are fsb_beam_rows' exactly (FSB_BEAM_V2_EXACT=0: the faster 32-bit build, whose
+selections can differ at such ties); its key64 test build selects with 64-bit keys at every level.
 
 fsb_beam_cuda (decode, small rows): one warp per query, lane l holds child slot l (frontier slot l // 2); each level
 loads the children's node fields once, the dot products of the valid children run as a shuffle reduce-scatter, and
@@ -431,22 +432,22 @@ def rows_source(NC: int, DH: int, WM: int, R: int, BOUND: bool, RC_T: bool, CAP:
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + _HELPERS + _KERNEL + _ROWS_KERNEL, total
 
 
-# ---- lean row-cooperative prefill descent (FSB_BEAM_V2=1, default 0): fsb_beam_rows2 takes the bf16 tensor-core
+# ---- lean row-cooperative prefill descent (FSB_BEAM_V2=1, the default): fsb_beam_rows2 takes the bf16 tensor-core
 # configuration of fsb_beam_rows (128 queries per block, head dim 64, frontier width 16, up to 4 cells per frontier
-# node) with sorting-network selection on packed keys, register frontiers and two block barriers per level. Its one
-# semantic deviation: children whose scores agree in the top 27 bits are ordered by child index; FSB_BEAM_V2_EXACT=1
-# builds it with that case redone on 64-bit keys (fsb_beam_rows' selections exactly, at some speed). Other shapes, the
-# test hooks (cap / umax / qb) and FSB_BEAM_V2=0 keep fsb_beam_rows.
+# node) with sorting-network selection on packed keys, register frontiers and two block barriers per level. Its
+# 32-bit build orders children whose scores agree in the top 27 bits by child index; FSB_BEAM_V2_EXACT=1 (the
+# default) builds it with that case redone on 64-bit keys (fsb_beam_rows' selections exactly, at some speed). Other
+# shapes, the test hooks (cap / umax / qb) and FSB_BEAM_V2=0 keep fsb_beam_rows.
 
 _ROWS2_UC, _ROWS2_DCH = 128, 64        # union slots per level (a larger union falls back); union slots per dot chunk
 
 
 def beam_v2_on() -> bool:
-    return os.environ.get("FSB_BEAM_V2", "0") == "1" and not _rows2_failed
+    return os.environ.get("FSB_BEAM_V2", "1") == "1" and not _rows2_failed
 
 
 def beam_v2_exact() -> bool:
-    return os.environ.get("FSB_BEAM_V2_EXACT", "0") == "1"
+    return os.environ.get("FSB_BEAM_V2_EXACT", "1") == "1"
 
 
 def _rows2_layout(uc: int = _ROWS2_UC):

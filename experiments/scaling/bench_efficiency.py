@@ -23,7 +23,7 @@ DT = torch.bfloat16
 ATTN_FLAGS = {"FSL_WINDOW_BATCHED": "1", "FSL_TRUNK_FUSED": "1", "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1",
               "FSL_PREFILL_CELL_REUSE": "1", "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0",
               "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1", "FSL_FAST_CACHE_STATS": "1",
-              "FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0", "FSL_KV_BOUNDED": "0"}
+              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1"}
 
 
 def attn_flags():
@@ -34,13 +34,13 @@ def attn_flags():
 # (tests/test_ruler_execution_metadata.py checks that the two agree)
 FSB_FLAGS = {"FSB_FAST_BEAM": "1", "FSB_BEAM_CUDA": "1", "FSB_BEAM_ROWS": "1", "FSB_TRAVERSE_TRITON": "1",
              "FSB_FAST_RERANK": "1", "FSB_FAST_CACHE": "1", "FSB_FAST_BUILD": "1", "FSB_BUILD_CUDA": "1", "FSB_FAST_ROWS": "1",
-             "FSB_DECODE_WHOLE": "1", "FSB_DECODE_GRAPH": "1", "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "0",
-             "FSB_DECODE_FORK": "0", "FSB_TRAIN_GRAPH": "0",
+             "FSB_DECODE_WHOLE": "1", "FSB_DECODE_GRAPH": "1", "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1",
+             "FSB_DECODE_FORK": "1", "FSB_TRAIN_GRAPH": "0",
              "FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP": "1", "FSB_ROWS_LSE_SPLIT": "4",
              "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
              "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
-             "FSB_WINDOW_OVERLAP": "0", "FSB_BUILD_PREFILL_TRIM": "0", "FSB_PREFILL_NOCOPY": "0", "FSB_ROWS_V3": "0",
-             "FSB_BEAM_V2": "0", "FSB_BEAM_V2_EXACT": "0"}
+             "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
+             "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1"}
 
 
 def fsb_flags():
