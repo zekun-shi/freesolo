@@ -18,11 +18,12 @@ DT = torch.bfloat16
 
 # inference execution switches shared by every serve config (window, trunk glue, readout, FS-L selection, cache cell
 # statistics; the FS / FS-L stream forks: prefill window beside the long-range branch, graphed decode read beside the
-# window); "0" restores the eager path
+# window); "0" restores the eager path. FSL_KV_BOUNDED=1: the FS-L graph decode keeps only the K / V cells it can still
+# read (src/fsattn/kv_bounded.py)
 ATTN_FLAGS = {"FSL_WINDOW_BATCHED": "1", "FSL_TRUNK_FUSED": "1", "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1",
               "FSL_PREFILL_CELL_REUSE": "1", "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0",
               "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1", "FSL_FAST_CACHE_STATS": "1",
-              "FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0"}
+              "FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0", "FSL_KV_BOUNDED": "0"}
 
 
 def attn_flags():
@@ -237,6 +238,7 @@ def bench_decode(m, ctx, serve, trunk, decode_mode="eager", steps=96, n_med=3, w
 
     total_steps = warm + n_med * steps          # every gd.step()/eager step advances one position
     rates = None
+    kv = {}
     if serve in ("dense", "sparse", "fsb") and decode_mode == "graph":
         from decode_graph import FSBGraphedDecoder, GraphedDecoder
         if serve == "fsb":
@@ -254,6 +256,8 @@ def bench_decode(m, ctx, serve, trunk, decode_mode="eager", steps=96, n_med=3, w
                 gd.step()
             torch.cuda.synchronize()
             rates.append(steps / (time.perf_counter() - t0))
+        if serve != "fsb":
+            kv = {"kv_bounded": gd.bounded_kv, "kv_faults": list(gd.kv_faults())}
     else:
         os.environ["FS_FUSED_ATTN"] = "1"
         if serve == "fsb":
@@ -284,7 +288,7 @@ def bench_decode(m, ctx, serve, trunk, decode_mode="eager", steps=96, n_med=3, w
             if serve == "fsb":
                 os.environ.pop("FSB_DECODE_GRAPH", None)
     peak = torch.cuda.max_memory_allocated() / 1024**3
-    return dict(tps=statistics.median(rates), peak_gib=peak, reps=rates)
+    return dict(tps=statistics.median(rates), peak_gib=peak, reps=rates, **kv)
 
 
 def main():
@@ -397,8 +401,13 @@ def main():
                     rec[f"decode_{dm}_tps"] = round(de["tps"], 2)
                     rec[f"decode_{dm}_peak_gib"] = round(de["peak_gib"], 2)
                     rec[f"decode_{dm}_impl"] = decode_impl[args.serve][dm]
+                    kv_str = ""
+                    if "kv_bounded" in de:
+                        rec[f"decode_{dm}_kv_bounded"] = de["kv_bounded"]
+                        rec[f"decode_{dm}_kv_faults"] = de["kv_faults"]
+                        kv_str = f"  kv_bounded={int(de['kv_bounded'])} faults={de['kv_faults']}"
                     print(f"[{label} L={L}] decode[{dm}]  {de['tps']:6.2f} tok/s  "
-                          f"peak {de['peak_gib']:.2f} GiB  reps={[round(r,1) for r in de['reps']]}", flush=True)
+                          f"peak {de['peak_gib']:.2f} GiB  reps={[round(r,1) for r in de['reps']]}{kv_str}", flush=True)
                 except torch.cuda.OutOfMemoryError:
                     rec[f"decode_{dm}_tps"] = "OOM"; rec[f"decode_{dm}_peak_gib"] = "OOM"
                     print(f"[{label} L={L}] decode[{dm}] OOM", flush=True)

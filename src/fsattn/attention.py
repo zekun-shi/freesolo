@@ -1239,6 +1239,11 @@ class FSAttn(nn.Module):
         }
 
     def _build_decode_pool(self, cache, blk_start, s, dev, need_tokens: bool = True, out: dict | None = None):
+        if getattr(cache, "bounded_kv", False):
+            # the bounded store (FSL_KV_BOUNDED): the same pool from its tables, which it then prunes (kv_bounded)
+            if need_tokens:
+                cache._no_history("_build_decode_pool(need_tokens=True)")
+            return cache.bounded_pool(blk_start, out=out)
         P = self._prune_cfg("cell_prune_pool", "FS_PRUNE_POOL", 64)
         Wc = self._prune_cfg("cell_prune_window", "FS_PRUNE_WINDOW", 8)
         Kbar_all, ceil_all, ncell = cache.completed_cells()
@@ -1350,12 +1355,12 @@ class FSAttn(nn.Module):
         cos = self.rope.cos_cached if self.use_rope else None
         sin = self.rope.sin_cached if self.use_rope else None
         if cache is not None and getattr(cache, "use_int8", False):
-            qk, qv, sk, sv, khot, vhot, nq_t, s = (cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf,
-                                                   cache._k_hot, cache._v_hot, cache._nq_t, cache.s)
-            if _tt.sr_decode_int8_ok(Q, K, V, qk, sk, khot, qv, sv, vhot, nq_t, win_idx, win_pos, cos):
+            qk, qv, sk, sv, khot, vhot, nq_t, s = cache.int8_state()
+            slots = cache.slot_table()
+            if _tt.sr_decode_int8_ok(Q, K, V, qk, sk, khot, qv, sv, vhot, nq_t, win_idx, win_pos, cos, slots=slots):
                 return _tt.sr_decode_fused_int8(Q, K, V, qk, sk, khot, qv, sv, vhot, nq_t, s,
                                                 pos_t, win_idx, win_pos, sigma, self.scale, self.window_size,
-                                                self.fs_uniform_sr, self.use_rope, cos, sin)
+                                                self.fs_uniform_sr, self.use_rope, cos, sin, slots=slots)
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("the int8 FS-B SR decode fallback must not be captured: it reads a "
                                    "length-sliced materialization whose baked shape goes stale at replay; "
@@ -1415,11 +1420,12 @@ class FSAttn(nn.Module):
         sigma = buf.get("sigma")
         if sigma is None:
             sigma = self.sigma
+        st = cache.int8_state() if int8 else None
+        slots = cache.slot_table() if int8 else None       # FSL_KV_BOUNDED: reads go through the cell -> slot table
         if int8 and kbuf is None and not (
-                _tt.sr_decode_int8_ok(Q, K, V, cache._qk_buf, cache._ks_buf, cache._k_hot,
-                                      cache._qv_buf, cache._vs_buf, cache._v_hot, cache._nq_t,
+                _tt.sr_decode_int8_ok(Q, K, V, st[0], st[2], st[4], st[1], st[3], st[5], st[6],
                                       buf["win_idx"], buf["win_pos"],
-                                      self.rope.cos_cached if self.use_rope else None)):
+                                      self.rope.cos_cached if self.use_rope else None, slots=slots)):
             # an exotic int8 configuration the fused window kernel does not cover: fall back through the
             # materialized bf16 history (eager only; captures must be covered by the fused kernels)
             if torch.cuda.is_current_stream_capturing():
@@ -1427,8 +1433,6 @@ class FSAttn(nn.Module):
                                    "materialized history whose baked shape goes stale at replay")
             kbuf, vbuf = cache.read_full_kv()
         pool = buf["pool"]
-        st = ((cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf, cache._k_hot, cache._v_hot, cache._nq_t,
-               cache.s) if int8 else None)
         if (Q.is_cuda and not pool.get("empty", False) and os.environ.get("FS_DECODE_FORK", "0") == "1"
                 and not compiling()):
             # FS_DECODE_FORK: the long-range read needs the window output only in its last step (the combine), so it
@@ -1443,7 +1447,7 @@ class FSAttn(nn.Module):
             side = _decode_read_stream(Q.device)
             side.wait_stream(cur)
             with torch.cuda.stream(side):
-                read = _tt.lr_decode_read(self, Q, kbuf, vbuf, pool, pos_t, sigma, st)
+                read = _tt.lr_decode_read(self, Q, kbuf, vbuf, pool, pos_t, sigma, st, slots=slots)
             out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
             cur.wait_stream(side)
             if read is not None and _tt.lr_combine_ok(out_short, Q):
@@ -1453,7 +1457,7 @@ class FSAttn(nn.Module):
         if pool.get("empty", False):
             out_long = Q.new_zeros(B, H, 1, D)
         elif int8:
-            out = _tt.lr_comb_int8(self, Q, out_short, pool, pos_t, sigma, st)
+            out = _tt.lr_comb_int8(self, Q, out_short, pool, pos_t, sigma, st, slots=slots)
             if out is not None:
                 return self.W_o(out)
             if torch.cuda.is_current_stream_capturing():

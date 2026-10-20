@@ -3,6 +3,7 @@ import os
 import torch
 
 from longctx_infer import _as_2d_long, _resolve_device, _autocast_ctx, _lm_head_fp32
+from src.fsattn import kv_bounded as _kvb
 from src.fsattn import kv_int8 as _kvi
 
 
@@ -46,17 +47,50 @@ class FSKVCache:
         self._n_q = 0                                # quantized rows ([0, _n_q) is the int8 region)
         self._nq_t = None                            # device int64 scalar holding _n_q, read inside decode graphs
         self._deq = None                             # eager materialization scratch (built lazily)
+        self.bounded_kv = False                      # GraphedDecoder flips this on via enable_bounded (FSL_KV_BOUNDED=1)
+        self._slots = None                           # kv_bounded.SlotStore: the bounded mode's K / V
+        self._ncell = 0                              # completed cells (bounded mode)
 
     def enable_int8(self):
         self._int8_ok = True
 
+    def enable_bounded(self):
+        # masked FS-L graph decode only (kv_bounded): keep the int8 K / V of just the cells a later decode step can
+        # read; nothing keeps the full history, so every read of it raises (_no_history)
+        self._int8_ok = True
+        self.bounded_kv = True
+
+    def _no_history(self, what):
+        raise RuntimeError(f"FSKVCache.{what} reads the full K / V history, which the bounded store "
+                           "(FSL_KV_BOUNDED=1) does not keep: only GraphedDecoder's fused decode reads it")
+
+    def int8_state(self):
+        # (qk, qv, sk, sv, k_hot, v_hot, nq_t, s): the int8 rows and scales the decode kernels read (the bounded
+        # store's slot rows and slot scales, read through slot_table()), the open cell's rows and n_q
+        if self.bounded_kv:
+            st = self._slots
+            return (st.qk, st.qv, st.sk, st.sv, self._k_hot, self._v_hot, self._nq_t, self.s)
+        return (self._qk_buf, self._qv_buf, self._ks_buf, self._vs_buf, self._k_hot, self._v_hot, self._nq_t, self.s)
+
+    def slot_table(self):
+        # the bounded store's cell -> slot table (int32 (B, H, cells), -1: not held), None for the full stores
+        return self._slots.slot_of if self.bounded_kv else None
+
+    def bounded_pool(self, blk_start, out=None):
+        # FSAttn._build_decode_pool of the bounded store; frees the cells no later block reads
+        return self._slots.pool(blk_start, self._ncell, out=out)
+
     def row_capacity(self) -> int:
+        if self.bounded_kv:
+            self._no_history("row_capacity")
         if self.use_int8:
             return 0 if self._qk_buf is None else self._qk_buf.shape[2]
         return 0 if self._k_buf is None else self._k_buf.shape[2]
 
     def graph_kv(self):
         # the read state a captured decode step gathers KV through: (mode, args); mode "bf16" gives (K, V)
+        if self.bounded_kv:
+            self._no_history("graph_kv")
         if self.use_int8:
             return ("int8", (self._qk_buf, self._qv_buf, self._ks_buf, self._vs_buf,
                              self._k_hot, self._v_hot, self._nq_t, self.s))
@@ -66,12 +100,16 @@ class FSKVCache:
 
     def rerank_keys(self):
         # the tokK the rerank scores read token keys from: the int8 read state in int8 mode, else the bf16 history
+        if self.bounded_kv:
+            self._no_history("rerank_keys")
         if self.use_int8:
             return _kvi.Int8Keys(self._qk_buf, self._ks_buf, self._k_hot, self._nq_t, self.s)
         return self._k_buf if self._k_buf is not None else self.lr_tokens()[0]
 
     def read_full_kv(self):
         # bf16 (K, V) over the whole stored history: the buffers themselves, or materialized in int8 mode
+        if self.bounded_kv:
+            self._no_history("read_full_kv")
         if self.use_int8:
             return self.lr_tokens()
         if self._k_buf is not None:
@@ -80,6 +118,8 @@ class FSKVCache:
 
     def _grow(self, k_t, v_t):
         B, H, _, D = k_t.shape
+        if self.bounded_kv:
+            self._no_history("append")
         if self.use_int8:
             off = self._len - self._n_q
             self._k_hot[:, :, off:off + 1] = k_t
@@ -111,6 +151,14 @@ class FSKVCache:
             return
         H, D = self.attn.n_heads, self.attn.head_dim
         max_cells = cap // self.s
+        if self.bounded_kv:
+            # the bounded store and the open cell's rows, instead of N-proportional K / V buffers
+            self._slots = _kvb.SlotStore(self.attn, B, max_cells, device)
+            self._k_hot = torch.zeros(B, H, self.s, D, dtype=dtype, device=device)
+            self._v_hot = torch.zeros(B, H, self.s, D, dtype=dtype, device=device)
+            self._prealloc = None
+            self._keep_prealloc = False
+            return
         kbar = torch.empty(B, H, max_cells, D, dtype=torch.float32, device=device) if max_cells > 0 else None
         ceil = torch.empty(B, H, max_cells, dtype=torch.float32, device=device) if max_cells > 0 else None
         if self._int8_ok and _kvi.int8_supported(dtype, device):
@@ -140,6 +188,9 @@ class FSKVCache:
             self.pos = K.shape[2]
             return
         cell_stats = handed if cell_stats is None else cell_stats
+        if self.bounded_kv:
+            self._prefill_bounded(K, V, cell_stats)
+            return
         B, H, N, D = K.shape
         cap = N + max(0, int(self.reserve))
         pre = self._prealloc
@@ -202,19 +253,7 @@ class FSKVCache:
             self._ceil_buf = pre[5] if pre is not None else None
         if ncell > 0:
             Kc = K[:, :, :ncell * self.s, :].reshape(B, H, ncell, self.s, D)
-            # same bits three ways, cheapest first: the statistics the layer's long-range prefill handed over, one
-            # CUDA pass (FSL_FAST_CACHE_STATS), the torch ops
-            if (cell_stats is not None and cell_stats[0] is K and tuple(cell_stats[1].shape) == (B, H, ncell, D)
-                    and tuple(cell_stats[2].shape) == (B, H, ncell)):
-                st = (cell_stats[1], cell_stats[2])
-            else:
-                st = _fast_cell_stats(K, ncell, self.s)
-            if st is not None:
-                self._kbar, self._ceil = st
-            else:
-                self._kbar = Kc.mean(dim=3).float()
-            if st is None:
-                self._ceil = Kc.float().norm(dim=-1).amax(dim=-1)
+            self._kbar, self._ceil = self._cell_stats_of(K, Kc, ncell, cell_stats)
             if self._kbar_buf is not None and self._kbar_buf.shape[2] >= ncell:
                 self._kbar_buf[:, :, :ncell].copy_(self._kbar)
                 self._ceil_buf[:, :, :ncell].copy_(self._ceil)
@@ -232,7 +271,75 @@ class FSKVCache:
                 self._cell_k = K[:, :, ncell * self.s:N, :].contiguous()
         self.pos = N
 
+    def _cell_stats_of(self, K, Kc, ncell, cell_stats):
+        # (Kbar, ceil) of the first ncell cells of K (Kc their (B, H, ncell, s, D) view), the same bits three ways,
+        # cheapest first: the statistics the layer's long-range prefill handed over, one CUDA pass
+        # (FSL_FAST_CACHE_STATS), the torch ops
+        B, H, _, D = K.shape
+        if (cell_stats is not None and cell_stats[0] is K and tuple(cell_stats[1].shape) == (B, H, ncell, D)
+                and tuple(cell_stats[2].shape) == (B, H, ncell)):
+            return cell_stats[1], cell_stats[2]
+        st = _fast_cell_stats(K, ncell, self.s)
+        if st is not None:
+            return st
+        return Kc.mean(dim=3).float(), Kc.float().norm(dim=-1).amax(dim=-1)
+
+    def _prefill_bounded(self, K, V, cell_stats):
+        # bounded mode: the cells the decode can still read go into the slot store (kv_bounded.SlotStore.prefill),
+        # the open cell's rows into the hot buffers; K / V themselves are not kept
+        B, H, N, D = K.shape
+        if not (_kvi.int8_supported(K.dtype, K.device) and K.stride(-1) == 1 and V.stride(-1) == 1):
+            raise RuntimeError("the bounded K / V store (FSL_KV_BOUNDED=1) holds int8 cells: it needs bf16 CUDA "
+                               "keys and values with FS_KV_INT8=1")
+        s = self.s
+        cap_cells = (N + max(0, int(self.reserve))) // s
+        if self._slots is None or not self._slots.fits(B, H, D, cap_cells, K.device):
+            self._slots = _kvb.SlotStore(self.attn, B, cap_cells, K.device)
+        if (self._k_hot is None or tuple(self._k_hot.shape) != (B, H, s, D) or self._k_hot.dtype != K.dtype
+                or self._k_hot.device != K.device):
+            self._k_hot = K.new_zeros(B, H, s, D)
+            self._v_hot = V.new_zeros(B, H, s, D)
+        ncell = N // s
+        kbar = ceil = None
+        if ncell > 0:
+            Kc = K[:, :, :ncell * s, :].reshape(B, H, ncell, s, D)
+            kbar, ceil = self._cell_stats_of(K, Kc, ncell, cell_stats)
+        self._slots.prefill(K, V, kbar, ceil, N)
+        del kbar
+        self.use_int8 = True
+        self._qk_buf = self._qv_buf = self._ks_buf = self._vs_buf = None
+        self._k_buf = self._v_buf = self._k_hist = self._v_hist = None
+        self._kbar_buf = self._ceil_buf = None
+        self._ncell = ncell
+        self._n_q = ncell * s
+        self._nq_t = torch.full((), self._n_q, dtype=torch.int64, device=K.device)
+        self._len = N
+        self._kbar = None
+        self._ceil = self._slots.ceil[:, :, :ncell] if ncell > 0 else None
+        r = N - ncell * s
+        if r > 0:
+            self._k_hot[:, :, :r].copy_(K[:, :, ncell * s:N, :])
+            self._v_hot[:, :, :r].copy_(V[:, :, ncell * s:N, :])
+            self._cell_k = self._k_hot[:, :, :r]
+        self.pos = N
+
     def _finish_cell(self, cell, v_cell=None):
+        if self.bounded_kv:
+            # the open cell's statistics as the int8 store takes them, then its rows into a free slot
+            k_cell = self._k_hot
+            st = _fast_cell_stats(k_cell, 1, self.s)
+            if st is None:
+                kbar = k_cell.mean(dim=2, keepdim=True).float()
+                ceil = k_cell.float().norm(dim=-1).amax(dim=-1, keepdim=True)
+            else:
+                kbar, ceil = st
+            self._slots.store_cell(k_cell, self._v_hot, kbar, ceil, self._ncell)
+            self._ncell += 1
+            self._n_q += self.s
+            self._nq_t.fill_(self._n_q)
+            self._ceil = self._slots.ceil[:, :, :min(self._ncell, self._slots.n_cells)]
+            self._cell_k = None
+            return
         if self.use_int8:
             k_cell, v_cell = self._k_hot, self._v_hot
             st = None if self.fsb_leaf_radius else _fast_cell_stats(k_cell, 1, self.s)
@@ -298,6 +405,8 @@ class FSKVCache:
 
     def _materialize(self):
         # int8 mode: dequantize the completed cells and append the open cell, into a persistent bf16 scratch
+        if self.bounded_kv:
+            self._no_history("lr_tokens")
         n = self._len
         n_q = self._n_q
         if self._deq is None or self._deq[0].shape[2] < n:
@@ -331,6 +440,8 @@ class FSKVCache:
         return k, v, p
 
     def completed_cells(self):
+        if self.bounded_kv:
+            self._no_history("completed_cells")
         if self._kbar is None:
             return None, None, 0
         return self._kbar, self._ceil, self._kbar.shape[2]

@@ -46,6 +46,7 @@ class GraphedDecoder:
         self.cache = None
         self.graph = None
         self._captured_C = None
+        self.bounded_kv = False         # FSL_KV_BOUNDED=1 and supported: each layer keeps only readable cells
 
     def _alloc(self, P):
         B = 1
@@ -85,6 +86,14 @@ class GraphedDecoder:
                 for c in self.cache:
                     c.enable_int8()             # int8 long-range KV; the window kernel writes the hot open cell
         kv_dt = self.dt if self.dt != torch.float32 else next(m.parameters()).dtype
+        from src.fsattn import kv_bounded as _kvb
+        # FSL_KV_BOUNDED=1: masked FS-L keeps, per layer, the int8 K / V of only the cells a later step can read
+        # (kv_bounded), on the int8 store's values; prompts shorter than the window keep the full store
+        self.bounded_kv = bool(_kvb.bounded_on() and P >= self.W and all(c._int8_ok for c in self.cache)
+                               and _kvb.supported(self.attn, kv_dt, self.dev))
+        if self.bounded_kv:
+            for c in self.cache:
+                c.enable_bounded()
         if os.environ.get("KV_PREALLOC", "1") == "1":       # as cached_generate: buffers before the prefill peak
             for c in self.cache:
                 c.preallocate(1, P, kv_dt, self.dev)
@@ -230,6 +239,15 @@ class GraphedDecoder:
         self._advance_cache_bookkeeping()
         self.pos += 1
         return self.next_tok
+
+    def kv_faults(self) -> tuple:
+        # bounded store only: (slot overflows, readable pool cells without a slot) over all layers, both 0 by
+        # construction (kv_bounded); a host sync
+        tot = [0, 0]
+        for c in self.cache if self.bounded_kv else ():
+            o, m = c._slots.faults()
+            tot[0] += o; tot[1] += m
+        return tuple(tot)
 
     @torch.no_grad()
     def _advance_cache_bookkeeping(self):

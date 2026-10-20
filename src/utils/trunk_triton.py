@@ -276,18 +276,21 @@ if triton is not None:
 
     @triton.jit
     def _sr_kv_rope_int8_kernel(
-        Q, K, V, QK, SK, HOTK, QV, SV, HOTV, NQ, Cos, Sin, PosT, WinIdx,
+        Q, K, V, QK, SK, HOTK, QV, SV, HOTV, NQ, Cos, Sin, PosT, WinIdx, CSLOT,
         Qrot, KwOut, VwOut,
         Lw, S, H: tl.constexpr, HALF: tl.constexpr,
         sqb, sqh, skb, skh, svb, svh,
         sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
         sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
+        sstb, ssth,
         scn, ssn,
         sqrb, sqrh, skwb, skwh, skwl, svwb, svwh, svwl,
-        BN: tl.constexpr, RND: tl.constexpr, USE_ROPE: tl.constexpr,
+        BN: tl.constexpr, RND: tl.constexpr, USE_ROPE: tl.constexpr, SLOTS: tl.constexpr,
     ):
         # _sr_kv_rope_kernel on an int8-mode cache: rows below n_q (loaded from NQ) are int8 * bf16 cell scale,
         # rows at or above it are the open cell's bf16 hot rows; the new token's row goes to the hot buffer.
+        # SLOTS (the bounded store, src/fsattn/kv_bounded.py): a completed cell's rows and scale live in the slot
+        # CSLOT maps the cell to, row slot * S + w_idx % S; the values read are the same.
         pid_n = tl.program_id(0)
         bh = tl.program_id(1)
         b = bh // H
@@ -332,12 +335,19 @@ if triton is not None:
         is_hot = (w_idx >= nq)[:, None]
         hot_i = (w_idx - nq)[:, None]
         cell = w_idx // S
+        if SLOTS:
+            slot = tl.load(CSLOT + b * sstb + h * ssth + cell, mask=m & (w_idx >= 0) & (w_idx < nq), other=0)
+            prow = slot * S + (w_idx - cell * S)
+            pcell = slot
+        else:
+            prow = w_idx
+            pcell = cell
 
-        kq1 = tl.load(QK + b * sqkb + h * sqkh + w_idx[:, None] * sqkn + cols[None, :],
+        kq1 = tl.load(QK + b * sqkb + h * sqkh + prow[:, None] * sqkn + cols[None, :],
                       mask=m[:, None], other=0).to(tl.float32)
-        kq2 = tl.load(QK + b * sqkb + h * sqkh + w_idx[:, None] * sqkn + HALF + cols[None, :],
+        kq2 = tl.load(QK + b * sqkb + h * sqkh + prow[:, None] * sqkn + HALF + cols[None, :],
                       mask=m[:, None], other=0).to(tl.float32)
-        ksc = tl.load(SK + b * sskb + h * sskh + cell, mask=m, other=0.0).to(tl.float32)[:, None]
+        ksc = tl.load(SK + b * sskb + h * sskh + pcell, mask=m, other=0.0).to(tl.float32)[:, None]
         kh1 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + cols[None, :],
                       mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
         kh2 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + HALF + cols[None, :],
@@ -360,11 +370,11 @@ if triton is not None:
         tl.store(kw_out_p, rkw1.to(KwOut.dtype.element_ty), mask=m[:, None])
         tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=m[:, None])
 
-        vq1 = tl.load(QV + b * sqvb + h * sqvh + w_idx[:, None] * sqvn + cols[None, :],
+        vq1 = tl.load(QV + b * sqvb + h * sqvh + prow[:, None] * sqvn + cols[None, :],
                       mask=m[:, None], other=0).to(tl.float32)
-        vq2 = tl.load(QV + b * sqvb + h * sqvh + w_idx[:, None] * sqvn + HALF + cols[None, :],
+        vq2 = tl.load(QV + b * sqvb + h * sqvh + prow[:, None] * sqvn + HALF + cols[None, :],
                       mask=m[:, None], other=0).to(tl.float32)
-        vsc = tl.load(SV + b * ssvb + h * ssvh + cell, mask=m, other=0.0).to(tl.float32)[:, None]
+        vsc = tl.load(SV + b * ssvb + h * ssvh + pcell, mask=m, other=0.0).to(tl.float32)[:, None]
         vh1 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + cols[None, :],
                       mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
         vh2 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + HALF + cols[None, :],
@@ -1094,7 +1104,8 @@ def sr_decode_fused(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, kbuf: tor
 
 def sr_decode_int8_ok(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: torch.Tensor, sk: torch.Tensor,
                       hotk: torch.Tensor, qv: torch.Tensor, sv: torch.Tensor, hotv: torch.Tensor,
-                      nq_t: torch.Tensor, win_idx: torch.Tensor, win_pos: torch.Tensor, cos=None) -> bool:
+                      nq_t: torch.Tensor, win_idx: torch.Tensor, win_pos: torch.Tensor, cos=None,
+                      slots: torch.Tensor | None = None) -> bool:
     if (compiling() or not available() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
             or os.environ.get("FSL_SR_DECODE_FUSED", "1") == "0"
             or torch.is_grad_enabled() or not Q.is_cuda):
@@ -1112,6 +1123,9 @@ def sr_decode_int8_ok(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: tor
         ct = torch.promote_types(Q.dtype, cos.dtype)
         if not (cos.dim() == 2 and cos.shape[1] >= half and cos.stride(-1) == 1 and ct in _RND):
             return False
+    if slots is not None and not (slots.dtype == torch.int32 and slots.dim() == 3 and slots.stride(-1) == 1
+                                  and tuple(slots.shape[:2]) == (B, H) and sk.shape == sv.shape):
+        return False
     return (Q.dtype in _RND and qk.dtype == torch.int8 and sk.dtype == torch.bfloat16
             and hotk.dtype == Q.dtype and qv.dtype == torch.int8 and sv.dtype == torch.bfloat16
             and hotv.dtype == V.dtype and nq_t.dtype == torch.int64)
@@ -1122,8 +1136,9 @@ def sr_decode_fused_int8(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: 
                          nq_t: torch.Tensor, s: int, pos_t: torch.Tensor, win_idx: torch.Tensor,
                          win_pos: torch.Tensor, sigma: torch.Tensor, scale: float, window_size: int,
                          fs_uniform_sr: bool, use_rope: bool, cos: torch.Tensor | None = None,
-                         sin: torch.Tensor | None = None) -> torch.Tensor:
-    """sr_decode_fused on an int8-mode cache (bit-exact window math modulo the int8 cell dequantization)."""
+                         sin: torch.Tensor | None = None, slots: torch.Tensor | None = None) -> torch.Tensor:
+    """sr_decode_fused on an int8-mode cache (bit-exact window math modulo the int8 cell dequantization). slots:
+    the bounded store's cell -> slot table (kv_bounded; qk / qv / sk / sv are then its slot rows and scales)."""
     B, H, _, D = Q.shape
     Lw = win_idx.shape[0]
     dt_mm = autocast_dtype() or (torch.promote_types(Q.dtype, cos.dtype) if (use_rope and cos is not None) else Q.dtype)
@@ -1139,6 +1154,7 @@ def sr_decode_fused_int8(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: 
     grid = (triton.cdiv(Lw, BN), B * H)
     _sr_kv_rope_int8_kernel[grid](
         Q, K, V, qk, sk, hotk, qv, sv, hotv, nq_t, cos_t, sin_t, pos_t, win_idx,
+        slots if slots is not None else nq_t,
         Qrot, Kw, Vw,
         Lw, s, H=H, HALF=D // 2,
         sqb=Q.stride(0), sqh=Q.stride(1), skb=K.stride(0), skh=K.stride(1), svb=V.stride(0), svh=V.stride(1),
@@ -1148,11 +1164,12 @@ def sr_decode_fused_int8(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: 
         sqvb=qv.stride(0), sqvh=qv.stride(1), sqvn=qv.stride(2),
         ssvb=sv.stride(0), ssvh=sv.stride(1),
         shvb=hotv.stride(0), shvh=hotv.stride(1), shvn=hotv.stride(2),
+        sstb=slots.stride(0) if slots is not None else 0, ssth=slots.stride(1) if slots is not None else 0,
         scn=scn, ssn=ssn,
         sqrb=Qrot.stride(0), sqrh=Qrot.stride(1),
         skwb=Kw.stride(0), skwh=Kw.stride(1), skwl=Kw.stride(2),
         svwb=Vw.stride(0), svwh=Vw.stride(1), svwl=Vw.stride(2),
-        BN=BN, RND=_RND[ct], USE_ROPE=bool(use_rope),
+        BN=BN, RND=_RND[ct], USE_ROPE=bool(use_rope), SLOTS=slots is not None,
         num_warps=4, enable_fp_fusion=False,
     )
     scores = torch.einsum("bhd,bhld->bhl", Qrot, Kw)
@@ -1414,13 +1431,14 @@ def _int8_state_ok(q_t, st):
 
 @torch.no_grad()
 def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, pos_t: torch.Tensor,
-                 sigma: torch.Tensor, st):
+                 sigma: torch.Tensor, st, slots: torch.Tensor | None = None):
     """fsl_lr_decode_combine on the int8 long-range KV state st=(qk, qv, sk, sv, khot, vhot, nq_t, s):
     the K / V gather reads idx < n_q as int8 * bf16 cell scale rounded to bf16 (the same values the
     bf16 kernel sees on the materialized cache), idx >= n_q as the bf16 hot rows; every other value is
     computed by the identical operations, so selection statistics and all roundings match. None when
     the support envelope of the fused kernels is exceeded (the caller's reference path then applies).
-    Without out_short, the read alone (lr_decode_read): see _lr_outputs."""
+    Without out_short, the read alone (lr_decode_read): see _lr_outputs. slots: the bounded store's cell -> slot
+    table (kv_bounded; st then holds its slot rows and scales), for the FS-L candidate pool only."""
     if (compiling() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
             or os.environ.get("FSL_LR_DECODE_FUSED", "1") == "0" or torch.is_grad_enabled()
             or not q_t.is_cuda or getattr(attn, "sel_content_only", False) or pool.get("empty", False)):
@@ -1439,6 +1457,9 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
             and _int8_state_ok(q_t, st)
             and attn.lr_norm.scale.is_contiguous() and attn.long_range_scale.is_contiguous()
             and attn.sel_scale.is_contiguous() and sigma.is_contiguous()):
+        return None
+    if slots is not None and not (slots.dtype == torch.int32 and slots.dim() == 3 and slots.stride(-1) == 1
+                                  and tuple(slots.shape[:2]) == (B, H) and not pool.get("dense", False)):
         return None
     if pool.get("dense", False):
         part_s = pool.get("part_s"); part_c = pool.get("part_c"); m_vis_t = pool.get("m_vis_t")
@@ -1531,7 +1552,7 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
     _lrc_comb_int8_kernel[(B * H,)](
         q_t[:, :, 0, :], kb_src, pool["ceil_cand"], pool["cen_cand"], pool["ok_cell"], pool["cand_c"],
         pos_t, attn.sel_scale, sigma,
-        qk, skt, khot, qv, svt, vhot, nq_t,
+        qk, skt, khot, qv, svt, vhot, nq_t, slots if slots is not None else nq_t,
         sr, w_norm, lrs, dst,
         q_t.stride(0), q_t.stride(1),
         kb_src.stride(0), kb_src.stride(1), skbc, skbd,
@@ -1541,23 +1562,26 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
         qv.stride(0), qv.stride(1), qv.stride(2), svt.stride(0), svt.stride(1),
         vhot.stride(0), vhot.stride(1), vhot.stride(2),
         srb, srh,
-        float(attn.scale), float(attn.lr_norm.eps), C, qk.shape[2] // s + 1,
+        slots.stride(0) if slots is not None else 0, slots.stride(1) if slots is not None else 0,
+        float(attn.scale), float(attn.lr_norm.eps), C,
+        slots.shape[2] if slots is not None else qk.shape[2] // s + 1,
         H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block),
         K_SELECT=k_sel, BLOCK_C=block_c, BLOCK_D=64, BLOCK_S=block_s,
         NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16, COMBINE=combine,
-        AUTOCAST_BF16=autocast_bf16,
+        AUTOCAST_BF16=autocast_bf16, SLOTS=slots is not None,
         num_warps=4, num_stages=2, enable_fp_fusion=False,
     )
     return res
 
 
 def lr_decode_read(attn, q_t: torch.Tensor, kbuf, vbuf, pool: dict, pos_t: torch.Tensor, sigma: torch.Tensor,
-                   st=None):
-    """The long-range read of fsl_lr_decode_combine (bf16 history kbuf / vbuf) or lr_comb_int8 (int8 state st) without
-    the window output, for a read that runs beside the window (FS_DECODE_FORK): the same kernels, stopped before their
-    combine, return (lr, out) for lr_combine; None where they do not apply (the caller's serial path then runs)."""
+                   st=None, slots: torch.Tensor | None = None):
+    """The long-range read of fsl_lr_decode_combine (bf16 history kbuf / vbuf) or lr_comb_int8 (int8 state st, read
+    through the bounded store's cell -> slot table slots when given) without the window output, for a read that runs
+    beside the window (FS_DECODE_FORK): the same kernels, stopped before their combine, return (lr, out) for
+    lr_combine; None where they do not apply (the caller's serial path then runs)."""
     if st is not None:
-        return lr_comb_int8(attn, q_t, None, pool, pos_t, sigma, st)
+        return lr_comb_int8(attn, q_t, None, pool, pos_t, sigma, st, slots=slots)
     if fsl_lr_decode_combine_ok(attn, q_t, kbuf, vbuf, None, pool, pos_t, sigma):
         return fsl_lr_decode_combine(attn, q_t, kbuf, vbuf, None, pool, pos_t, sigma)
     return None
@@ -1583,14 +1607,15 @@ def lr_combine(out_short: torch.Tensor, lr: torch.Tensor, out: torch.Tensor) -> 
 if triton is not None:
 
     @triton.jit
-    def _int8_cell_read(Q8, SC, HOTT, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
-                        sqb, sqh, sqn, sscb, ssch, shb, shh, shn, safe_cell, cell_ok):
+    def _int8_cell_read(Q8, SC, HOTT, NQT, b, h, tok, prow, row8, rowh, offs_d, d_mask,
+                        sqb, sqh, sqn, sscb, ssch, shb, shh, shn, psc, cell_ok):
         # one selected-cell tile of keys or values from the int8 state: rows below n_q dequantized
-        # int8 * cell scale and rounded to bf16 (the materialized-cache value); hot rows read bf16
+        # int8 * cell scale and rounded to bf16 (the materialized-cache value); hot rows read bf16. The int8 rows
+        # and the scale sit at prow / psc: the tokens and their cell, or the bounded store's slot rows and slot
         nq8 = tl.load(NQT)
-        q8 = tl.load(Q8 + b * sqb + h * sqh + tok[:, None] * sqn + offs_d[None, :],
+        q8 = tl.load(Q8 + b * sqb + h * sqh + prow[:, None] * sqn + offs_d[None, :],
                      mask=row8[:, None] & d_mask[None, :], other=0)
-        tsc = tl.load(SC + b * sscb + h * ssch + safe_cell, mask=cell_ok, other=0.0).to(tl.float32)
+        tsc = tl.load(SC + b * sscb + h * ssch + psc, mask=cell_ok, other=0.0).to(tl.float32)
         th = tl.load(HOTT + b * shb + h * shh + (tok - nq8)[:, None] * shn + offs_d[None, :],
                      mask=rowh[:, None] & d_mask[None, :], other=0.0)
         tq = (q8.to(tl.float32) * tsc).to(HOTT.dtype.element_ty)
@@ -1599,21 +1624,22 @@ if triton is not None:
     @triton.jit
     def _lrc_comb_int8_kernel(
         Q, KBAR, CEIL, CEN, OK, CAND, POS, LAM, SIG,
-        QK, SKC, HOTK, QV, SVC, HOTV, NQT,
+        QK, SKC, HOTK, QV, SVC, HOTV, NQT, CSLOT,
         SR, W_NORM, LRS, O,
         sqb, sqh, skbb, skbh, skbc, skbd, scb, sch,
         sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
         sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
-        srb, srh,
+        srb, srh, sstb, ssth,
         sc, eps, C, NCAP,
         H: tl.constexpr, D: tl.constexpr, SCALE: tl.constexpr,
         CELL_SIZE: tl.constexpr, QUERY_BLOCK: tl.constexpr, K_SELECT: tl.constexpr,
         BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
         NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
         COMBINE: tl.constexpr,
-        AUTOCAST_BF16: tl.constexpr,
+        AUTOCAST_BF16: tl.constexpr, SLOTS: tl.constexpr,
     ):
-        # _fsl_lr_decode_combine_kernel with the K / V tile reads on the int8 cache state
+        # _fsl_lr_decode_combine_kernel with the K / V tile reads on the int8 cache state; SLOTS: the bounded
+        # store (kv_bounded), whose cell -> slot table CSLOT places a selected cell's rows and scale
         bh = tl.program_id(0)
         b = bh // H
         h = bh - b * H
@@ -1714,6 +1740,14 @@ if triton is not None:
 
             safe_cell = tl.maximum(cell, 0)
             tok = safe_cell * CELL_SIZE + offs_s
+            if SLOTS:
+                cslot = tl.load(CSLOT + b * sstb + h * ssth + safe_cell, mask=cell_ok, other=-1)
+                cell_ok = cell_ok & (cslot >= 0)
+                psc = tl.maximum(cslot, 0)
+                prow = psc * CELL_SIZE + offs_s
+            else:
+                psc = safe_cell
+                prow = tok
             tok_ok = (
                 cell_ok
                 & (offs_s < CELL_SIZE)
@@ -1723,8 +1757,8 @@ if triton is not None:
             in8 = tok < nq8
             row8 = tok_ok & (tok < nq8)
             rowh = tok_ok & (tok >= nq8)
-            kval = _int8_cell_read(QK, SKC, HOTK, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
-                                   sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn, safe_cell, cell_ok)
+            kval = _int8_cell_read(QK, SKC, HOTK, NQT, b, h, tok, prow, row8, rowh, offs_d, d_mask,
+                                   sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn, psc, cell_ok)
             scores = tl.sum(kval.to(tl.float32) * q[None, :], axis=1) * SCALE
             scores = tl.where(tok_ok, scores, -float("inf"))
 
@@ -1734,8 +1768,8 @@ if triton is not None:
             alpha = tl.where(has_token, tl.exp(m_i - m_new), 1.0)
             p = tl.where(tok_ok, tl.exp(scores - m_new), 0.0)
 
-            vval = _int8_cell_read(QV, SVC, HOTV, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
-                                   sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn, safe_cell, cell_ok)
+            vval = _int8_cell_read(QV, SVC, HOTV, NQT, b, h, tok, prow, row8, rowh, offs_d, d_mask,
+                                   sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn, psc, cell_ok)
             acc_new = acc * alpha + tl.sum(p[:, None].to(vval.dtype) * vval, axis=0).to(tl.float32)
             l_new = l_i * alpha + tl.sum(p, axis=0)
 
@@ -1844,7 +1878,7 @@ if triton is not None:
 
             row8 = tok_ok & (tok < nq8)
             rowh = tok_ok & (tok >= nq8)
-            kval = _int8_cell_read(QK, SKC, HOTK, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+            kval = _int8_cell_read(QK, SKC, HOTK, NQT, b, h, tok, tok, row8, rowh, offs_d, d_mask,
                                    sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn, safe_cell, cell_ok)
             scores = tl.sum(kval.to(tl.float32) * q[None, :], axis=1) * SCALE
             scores = tl.where(tok_ok, scores, -float("inf"))
@@ -1855,7 +1889,7 @@ if triton is not None:
             alpha = tl.where(has_token, tl.exp(m_i - m_new), 1.0)
             p = tl.where(tok_ok, tl.exp(scores - m_new), 0.0)
 
-            vval = _int8_cell_read(QV, SVC, HOTV, NQT, b, h, tok, row8, rowh, offs_d, d_mask,
+            vval = _int8_cell_read(QV, SVC, HOTV, NQT, b, h, tok, tok, row8, rowh, offs_d, d_mask,
                                    sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn, safe_cell, cell_ok)
             acc_new = acc * alpha + tl.sum(p[:, None].to(vval.dtype) * vval, axis=0).to(tl.float32)
             l_new = l_i * alpha + tl.sum(p, axis=0)
