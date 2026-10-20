@@ -8,8 +8,9 @@ fixed-policy forest serve config this path computes the same selection with:
 - per-forward constants (block starts, query positions, stage-major (head, block) row tables), cached per shape and
   shared by every layer;
 - per layer: the forests' CUDA build (FSB_BUILD_PREFILL_TRIM=1, the default: only the chunks the layer's spines can
-  read, fsb_build_cuda.spine_chunks), one spine launch per forest over every (head, block) row and one launch that
-  writes both beams' widths and budgets and each row's lambda and sigma;
+  read, fsb_build_cuda.spine_chunks; FSB_GLUE_FORK=1: in a captured prefill, with the cell statistics on a side
+  stream forked right after the layer's K projection, fork_layer_forests), one spine launch per forest over every
+  (head, block) row and one launch that writes both beams' widths and budgets and each row's lambda and sigma;
 - per stage (FSB_FAST_PREFILL_BLKCHUNK query blocks, default 128, fewer when the stage's scratch and the layer's
   tables would exceed FSB_FAST_PREFILL_SCRATCH_MB, default 2048, and at most fsb_prefill_blkchunk when that memory
   bound is given as a kwarg or FSB_PREFILL_BLKCHUNK): the query copy, both beams in one launch of
@@ -253,6 +254,18 @@ def _stage_blocks(T, nb, Bq, Dh, Mc, Ca, Cb, K, layer_bytes: int = 0, cap: int =
     return max(1, min(want, budget // max(1, _stage_bytes(T, Bq, Dh, Mc, Ca, Cb, K))))
 
 
+def _stages(attn, T: int, nb: int, Bq: int, Dh: int, M: int, d_eff, utau: bool) -> tuple:
+    # the fast prefill's stages ((b0, b1) block spans) for a layer of these sizes
+    Kk = attn.fsb_kk
+    W_max, Wu_max = attn.fsb_W_max, int(getattr(attn, "fsb_union_W_max", 0) or 0)
+    R = 1 << (attn.fsb_delta_max if d_eff is None else d_eff)
+    union = int(getattr(attn, "fsb_union_width", 0) or 0) > 0
+    acc = getattr(attn, "_fsb_read_acc", None)
+    fixed = _layer_bytes(T, nb, Bq, Dh, M, Kk, union, utau, acc is not None and utau, prefill_stats_on())
+    nbch = _stage_blocks(T, nb, Bq, Dh, M, W_max * R, Wu_max * R if union else 0, Kk, fixed, _blkchunk_cap(attn))
+    return tuple((b0, min(b0 + nbch, nb)) for b0 in range(0, nb, nbch))
+
+
 def _blkchunk_cap(attn) -> int:
     # fsb_prefill_blkchunk (eval_ruler / train_dist --fsb_prefill_blkchunk, FSB_PREFILL_BLKCHUNK: "query blocks per
     # prefill chunk, memory bound") caps the stage size when it was given; 0: no cap (FSB_FAST_PREFILL_BLKCHUNK)
@@ -391,8 +404,7 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
     from .fsb_beam_cuda import spines_tables_cuda
     from .fsb_fast_step import fast_beam_ok, forest_beam_fused, forest_beam_pair
     from .fsb_rows import UCAP, union_rerank_rows
-    from .fsb_build_cuda import prefill_trim_on
-    from .fsb_tree import (_check_compact, _det_sum, _forest_build_stage, beam_delta_eff, build_spines, fsb_read_acc,
+    from .fsb_tree import (_check_compact, _forest_build_stage, beam_delta_eff, build_spines, fsb_read_acc,
                            fsb_utau_acc, masked_readout, readout_handoff, union_tau_on)
     B, H, _, Dh = Q.shape
     s = attn.cell_stride
@@ -415,34 +427,19 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
     stats = prefill_stats_on()
     acc = getattr(attn, "_fsb_read_acc", None)
     q_bf16 = Q.dtype == torch.bfloat16                          # the re-rank query is Q.float() (no routing here)
-    fixed = _layer_bytes(T, nb, Bq, Dh, M, Kk, union, utau, acc is not None and utau, stats)
-    nbch = _stage_blocks(T, nb, Bq, Dh, M, W_max * R, Wu_max * R if union else 0, Kk, fixed, _blkchunk_cap(attn))
-    stages = tuple((b0, min(b0 + nbch, nb)) for b0 in range(0, nb, nbch))
+    stages = _stages(attn, T, nb, Bq, Dh, M, d_eff, utau)
     cst = _consts(dev, B, H, nb, Bq, stages)
     blk_start = cst["blk_start"]
     lb = _legacy_blocks(attn, nb)
+    fk = join_layer_forests(attn)
     with torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
-        # cell statistics with fsb_long_range's own ops (the forests' inputs), handed to the KV cache as it does
-        from .fsl_select_cuda import cache_cell_stats
-        st_c = cache_cell_stats(Kp, M, s) if not attn.fsb_leaf_radius else None
-        if st_c is not None:
-            Kbar, ceil_c = st_c
+        if fk is not None and fk[0] is Kp and fk[1] == (N, blk_start.data_ptr()):
+            Kbar, ceil_c, spread, F, m_b_all = fk[2]            # built by the fork after the K projection
         else:
-            Kpv = Kp.view(B, H, M, s, Dh)
-            Kbar = Kpv.mean(dim=3).float()
-            ceil_c = Kpv.float().norm(dim=-1).amax(dim=-1)
+            Kbar, ceil_c, spread, F, m_b_all = _layer_forests(attn, Kp, M, s, nb, Bq, cst)
+        del fk
         if getattr(attn, "_cell_stats_out", None) is not None and not pad:
             attn._cell_stats_out.append((K, Kbar, ceil_c))      # FSKVCache.prefill: the same ops on the same view
-        spread = None
-        if attn.fsb_leaf_radius:
-            dK = Kpv.float() - Kbar[..., None, :]
-            spread = _det_sum(dK * dK, -1).amax(dim=-1).sqrt()
-            del dK
-        # FSB_BUILD_PREFILL_TRIM=1: every read of these forests below goes through the spines of the layer's m_b
-        # (the beams descend from their chunk roots), so the CUDA build may skip the chunks no such spine reads
-        F, m_b_all = _forest_build_stage(attn, Kbar.reshape(T, M, Dh), ceil_c.reshape(T, M), blk_start, s,
-                                         spread.reshape(T, M) if spread is not None else None,
-                                         mb_max=_mb_max(nb, Bq, s, M) if prefill_trim_on() else None)
         F["chunks"] = {}
         F2 = F.get("utau_F") if utau else None
         m_b2_all = F.get("utau_mba") if F2 is not None else None
@@ -674,6 +671,96 @@ def fsb_prefill_fast(attn, Q, K, V, Kp, Vp, sigma, N: int, tokK):
     if getattr(attn, "_fsb_rd", None) is not None:
         attn._fsb_rd = None
     return y
+
+
+def _layer_forests(attn, Kp, M: int, s: int, nb: int, Bq: int, cst: dict):
+    # a layer's cell statistics with fsb_long_range's own ops (the forests' inputs, also handed to the KV cache) and
+    # its forests: (Kbar, ceil_c, spread, F, m_b_all)
+    from .fsb_build_cuda import prefill_trim_on
+    from .fsb_tree import _det_sum, _forest_build_stage
+    from .fsl_select_cuda import cache_cell_stats
+    B, H, _, Dh = Kp.shape
+    T = B * H
+    st_c = cache_cell_stats(Kp, M, s) if not attn.fsb_leaf_radius else None
+    if st_c is not None:
+        Kbar, ceil_c = st_c
+    else:
+        Kpv = Kp.view(B, H, M, s, Dh)
+        Kbar = Kpv.mean(dim=3).float()
+        ceil_c = Kpv.float().norm(dim=-1).amax(dim=-1)
+    spread = None
+    if attn.fsb_leaf_radius:
+        dK = Kpv.float() - Kbar[..., None, :]
+        spread = _det_sum(dK * dK, -1).amax(dim=-1).sqrt()
+        del dK
+    # FSB_BUILD_PREFILL_TRIM=1: every read of these forests below goes through the spines of the layer's m_b
+    # (the beams descend from their chunk roots), so the CUDA build may skip the chunks no such spine reads
+    F, m_b_all = _forest_build_stage(attn, Kbar.reshape(T, M, Dh), ceil_c.reshape(T, M), cst["blk_start"], s,
+                                     spread.reshape(T, M) if spread is not None else None,
+                                     mb_max=_mb_max(nb, Bq, s, M) if prefill_trim_on() else None)
+    return Kbar, ceil_c, spread, F, m_b_all
+
+
+_FORK_STREAMS: dict = {}
+
+
+def glue_fork_on() -> bool:
+    # FSB_GLUE_FORK=1 (default 0): fork_layer_forests
+    return os.environ.get("FSB_GLUE_FORK", "0") == "1"
+
+
+def _fork_now() -> bool:
+    # the fork runs while a CUDA graph is captured, whose replays repeat it at no host cost; an eager prefill keeps
+    # the build on the long-range branch: the fork's host work (its own gate, the stream switch and an event per
+    # layer) would land on the short prompts, whose eager prefill is bound by the host
+    return torch.cuda.is_current_stream_capturing()
+
+
+def fork_layer_forests(attn, K: torch.Tensor, N: int) -> None:
+    # FSB_GLUE_FORK=1: a standard FS-B prefill under CUDA-graph capture builds the layer's cell statistics and forests
+    # (_layer_forests, which read only K) on a side stream forked right after the K projection, beside the V and Q
+    # projections and the window branch, instead of at the head of the long-range branch; fsb_prefill_fast joins it
+    # and takes them when they are its own inputs (the same K, length and constants), so the same kernels run on the
+    # same inputs and give the same values. Only for the inputs the fast prefill takes (prefill_fast_ok with K for the
+    # same-shaped Q) and no padded cells. The side stream allocates from its own pool after waiting for the caller's
+    # stream, and the caller joins it before its first read of these tensors and keeps K until after the join
+    # (join_layer_forests); the fork and the join put both streams in the captured graph. The stream is created on
+    # the eager pass that precedes every capture (it compiles the kernels), outside the capture.
+    join_layer_forests(attn)
+    if not (glue_fork_on() and K.is_cuda and K.dim() == 4 and not torch.is_grad_enabled() and not compiling()):
+        return
+    dev = K.device
+    side = _FORK_STREAMS.get(str(dev))
+    if side is None:
+        side = _FORK_STREAMS[str(dev)] = torch.cuda.Stream(device=dev)
+    if not _fork_now():
+        return
+    from .fsb_tree import beam_delta_eff, union_tau_on
+    B, H, _, Dh = K.shape
+    s = attn.cell_stride
+    M = (N + s - 1) // s
+    Bq = min(attn._cell_block, N)
+    if M * s != N or K.shape[2] != N or not prefill_fast_ok(attn, K, K, Bq):
+        return
+    nb = (N + Bq - 1) // Bq
+    T = B * H
+    stages = _stages(attn, T, nb, Bq, Dh, M, beam_delta_eff(attn), union_tau_on(attn))
+    cst = _consts(dev, B, H, nb, Bq, stages)
+    side.wait_stream(torch.cuda.current_stream(dev))
+    with torch.cuda.stream(side), torch.no_grad(), torch.autocast(device_type=dev.type, enabled=False):
+        res = _layer_forests(attn, K, M, s, nb, Bq, cst)
+    ev = torch.cuda.Event()
+    ev.record(side)
+    attn._fsb_fork = (K, (N, cst["blk_start"].data_ptr()), res, ev)
+
+
+def join_layer_forests(attn):
+    # the caller's stream waits for a pending fork_layer_forests and drops it -> (K, key, forests, event) or None
+    fk = getattr(attn, "_fsb_fork", None)
+    if fk is not None:
+        attn._fsb_fork = None
+        torch.cuda.current_stream(fk[0].device).wait_event(fk[3])
+    return fk
 
 
 def _redo_stages(attn, Q, F, m_b_all, sigma, N, Bq, blk_start, tokK, lb, nb, spans, sel32, prov_full, nv_full):

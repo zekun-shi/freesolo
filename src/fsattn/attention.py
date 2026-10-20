@@ -920,6 +920,15 @@ class FSAttn(nn.Module):
         torch.mm(x.view(B * N, C), lin.weight.t(), out=out)
         return out.view(B, N, H, D).transpose(1, 2)
 
+    def _fork_forests(self, fork: bool, K, N: int) -> None:
+        # FSB_GLUE_FORK=1 (FS-B standard prefill; default 0): in a captured prefill the layer's cell statistics and
+        # forests, which read only K, start on a side stream as soon as K exists (fsb_prefill.fork_layer_forests),
+        # beside the V and Q projections; the long-range branch joins them (and _forward_cached joins any it did not
+        # take)
+        if fork:
+            from .fsb_prefill import fork_layer_forests
+            fork_layer_forests(self, K, N)
+
     def _forward_cached(self, x, cache):
         B, N, _ = x.shape
         self._assert_cacheable(phase="prefill" if (cache.pos == 0 and N > 1) else "decode")
@@ -932,8 +941,10 @@ class FSAttn(nn.Module):
         cap = N + max(0, int(getattr(cache, "reserve", 0))) if pre is not None else 0
         pre_kv = (pre is not None and torch.is_tensor(pre[2]) and pre[0] == B and pre[1] == N
                   and tuple(pre[2].shape) == (B, H, cap, D) and pre[2].device == x.device)
+        fork = self.fsb_enabled and is_std_prefill and os.environ.get("FSB_GLUE_FORK", "0") == "1"
         if pre_kv and self._kv_token_major_ok(x, cache, pre):
             K = self._project_into(self.W_k, x, pre[2])
+            self._fork_forests(fork, K, N)
             V = self._project_into(self.W_v, x, pre[3])
             Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
         elif pre_kv:
@@ -942,6 +953,7 @@ class FSAttn(nn.Module):
                 K = pre[2][:, :, :N]
                 K.copy_(wk)
                 del wk
+                self._fork_forests(fork, K, N)
                 wv = self.W_v(x).view(B, N, H, D).transpose(1, 2)
                 V = pre[3][:, :, :N]
                 V.copy_(wv)
@@ -951,15 +963,23 @@ class FSAttn(nn.Module):
                 Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
                 K = wk
                 del wk
+                self._fork_forests(fork, K, N)
                 V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
         elif is_std_prefill and not torch.is_grad_enabled() and pre_ok and not compiling() and N > 4096:
             if self._kv_token_major_ok(x, cache):
                 K = self.W_k(x).view(B, N, H, D).transpose(1, 2)
+                self._fork_forests(fork, K, N)
                 V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
             else:
                 K = self.W_k(x).view(B, N, H, D).transpose(1, 2).contiguous()
+                self._fork_forests(fork, K, N)
                 V = self.W_v(x).view(B, N, H, D).transpose(1, 2).contiguous()
             Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+        elif fork and not torch.is_grad_enabled():
+            K = self.W_k(x).view(B, N, H, D).transpose(1, 2)
+            self._fork_forests(fork, K, N)
+            Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
+            V = self.W_v(x).view(B, N, H, D).transpose(1, 2)
         else:
             Q = self.W_q(x).view(B, N, H, D).transpose(1, 2)
             K = self.W_k(x).view(B, N, H, D).transpose(1, 2)
@@ -1037,6 +1057,9 @@ class FSAttn(nn.Module):
                     out_long = self._long_range(Q_lr, K_lr, V, sigma, N)
                 finally:
                     fused, cell_stats = self._end_lr()
+            if getattr(self, "_fsb_fork", None) is not None:
+                from .fsb_prefill import join_layer_forests
+                join_layer_forests(self)
             y = self._combine(out_short, out_long, fused, B, N, sr_event=ev)
             if not torch.is_grad_enabled():
                 del Q, Q_lr, out_short, out_long

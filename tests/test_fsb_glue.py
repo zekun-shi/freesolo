@@ -1,9 +1,11 @@
 """The FS-B prefill's work around its selection kernels: K and V taken in the projections' token-major layout when the
-prefill keeps no KV cache (FSB_GLUE_KV, FSAttn._kv_token_major_ok / _project_into), against the same model with the
-switch off, bit for bit: hidden states, every layer's selected cells, the KV cache the prefill leaves, eager and
-CUDA-graph captured prefills (replayed on new inputs), at the released attention shape (16 heads of 64, cells of 32,
-K = 4, beam width 16) with partial query blocks, padded cells, several stages and tied cells; plus the copies the
-switch removes and where it must not apply."""
+prefill keeps no KV cache (FSB_GLUE_KV, FSAttn._kv_token_major_ok / _project_into) and the layer's cell statistics and
+forests built on a side stream forked right after the K projection in a captured prefill (FSB_GLUE_FORK,
+fsb_prefill.fork_layer_forests), against the same model with both switches off, bit for bit: hidden states, every
+layer's selected cells, the KV cache the prefill leaves, eager and CUDA-graph captured prefills (replayed on new
+inputs), at the released attention shape (16 heads of 64, cells of 32, K = 4, beam width 16) with partial query
+blocks, padded cells, several stages, two sequences and tied cells; plus the work each switch removes and where it
+must not apply."""
 import os
 import sys
 
@@ -23,7 +25,7 @@ from src.fsattn.attention import FSAttn  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not fp._HAVE_TRITON, reason="needs Triton")
 
-SWITCHES = ("FSB_GLUE_KV",)
+SWITCHES = ("FSB_GLUE_KV", "FSB_GLUE_FORK")
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -91,6 +93,8 @@ def _prefill(monkeypatch, m, x, retain):
                 t = getattr(c, name, None)
                 if torch.is_tensor(t):
                     out[f"{name}{j}"] = t.clone()
+    for blk in m.blocks:
+        assert getattr(blk.attn.fsattn, "_fsb_fork", None) is None      # every fork was joined
     return out
 
 
@@ -101,7 +105,7 @@ def _prefill(monkeypatch, m, x, retain):
                               "short", "batch2"])
 @pytest.mark.parametrize("retain", [False, True], ids=["prefill_only", "keep_cache"])
 def test_glue_eager_prefill_matches_off(monkeypatch, L, blk, ties, B, retain):
-    # the switch on against off: same hidden states, selected cells (in order) and cache, bit for bit
+    # every switch combination against both off: same hidden states, selected cells (in order) and cache, bit for bit
     monkeypatch.setenv("FS_FUSED_ATTN", "1")
     monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
     monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", blk)
@@ -111,18 +115,19 @@ def test_glue_eager_prefill_matches_off(monkeypatch, L, blk, ties, B, retain):
     _calibrate(m, x)
     ref = _prefill(monkeypatch, m, x, retain)
     assert len([k for k in ref if k.startswith("sel")]) == 2
-    _set(monkeypatch, SWITCHES)
-    got = _prefill(monkeypatch, m, x, retain)
-    assert got.keys() == ref.keys()
-    for k in ref:
-        assert _same(got[k], ref[k]), k
+    for on in (("FSB_GLUE_KV",), ("FSB_GLUE_FORK",), SWITCHES):
+        _set(monkeypatch, on)
+        got = _prefill(monkeypatch, m, x, retain)
+        assert got.keys() == ref.keys(), on
+        for k in ref:
+            assert _same(got[k], ref[k]), (on, k)
 
 
 @pytest.mark.parametrize("retain", [False, True], ids=["prefill_only", "keep_cache"])
 def test_glue_graphed_prefill_matches_eager_off(monkeypatch, retain):
-    # the switch inside a captured prefill (several stages on the stage pipe, the forked window, the bench's shared
+    # both switches inside a captured prefill (several stages on the stage pipe, the forked window, the bench's shared
     # K / V buffers that every layer overwrites when no cache is kept): replays on the captured and on new inputs equal
-    # the eager prefill with the switch off bit for bit
+    # the eager prefill with the switches off bit for bit
     from decode_graph import GraphedPrefiller
     from kv_cache import _trunk_cached, make_caches
     from longctx_infer import _lm_head_fp32
@@ -150,6 +155,8 @@ def test_glue_graphed_prefill_matches_eager_off(monkeypatch, retain):
         if retain:
             for cg, ce in zip(gp.cache, cs):
                 assert _same(cg._kbar, ce._kbar) and _same(cg._ceil, ce._ceil)
+    for blk in m.blocks:
+        assert getattr(blk.attn.fsattn, "_fsb_fork", None) is None
 
 
 @pytest.mark.parametrize("N,extra", [(4096, 0), (3000, 0), (3000, 40), (1, 0)])
@@ -212,3 +219,112 @@ def test_glue_kv_drops_the_layout_copies_only_without_cache(monkeypatch, preallo
             n[kv, retain] = _copies(lambda: run(retain))
     assert n["0", False] - n["1", False] == 2 * n_layers, n
     assert n["0", True] == n["1", True], n
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["capture", "eager_forced"])
+def test_glue_fork_is_taken_where_the_fast_prefill_runs(monkeypatch, forced):
+    # FSB_GLUE_FORK=1 builds each layer's forests once, on the fork stream, inside a captured prefill (and eagerly when
+    # the capture-only gate is forced open), and the fast prefill takes them; the eager pass before the capture, padded
+    # cells and the switch off keep the build on the long-range branch
+    from decode_graph import GraphedPrefiller
+    from kv_cache import _trunk_cached, make_caches
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
+    if forced:
+        monkeypatch.setattr(fp, "_fork_now", lambda: True)
+    calls = []
+    real = fp._layer_forests
+
+    def spy(*a, **k):
+        side = fp._FORK_STREAMS.get(str(torch.device("cuda", torch.cuda.current_device())))
+        calls.append((torch.cuda.is_current_stream_capturing(),
+                      side is not None and torch.cuda.current_stream().cuda_stream == side.cuda_stream))
+        return real(*a, **k)
+
+    monkeypatch.setattr(fp, "_layer_forests", spy)
+    for L, fork in ((4096, "1"), (3000, "1"), (4096, "0")):
+        m = _model(L)
+        x = _tokens(L, 9)
+        _set(monkeypatch, ())
+        _calibrate(m, x)
+        monkeypatch.setenv("FSB_GLUE_FORK", fork)
+        calls.clear()
+        n = len(m.blocks)
+        forked = fork == "1" and L % 32 == 0
+        if forced:
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                _trunk_cached(m, x, make_caches(m, retain_kv=False))
+            assert calls == [(False, forked)] * n, (L, fork, calls)
+        else:
+            gp = GraphedPrefiller(m, L, B=1, device="cuda", dtype=torch.bfloat16, tail_tokens=64, retain_kv=False)
+            gp.capture(x)                                    # an eager warm-up pass, then the capture
+            assert calls == [(False, False)] * n + [(True, forked)] * n, (L, fork, calls)
+            gp.run(x)
+            del gp
+        for blk in m.blocks:
+            assert getattr(blk.attn.fsattn, "_fsb_fork", None) is None
+
+
+def test_glue_fork_unused_is_joined(monkeypatch):
+    # a fork whose forests the long-range branch does not take (here its own gate sends it to the stage loop) is
+    # still joined before the layer's output, and the output is the switch-off output (the capture-only gate forced
+    # open, so the eager prefill forks)
+    from kv_cache import _trunk_cached, make_caches
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
+    monkeypatch.setattr(fp, "_fork_now", lambda: True)
+    L = 2048
+    m = _model(L)
+    x = _tokens(L, 3)
+    _set(monkeypatch, ())
+    _calibrate(m, x)
+    joins = []
+    real = fp.join_layer_forests
+
+    def spy(attn):
+        fk = real(attn)
+        joins.append(fk is not None)
+        return fk
+
+    monkeypatch.setattr(fp, "join_layer_forests", spy)
+    out = {}
+    for fork in ("0", "1"):
+        monkeypatch.setenv("FSB_GLUE_FORK", fork)
+        joins.clear()
+        orig_ok = fp.prefill_fast_ok
+
+        def ok(attn, Q, tokK, Bq):                           # the fork's check passes, the branch's own one fails
+            return orig_ok(attn, Q, tokK, Bq) if Q is tokK else False
+
+        monkeypatch.setattr(fp, "prefill_fast_ok", ok)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out[fork] = _trunk_cached(m, x, make_caches(m, retain_kv=False)).clone()
+        monkeypatch.setattr(fp, "prefill_fast_ok", orig_ok)
+        assert (sum(joins) == len(m.blocks)) == (fork == "1"), (fork, joins)
+        for blk in m.blocks:
+            assert getattr(blk.attn.fsattn, "_fsb_fork", None) is None
+    assert _same(out["0"], out["1"])
+
+
+def test_glue_fork_forced_eager_matches_off(monkeypatch):
+    # the forked build with the capture-only gate forced open in an eager prefill of several stages and the cache kept:
+    # hidden states, selected cells and cache bit for bit as with the switch off
+    monkeypatch.setenv("FS_FUSED_ATTN", "1")
+    monkeypatch.setenv("FS_PRUNE_KERNEL", "0")
+    monkeypatch.setenv("FSB_FAST_PREFILL_BLKCHUNK", "8")
+    L = 4096
+    m = _model(L)
+    x = _tokens(L, 77)
+    _set(monkeypatch, ())
+    _calibrate(m, x)
+    real_now = fp._fork_now
+    for retain in (False, True):
+        _set(monkeypatch, ())
+        ref = _prefill(monkeypatch, m, x, retain)
+        monkeypatch.setattr(fp, "_fork_now", lambda: True)
+        _set(monkeypatch, SWITCHES)
+        got = _prefill(monkeypatch, m, x, retain)
+        monkeypatch.setattr(fp, "_fork_now", real_now)
+        assert got.keys() == ref.keys()
+        for k in ref:
+            assert _same(got[k], ref[k]), (retain, k)

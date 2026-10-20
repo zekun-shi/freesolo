@@ -25,7 +25,7 @@ def _fsb_execution_env():
                 "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
                 "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
                 "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "1", "FSB_BUILD_UNIFORM": "1",
-                "FSB_BEAM_LONG": "1", "FSB_GLUE_KV": "0"}
+                "FSB_BEAM_LONG": "1", "FSB_GLUE_KV": "0", "FSB_GLUE_FORK": "0"}
     return {name: os.environ.get(name, default) for name, default in defaults.items()}
 
 def _attn_execution_env():
