@@ -1418,3 +1418,589 @@ fsb_beam_rows(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const
 #endif
     }
 }
+// >>> SECTION: _ROWS2_KERNEL <<<
+
+// ---- lean row-cooperative prefill descent (FSB_BEAM_V2=1): fsb_beam_rows' tensor-core configuration (bf16 queries,
+// 128 per block, head dim 64, frontier width 16, up to 4 cells per frontier node) with the same levels, unions, bf16
+// dots and scores, restructured around four changes:
+// - selection by sorting networks on packed keys, key = (order-preserving bits of the score, low 5 bits cleared) |
+//   (31 - child index): each lane sorts the keys of its 8 frontier slots' children (16 keys, Batcher's network) and the
+//   lane pair merges the two sorted halves (bitonic), so lane h ends with ranks 8 h .. 8 h + 7. Two children whose
+//   scores agree in their top 27 bits (relative 2^-18) are ordered by child index, where the rank counting of
+//   fsb_beam_rows orders them by the low bits (the KEY64 test build keeps every bit and matches it exactly);
+// - per-query state in registers: the open frontier (union slots in rank order, a byte each, with 4-bit codes of the
+//   union's nodes staged for the block's budget); carried nodes, which never expand again, leave it for a
+//   shared-memory prefix in carry order;
+// - two block barriers per level: one after the expanded parents' marks (bytes over the union, read back by ballots),
+//   after which the marked parents' threads (one per child, all warps) stage the next union and publish its slot
+//   ranks, and one after that union is staged;
+// - warp-local dots: each warp dots its own 16 queries (its mma rows) with the union, DCH slots at a time, and gathers
+//   its queries' child scores after a __syncwarp.
+// A union of more than UC2 slots hands the block's queries to the warp-per-query descent from that level, as in
+// fsb_beam_rows.
+
+// UC2: union slots of a level (a larger union falls back), DCH: union slots per warp dot chunk (fsb_beam_cuda)
+#define MK2 (UC2 + 16)                            // bytes per mark buffer: one per union slot, then the level flags
+
+static_assert(UC2 >= 32 && UC2 <= UMAX && UC2 <= 128 && (UC2 & (UC2 - 1)) == 0 && DCH == 64 && WM == 16 && R <= 4 &&
+              DH == 64 && QB == 128, "fsb_beam_rows2's configuration");
+
+// KEY64 (a test build): 64-bit keys holding all 32 order-preserving score bits above the child index, i.e. exactly
+// fsb_beam_rows' (score desc, child asc) order, which shows the 32-bit keys' truncation is their only deviation
+#if KEY64
+typedef unsigned long long skey;
+__device__ __forceinline__ skey kmax(const skey a, const skey b) { return a > b ? a : b; }
+__device__ __forceinline__ skey kmin(const skey a, const skey b) { return a > b ? b : a; }
+#else
+typedef unsigned skey;
+__device__ __forceinline__ skey kmax(const skey a, const skey b) { return umax(a, b); }
+__device__ __forceinline__ skey kmin(const skey a, const skey b) { return umin(a, b); }
+#endif
+
+__device__ __forceinline__ void ce_desc(skey& a, skey& b) {                  // a <- max, b <- min
+    const skey x = kmax(a, b);
+    b = kmin(a, b);
+    a = x;
+}
+
+// Batcher's odd-even merge sort of 16 keys, descending (63 compare-exchanges)
+__device__ __forceinline__ void sort16_desc(skey (&k)[16]) {
+#define CE(a, b) ce_desc(k[a], k[b])
+    CE(0,1); CE(2,3); CE(4,5); CE(6,7); CE(8,9); CE(10,11); CE(12,13); CE(14,15); CE(0,2); CE(1,3); CE(4,6); CE(5,7);
+    CE(8,10); CE(9,11); CE(12,14); CE(13,15); CE(1,2); CE(5,6); CE(9,10); CE(13,14); CE(0,4); CE(1,5); CE(2,6);
+    CE(3,7); CE(8,12); CE(9,13); CE(10,14); CE(11,15); CE(2,4); CE(3,5); CE(10,12); CE(11,13); CE(1,2); CE(3,4);
+    CE(5,6); CE(9,10); CE(11,12); CE(13,14); CE(0,8); CE(1,9); CE(2,10); CE(3,11); CE(4,12); CE(5,13); CE(6,14);
+    CE(7,15); CE(4,8); CE(5,9); CE(6,10); CE(7,11); CE(2,4); CE(3,5); CE(6,8); CE(7,9); CE(10,12); CE(11,13); CE(1,2);
+    CE(3,4); CE(5,6); CE(7,8); CE(9,10); CE(11,12); CE(13,14);
+#undef CE
+}
+
+// slot of the r-th byte of a lane's 8 packed bytes (lo: bytes 0-3, hi: 4-7)
+__device__ __forceinline__ int byte8(const unsigned lo, const unsigned hi, const int j) {
+    return (int)(((j < 4 ? lo : hi) >> (8 * (j & 3))) & 0xffu);
+}
+
+// a node's 4-bit code for budget bud: expanded (cnt > bud) | carried (cnt <= bud) << 1 | left child << 2 | right child
+// << 3 (children only when expanded; a NaN count is neither expanded nor carried)
+__device__ __forceinline__ unsigned node_code(const float cnt, const float chl, const float chr, const float bud) {
+    const bool ex = cnt > bud, ca = cnt <= bud;
+    return (unsigned)ex | ((unsigned)ca << 1) | ((unsigned)(ex && chl != -1.0f) << 2) |
+           ((unsigned)(ex && chr != -1.0f) << 3);
+}
+
+// union-slot pair index of a chunk dot row (DCH / 2 = 32 pairs), swizzled so one n-tile's fragment stores (rows g,
+// pairs t4) hit 32 banks
+__device__ __forceinline__ int dswz(const int row) { return (row & 7) << 2; }
+
+__device__ __forceinline__ void ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+// the selection key of a child with score s and child index c, or 0 when it has no child (exists false) or its score is
+// not above the reference's -5e8 (NaN included): the order-preserving bits of s (sign bit set for s >= 0, every bit
+// flipped below) with the low 5 bits replaced by 31 - c, so equal tops rank the earlier child first. A mean score can
+// be -0 (a -0 dot and a -0 prior), which counts as +0; a bound score never is (with a radius coefficient >= 0 its
+// radius term is +0 or positive).
+__device__ __forceinline__ skey child_key(const float s, const int c, const bool exists) {
+#if BOUND
+    const unsigned u = __float_as_uint(s);
+#else
+    const unsigned u = __float_as_uint(f_add(s, 0.0f));
+#endif
+    const unsigned o = u ^ ((unsigned)((int)u >> 31) | 0x80000000u);
+#if KEY64
+    return (exists && s > -5e8f) ? (((skey)o << 32) | (skey)(31 - c)) : (skey)0;
+#else
+    return (exists && s > -5e8f) ? ((o & ~31u) | (unsigned)(31 - c)) : 0u;
+#endif
+}
+
+// one dot chunk of a warp (union slots [cd, cd + DCH), all of the union when !CHUNKED): the mma of its 16 queries with
+// the chunk's tile rows (B fragments by ldmatrix: thread i addresses row 8 nt + (i & 7), piece i >> 3, + 4 for the
+// second load; rows past the union repeat its last row), bf16 after the scale as fsb_beam_rows, then this lane's
+// children's keys from their dot pair and score-term pair (a frontier slot's two children sit at union slots 2 pi,
+// 2 pi + 1, pi = base / 2 of the slot's base in bv; pk holds the child bits)
+template <bool CHUNKED>
+__device__ __forceinline__ void chunk_keys(skey (&key)[16], const unsigned* s_mu, unsigned* s_dw, const float4* s_ux2,
+                                           const unsigned (&qa)[4][4], const unsigned bv_lo, const unsigned bv_hi,
+                                           const unsigned pk, const float qn, const float scale, const int Pc,
+                                           const int cd, const int lane, const int h) {
+    const int g = lane >> 2, t4 = lane & 3, ql = lane >> 1;
+    const unsigned pm = CHUNKED ? 0x3f3f3f3fu : 0x1f1f1f1fu;              // pair indices below UC2 / 2 (DCH / 2)
+    const unsigned pv_lo = (bv_lo >> 1) & pm, pv_hi = (bv_hi >> 1) & pm;
+#pragma unroll
+    for (int nt = 0; nt < DCH / 8; nt++) {
+        if (cd + 8 * nt < Pc) {
+            const int u_row = min(cd + 8 * nt + (lane & 7), Pc - 1);
+            const unsigned ra = (unsigned)__cvta_generic_to_shared(s_mu + u_row * 32);
+            unsigned b[8];
+            ldsm_x4(b[0], b[1], b[2], b[3], ra + 16u * ((unsigned)(lane >> 3) ^ (unsigned)(u_row & 7)));
+            ldsm_x4(b[4], b[5], b[6], b[7], ra + 16u * ((unsigned)((lane >> 3) + 4) ^ (unsigned)(u_row & 7)));
+            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int ks = 0; ks < 4; ks++) mma16816_tc(acc, qa[ks], b[2 * ks], b[2 * ks + 1]);
+            const int pr = 4 * nt + t4;
+            s_dw[g * (DCH / 2) + (pr ^ dswz(g))] = pack_bf16x2(f_mul(acc[0], scale), f_mul(acc[1], scale));
+            s_dw[(g + 8) * (DCH / 2) + (pr ^ dswz(g + 8))] = pack_bf16x2(f_mul(acc[2], scale), f_mul(acc[3], scale));
+        }
+    }
+    __syncwarp();
+    const unsigned* drow = s_dw + ql * (DCH / 2);
+#pragma unroll
+    for (int jj = 0; jj < 8; jj++) {
+        const int pi = byte8(pv_lo, pv_hi, jj);
+        int pl = pi;
+        unsigned two = (pk >> (4 * jj + 2)) & 3u;
+        if (CHUNKED) {
+            pl = pi - (cd >> 1);
+            if ((unsigned)pl >= (unsigned)(DCH / 2)) { pl = 0; two = 0u; }
+        }
+        const unsigned dd = drow[pl ^ dswz(ql)];
+        const float4 tm = s_ux2[pi];
+        const float dl = __uint_as_float(dd << 16), dr = __uint_as_float(dd & 0xffff0000u);
+#if BOUND
+        const float sl = f_add(f_add(dl, f_mul(qn, tm.x)), tm.y);
+        const float sr = f_add(f_add(dr, f_mul(qn, tm.z)), tm.w);
+#else
+        const float sl = f_add(dl, tm.y);
+        const float sr = f_add(dr, tm.w);
+#endif
+        const int c = 2 * (8 * h + jj);
+        if (!CHUNKED || (two & 1u)) key[2 * jj] = CHUNKED ? child_key(sl, c, true) : child_key(sl, c, (two & 1u) != 0u);
+        if (!CHUNKED || (two & 2u)) key[2 * jj + 1] = CHUNKED ? child_key(sr, c + 1, true)
+                                                              : child_key(sr, c + 1, (two & 2u) != 0u);
+    }
+    __syncwarp();
+}
+
+extern "C" __global__ void __launch_bounds__(NT, MINB2)
+fsb_beam_rows2(const BeamP B0, const BeamP B1, const float* __restrict__ Q, const float* __restrict__ QPOS,
+               const float* __restrict__ RC, const float rc_s, const float* __restrict__ LAM,
+               const float* __restrict__ SIG, const int Bq, const float scale, const float cell_size,
+               const i64 QST_T, const i64 QST_B, const int NQ, int* __restrict__ FBC) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    unsigned* s_mu = reinterpret_cast<unsigned*>(smem + OFF2_MU);     // [UC2][32] union tile: bf16 pairs, row u's
+                                                                       // 16-byte pieces XOR (u & 7)
+    unsigned* s_dot = reinterpret_cast<unsigned*>(smem + OFF2_DOT);   // [8][16][DCH / 2] each warp's chunk dots
+    float4* s_um = reinterpret_cast<float4*>(smem + OFF2_UM);         // [2][UC2] union nodes: ref (bits), cnt, children
+    float2* s_ux = reinterpret_cast<float2*>(smem + OFF2_UX);         // [UC2] the staged union: rad * scale, prior
+    int* s_car = reinterpret_cast<int*>(smem + OFF2_CAR);             // [QB][16] carried node refs, in carry order
+    unsigned char* s_cs = smem + OFF2_CS;                              // [QB][16] open rank r's left child slot
+    unsigned char* s_mk = smem + OFF2_MK;                              // [2][MK2] parent marks, then the level flags
+    unsigned char* s_rank = smem + OFF2_RANK;                          // [UC2] a marked parent's children's union slot
+    unsigned char* s_code = smem + OFF2_CODE;                          // [2][UC2] the union nodes' 4-bit codes
+    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int qi = tid >> 1, h = tid & 1, ql = lane >> 1;
+#ifdef PROF
+    unsigned long long ptim = clock64(), pacc[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+#endif
+    const int bpr = (Bq + QB - 1) / QB;
+    const bool sec = (i64)blockIdx.x >= B0.rows * bpr;
+    const i64 blk = sec ? (i64)blockIdx.x - B0.rows * bpr : (i64)blockIdx.x;
+    const i64 t = blk / bpr;
+    const int q0 = (int)(blk - t * bpr) * QB;
+#define BSEL(f) (sec ? B1.f : B0.f)
+    const i64* ROOT = BSEL(ROOT);
+    i64* CELLS = BSEL(CELLS);
+    float* NVIS = BSEL(NVIS);
+    const i64* WBEAM = BSEL(WBEAM);
+    const i64* BUDGET = BSEL(BUDGET);
+    const i64* TIDX = BSEL(TIDX);
+    const unsigned short* CHUNK = BSEL(CHUNK);
+    const float* CHUNK_AX = BSEL(CHUNK_AX);
+    const float* SPINE = BSEL(SPINE);
+    const i64* LEAF = BSEL(LEAF);
+    const i64* ADM = BSEL(ADM);
+    const i64 Ntot = BSEL(Ntot), Sp = BSEL(Sp), Ltot = BSEL(Ltot), Mm = BSEL(Mm);
+    const int KMAXP1 = BSEL(KMAXP1);
+#undef BSEL
+    const i64 tidx = TIDX[t];
+    const unsigned short* cmub = CHUNK + tidx * Ntot * DH;
+    const float* cax = CHUNK_AX + tidx * Ntot * NA;
+    const float* sbase = SPINE + t * Sp * NC;
+    const i64* leafb = LEAF + tidx * Ltot;
+    const i64* admb = ADM + tidx * Mm;
+#if RC_T
+    const float rcq = RC[t];
+#else
+    const float rcq = rc_s;
+#endif
+    const float lam = LAM[t];
+    const float sig2 = f_mul(2.0f, SIG[t]);
+    const int root = (int)ROOT[t];
+    const bool qok = q0 + qi < Bq;
+    const bool qr_ok = qok && q0 + qi < NQ;                           // a strided stage view's pads read zeros
+    const i64 pid = t * Bq + (qok ? q0 + qi : 0);
+    const i64 qrow = t * QST_T + (qr_ok ? q0 + qi : 0) * QST_B;
+    // the query's radius-scaled norm (lane h: columns 32 h .. 32 h + 31) and the warp's mma A fragments (rows 16 wid +
+    // g and + 8), as fsb_beam_rows reads them
+    float qn;
+    {
+        const unsigned short* qp = reinterpret_cast<const unsigned short*>(Q) + qrow;
+        float qs = 0.0f;
+        if (qr_ok) {
+#pragma unroll
+            for (int m = 0; m < 4; m++) {
+                const uint4 a = __ldg(reinterpret_cast<const uint4*>(qp + 32 * h + 8 * m));
+                const float f0 = __uint_as_float(a.x << 16), f1 = __uint_as_float(a.x & 0xffff0000u);
+                const float f2 = __uint_as_float(a.y << 16), f3 = __uint_as_float(a.y & 0xffff0000u);
+                const float f4 = __uint_as_float(a.z << 16), f5 = __uint_as_float(a.z & 0xffff0000u);
+                const float f6 = __uint_as_float(a.w << 16), f7 = __uint_as_float(a.w & 0xffff0000u);
+                qs = f_add(qs, f_add(f_add(f_mul(f0, f0), f_mul(f1, f1)), f_add(f_mul(f2, f2), f_mul(f3, f3))));
+                qs = f_add(qs, f_add(f_add(f_mul(f4, f4), f_mul(f5, f5)), f_add(f_mul(f6, f6), f_mul(f7, f7))));
+            }
+        }
+        qn = f_mul(f_sqrt_ftz(f_add(qs, __shfl_xor_sync(FULL, qs, 1))), rcq);
+    }
+    const int g = lane >> 2, t4 = lane & 3;
+    unsigned qa[4][4];
+    {
+        const unsigned short* qbase_bf = reinterpret_cast<const unsigned short*>(Q) + t * QST_T + q0 * QST_B;
+        const int r0 = 16 * wid + g, r1 = r0 + 8;
+        const bool ok0 = q0 + r0 < NQ, ok1 = q0 + r1 < NQ;
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            const int c0 = 16 * ks + 2 * t4, c1 = c0 + 8;
+            qa[ks][0] = ok0 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r0 * QST_B + c0)) : 0u;
+            qa[ks][1] = ok1 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r1 * QST_B + c0)) : 0u;
+            qa[ks][2] = ok0 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r0 * QST_B + c1)) : 0u;
+            qa[ks][3] = ok1 ? __ldg(reinterpret_cast<const unsigned*>(qbase_bf + r1 * QST_B + c1)) : 0u;
+        }
+    }
+    const float qpos_blk = QPOS[t * Bq + q0 + min(QB / 2, Bq - q0 - 1)];
+    const float bud = qok ? (float)BUDGET[pid] : 0.0f;
+    const i64 wbeam = qok ? WBEAM[pid] : 0;
+    const int wl = (int)min(max(wbeam, (i64)0), (i64)WM);             // frontier slots that can be kept
+    // the budget the staged codes use: the block's first query's (every query of a prefill row shares its row's)
+    const float bud_blk = (float)BUDGET[t * Bq + q0];
+    const bool ubud = !qok || bud == bud_blk;
+    // level 0's union is the root (buffer 0, slot 0); every query starts with it as its one open entry
+    if (tid == 0 && root != -1) {
+        const float* p = aux_row(cax, sbase, root);
+        s_um[0] = make_float4(__int_as_float(root), p[3], p[4], p[5]);
+        s_code[0] = (unsigned char)node_code(p[3], p[4], p[5], bud_blk);
+    }
+    for (int v = tid; v < 2 * MK2 / 4; v += NT) reinterpret_cast<unsigned*>(s_mk)[v] = 0u;
+    __syncthreads();
+    unsigned o_lo = 0u, o_hi = 0u;            // open entries: union slots in rank order, lane h ranks 8 h .. 8 h + 7
+    int nopen = (qok && root != -1) ? 1 : 0, ncar = 0, nvis = 0;
+    bool done = !qok;
+    int ub = 0, fb_lev = -1;                  // the union buffer the open entries index; the fallback level
+    int ncar0 = 0, nvis0 = 0, nopen0 = 0;     // the level's starting state (the fallback restarts the level)
+    bool done0 = done;
+    PMARK(0);
+    for (int lev = 0; lev < KMAXP1; lev++) {
+        unsigned char* mk = s_mk + ub * MK2;
+        const float4* um_cur = s_um + ub * UC2;
+        ncar0 = ncar; nvis0 = nvis; nopen0 = nopen; done0 = done;
+        // ---- A: the open entries as 4-bit codes: expanded (cnt > budget: their children are the candidates, their
+        // slots are marked), carried (cnt <= budget: appended to the carried prefix in slot order, positions past the
+        // width drop), left / right child present; a NaN count is neither expanded nor carried: dropped, as in every
+        // beam kernel. The union stages the codes for the block's budget; a query with a budget of its own derives them
+        // from the node fields (children are stored as exact integers, -1 for none). Nibble j of pk is open rank
+        // 8 h + j (0 past the open count). A query with nothing to expand, or no free slot for a child, is final.
+        const int nmine = done ? 0 : min(max(nopen - 8 * h, 0), 8);
+        const unsigned char* code_cur = s_code + ub * UC2;
+        unsigned pk = 0u;
+        if (ubud) {
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++)
+                pk |= (jj < nmine ? (unsigned)code_cur[byte8(o_lo, o_hi, jj) & (UC2 - 1)] : 0u) << (4 * jj);
+        } else {
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++) {
+                const float4 m = um_cur[byte8(o_lo, o_hi, jj) & (UC2 - 1)];
+                pk |= (jj < nmine ? node_code(m.y, m.z, m.w, bud) : 0u) << (4 * jj);
+            }
+        }
+        const unsigned po = __shfl_xor_sync(FULL, pk, 1);
+        const unsigned lo = h ? po : pk, hi = h ? pk : po;
+        int k = 0, n = 0;
+        if (!done) {
+            n = __popc(lo & 0xccccccccu) + __popc(hi & 0xccccccccu);
+            const int ncarry = __popc(lo & 0x22222222u) + __popc(hi & 0x22222222u);
+            const int cbase = ncar + (h ? __popc(lo & 0x22222222u) : 0);
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++) {
+                const int pos = cbase + __popc(pk & 0x22222222u & ((1u << (4 * jj)) - 1u));
+                if (((pk >> (4 * jj + 1)) & 1u) && pos < wl)
+                    s_car[qi * 16 + pos] = __float_as_int(um_cur[byte8(o_lo, o_hi, jj) & (UC2 - 1)].x);
+            }
+            // the level selects (ranks children by score) when a query has more children than free slots, the vote of
+            // fsb_beam_rows, which also counts a query whose frontier is not yet at its fixed point (open entries,
+            // or more carried nodes than slots: a width-0 root) though it keeps no child
+            if (ncar + ncarry + n > wl && (ncarry < nopen || ncar + ncarry > wl)) {
+                mk[UC2] = 1;
+                mk[UC2 + 1] = 1;
+            }
+            ncar = min(ncar + ncarry, wl);
+            nvis += n;
+            k = wl - ncar;
+            if (((lo | hi) & 0x11111111u) == 0u || k <= 0) {
+                done = true;
+                nopen = 0;
+                n = 0;
+            } else {
+#pragma unroll
+                for (int jj = 0; jj < 8; jj++)
+                    if ((pk >> (4 * jj)) & 1u) mk[byte8(o_lo, o_hi, jj)] = 1;
+                mk[UC2] = 1;                                           // a query descends further
+            }
+        }
+        PMARK(1);
+        __syncthreads();                                               // B1: the level's marks and flags
+        PMARK(2);
+        const unsigned fl = *reinterpret_cast<const unsigned short*>(mk + UC2);
+        if ((fl & 0xffu) == 0u) break;                                 // every query is final
+        const bool any_sel = (fl >> 8) != 0u;
+        unsigned bal[4];
+#pragma unroll
+        for (int w = 0; w < 4; w++) bal[w] = w < UC2 / 32 ? __ballot_sync(FULL, mk[32 * w + lane] != 0) : 0u;
+        const int c0 = __popc(bal[0]), c01 = c0 + __popc(bal[1]), c012 = c01 + __popc(bal[2]);
+        const int Pc = 2 * (c012 + __popc(bal[3]));
+#ifdef PROF
+        if (tid == 0 && FBC != nullptr) {                             // union sizes (8-slot bins) of select / keep-all
+            atomicAdd(FBC + (any_sel ? 128 : 192) + min(Pc >> 3, 63), 1);
+        }
+#endif
+        if (Pc > UC2) { fb_lev = lev; break; }
+        // the other buffer's marks were last read before this barrier: clear them for the next level
+        if (tid < MK2 / 4) reinterpret_cast<unsigned*>(s_mk + (ub ^ 1) * MK2)[tid] = 0u;
+        // ---- B: the next union: the marked parents' children in slot order, slot 2 r + side for the parent of rank r.
+        // Thread p + 128 side stages child side of parent slot p (all 8 warps take part): its tile row by cp.async (a
+        // spine row rounds its fp32 mean to bf16 as the warp kernels' tile does) when some query selects, its node
+        // fields and code; the left child's thread records the parent's child base 2 r in s_rank
+        float4* um_nxt = s_um + (ub ^ 1) * UC2;
+        unsigned char* code_nxt = s_code + (ub ^ 1) * UC2;
+        {
+            const int p = tid & 127, sd = tid >> 7, pw = p >> 5;
+            const unsigned bw = pw == 0 ? bal[0] : (pw == 1 ? bal[1] : (pw == 2 ? bal[2] : bal[3]));
+            if (p < UC2 && ((bw >> lane) & 1u)) {
+                const int pre = pw == 0 ? 0 : (pw == 1 ? c0 : (pw == 2 ? c01 : c012));
+                const int base = 2 * (pre + __popc(bw & ((1u << lane) - 1u)));
+                if (sd == 0) s_rank[p] = (unsigned char)base;
+                const float4 pm = um_cur[p];
+                const int ref = (int)(sd ? pm.w : pm.z);
+                const int u = base + sd;
+                unsigned* dst = s_mu + u * 32;
+                if (ref != -1) {
+                    const float* pa = aux_row(cax, sbase, ref);
+                    const float cnt = __ldg(pa + 3), chl = __ldg(pa + 4), chr = __ldg(pa + 5);
+                    if (any_sel) {
+                        if (ref >= 0) {
+                            const unsigned* src = reinterpret_cast<const unsigned*>(cmub + (i64)ref * DH);
+#pragma unroll
+                            for (int pc = 0; pc < 8; pc++) cp_async16(dst + 4 * (pc ^ (u & 7)), src + 4 * pc);
+                        } else {
+                            const float* sp = sbase + (i64)(-ref - 2) * NC;
+#pragma unroll
+                            for (int w = 0; w < 32; w++)
+                                dst[w ^ ((u & 7) << 2)] = pack_bf16x2(__ldg(sp + 2 * w), __ldg(sp + 2 * w + 1));
+                        }
+                        const float rad = __ldg(pa), amax = __ldg(pa + 1), pmin = __ldg(pa + 2);
+                        const float pmin_pos = f_mul(f_add(pmin, 0.5f), cell_size);
+                        const float dx = __int_as_float(__float_as_int(f_sub(qpos_blk, pmin_pos)) & 0x7fffffff);
+                        s_ux[u] = make_float2(f_mul(rad, scale), f_mul(f_mul(lam, amax), erf_tl(f_div_full(dx, sig2))));
+                    }
+                    um_nxt[u] = make_float4(__int_as_float(ref), cnt, chl, chr);
+                    code_nxt[u] = (unsigned char)node_code(cnt, chl, chr, bud_blk);
+                } else if (any_sel) {
+#pragma unroll
+                    for (int pc = 0; pc < 8; pc++) *reinterpret_cast<uint4*>(dst + 4 * pc) = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+        }
+        cp_async_commit();
+        cp_async_wait_all();
+        PMARK(3);
+        __syncthreads();                                               // B2: the union is staged
+        PMARK(4);
+        // each expanded entry's children sit at union slots base, base + 1 (its parent's s_rank)
+        unsigned bv_lo = 0u, bv_hi = 0u;
+        if (!done) {
+#pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+                bv_lo |= (unsigned)s_rank[byte8(o_lo, o_hi, jj) & (UC2 - 1)] << (8 * jj);
+                bv_hi |= (unsigned)s_rank[byte8(o_lo, o_hi, jj + 4) & (UC2 - 1)] << (8 * jj);
+            }
+        }
+        if (!any_sel) {
+            // ---- C0: no query selects: every child is kept, in child order (fsb_beam_rows' block-wide keep-all
+            // level), scattered through the warp's dot rows
+            unsigned char* no = reinterpret_cast<unsigned char*>(s_dot + wid * (16 * (DCH / 2))) + ql * 16;
+            if (!done) {
+                const int pbase = h ? __popc(lo & 0xccccccccu) : 0;
+#pragma unroll
+                for (int jj = 0; jj < 8; jj++) {
+                    const unsigned two = (pk >> (4 * jj + 2)) & 3u;
+                    const int pos = pbase + __popc(pk & 0xccccccccu & ((1u << (4 * jj + 2)) - 1u));
+                    const int base = byte8(bv_lo, bv_hi, jj);
+                    if (two & 1u) no[pos] = (unsigned char)base;
+                    if (two & 2u) no[pos + (int)(two & 1u)] = (unsigned char)(base + 1);
+                }
+            }
+            __syncwarp();
+            if (!done) {
+                const uint2 v = *reinterpret_cast<const uint2*>(no + 8 * h);
+                o_lo = v.x; o_hi = v.y;
+                nopen = n;
+            }
+            PMARK(7);
+        } else {
+            // ---- C: the warp's dots with the union, DCH slots at a time (bf16 after the scale, as fsb_beam_rows), and
+            // the keys of this lane's children (frontier slots 8 h + jj, left then right); a slot's two children are
+            // one dot pair and one pair of score terms
+            *reinterpret_cast<uint2*>(s_cs + qi * 16 + 8 * h) = make_uint2(bv_lo, bv_hi);
+            skey key[16];
+#pragma unroll
+            for (int i = 0; i < 16; i++) key[i] = 0u;
+            unsigned* s_dw = s_dot + wid * (16 * (DCH / 2));
+            const float4* s_ux2 = reinterpret_cast<const float4*>(s_ux);
+            const bool wact = __any_sync(FULL, !done);
+            if (wact) {
+                if (Pc <= DCH) {
+                    chunk_keys<false>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, 0, lane, h);
+                } else {
+                    for (int cd = 0; cd < Pc; cd += DCH)
+                        chunk_keys<true>(key, s_mu, s_dw, s_ux2, qa, bv_lo, bv_hi, pk, qn, scale, Pc, cd, lane, h);
+                }
+            }
+            PMARK(5);
+            if (wact) {
+                // ---- D: rank the children: each lane sorts its 16 keys, the pair keeps the top 16 of both (the first
+                // stage of the bitonic merge of one list with the other reversed), and the bitonic halves split: lane 0
+                // the larger 8 (ranks 0-7), lane 1 the rest (ranks 8-15). Final queries hold no keys.
+                sort16_desc(key);
+                skey c[16];
+#pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    const skey mine = h ? key[15 - i] : key[i];
+                    c[i] = kmax(mine, __shfl_xor_sync(FULL, mine, 1));
+                }
+                skey r8[8];
+#pragma unroll
+                for (int i = 0; i < 8; i++) r8[i] = h ? kmin(c[i], c[i + 8]) : kmax(c[i], c[i + 8]);
+                ce_desc(r8[0], r8[4]); ce_desc(r8[1], r8[5]); ce_desc(r8[2], r8[6]); ce_desc(r8[3], r8[7]);
+                ce_desc(r8[0], r8[2]); ce_desc(r8[1], r8[3]); ce_desc(r8[4], r8[6]); ce_desc(r8[5], r8[7]);
+                ce_desc(r8[0], r8[1]); ce_desc(r8[2], r8[3]); ce_desc(r8[4], r8[5]); ce_desc(r8[6], r8[7]);
+                // the new open entries: the kept ranks (below k = the free slots after the carried prefix), their
+                // union slots from the child index in the key
+                unsigned nlo = 0u, nhi = 0u;
+                int nv = 0;
+#pragma unroll
+                for (int jj = 0; jj < 8; jj++) {
+                    const skey kk = r8[jj];
+                    const int cix = 31 - (int)(kk & 31u);
+                    const unsigned slot = (unsigned)(s_cs[qi * 16 + (cix >> 1)] + (cix & 1));
+                    if (8 * h + jj < k && kk != 0u) {
+                        if (jj < 4) nlo |= slot << (8 * jj);
+                        else nhi |= slot << (8 * (jj - 4));
+                        nv++;
+                    }
+                }
+                const int nvo = __shfl_xor_sync(FULL, nv, 1);
+                if (!done) {
+                    o_lo = nlo; o_hi = nhi;
+                    nopen = nv + nvo;
+                }
+            }
+            PMARK(6);
+        }
+        ub ^= 1;
+    }
+    if (fb_lev < 0) {
+        // ---- E: cells of the final frontiers: the carried prefix, then any open entries the level limit left; each
+        // lane reads src / off / len of its slots 8 h .. 8 h + 7 and their cells, stored as 16-byte pairs
+        if (!done) {
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++)
+                if (8 * h + jj < nopen)
+                    s_car[qi * 16 + ncar + 8 * h + jj] = __float_as_int(s_um[ub * UC2 + byte8(o_lo, o_hi, jj)].x);
+        }
+        __syncwarp();
+        const int nfr = ncar + nopen;
+        int ref[8];
+        float src[8], off[8], ln[8];
+#pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+            const int w = 8 * h + jj;
+            ref[jj] = (qok && w < nfr) ? s_car[qi * 16 + w] : -1;
+            src[jj] = 0.0f; off[jj] = 0.0f; ln[jj] = 0.0f;
+            if (ref[jj] != -1) {
+                const float* p = aux_row(cax, sbase, ref[jj]);
+                src[jj] = __ldg(p + 6); off[jj] = __ldg(p + 7); ln[jj] = __ldg(p + 8);
+            }
+        }
+        if (qok) {
+            // cells 8 R h .. 8 R h + 8 R - 1 of the query's row: slot 8 h + e / R, cell e % R of the node
+            longlong2* dst = reinterpret_cast<longlong2*>(CELLS + (pid * 16 + 8 * h) * R);
+#pragma unroll
+            for (int i = 0; i < 4 * R; i++) {
+                i64 cv[2];
+#pragma unroll
+                for (int z = 0; z < 2; z++) {
+                    const int jj = (2 * i + z) / R, tr = (2 * i + z) % R;
+                    cv[z] = -1;
+                    if (ref[jj] != -1 && src[jj] > 0.0f && (float)tr < ln[jj]) {
+                        const i64 pos = (i64)off[jj] + tr;
+                        cv[z] = src[jj] == 1.0f ? __ldg(leafb + min(max(pos, (i64)0), Ltot - 1))
+                                                : __ldg(admb + min(max(pos, (i64)0), Mm - 1));
+                    }
+                }
+                dst[i] = make_longlong2(cv[0], cv[1]);
+            }
+            if (h == 0) NVIS[pid] = (float)nvis;
+        }
+        PMARK(8);
+    } else {
+        // a level's union outgrew UC2 slots: every query restarts that level in the warp-per-query descent, from its
+        // frontier at the level's start (the carried prefix as CAR0 + ref, then the open entries as slots of the
+        // union in um_cur, whose node fields are staged), with its norm and visits so far
+        if (FBC != nullptr && tid == 0) {                             // test / diagnostic counters (null by default)
+            atomicAdd(FBC, 1);
+            atomicAdd(FBC + 1 + min(fb_lev, 63), 1);
+        }
+        int* fr = s_car + qi * 16;
+        if (!done0) {
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++)
+                if (8 * h + jj < nopen0) fr[ncar0 + 8 * h + jj] = byte8(o_lo, o_hi, jj);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+            const int w = 8 * h + jj;
+            if (w < ncar0) fr[w] = CAR0 + fr[w];
+            else if (done0 || w >= ncar0 + nopen0) fr[w] = EMPTY_E;
+        }
+        if (h == 0) {
+            reinterpret_cast<int*>(s_cs + qi * 16)[0] = nvis0;
+            reinterpret_cast<float*>(s_cs + qi * 16)[1] = qn;
+        }
+        __syncthreads();
+        WarpS* ws = reinterpret_cast<WarpS*>(smem + OFF2_MU) + wid;
+        const float4* um_prev = s_um + ub * UC2;
+        for (int kq = 0; kq < QB / NWARP_R; kq++) {
+            const int q2 = wid * (QB / NWARP_R) + kq;
+            if (q0 + q2 >= Bq) break;
+            const i64 p2 = t * Bq + q0 + q2;
+            const bool pq_ok = q0 + q2 < NQ;
+            const unsigned short* q2p = reinterpret_cast<const unsigned short*>(Q) + t * QST_T + (i64)(q0 + q2) * QST_B;
+            const float* qrow_p = pq_ok ? reinterpret_cast<const float*>(q2p) : fsb_qzero;
+            const int slot = lane >> 1;
+            continue_query(*ws, lane, slot < WM ? s_car[q2 * 16 + slot] : EMPTY_E, um_prev, qrow_p,
+                           BOUND ? reinterpret_cast<const float*>(s_cs + q2 * 16)[1] : 0.0f,
+                           reinterpret_cast<const int*>(s_cs + q2 * 16)[0], QPOS[p2], lam, sig2, (float)BUDGET[p2],
+                           WBEAM[p2], fb_lev, KMAXP1, scale, cell_size, cmub, cax, sbase, leafb, admb, Ltot, Mm,
+                           CELLS + p2 * (WM * R), NVIS + p2);
+        }
+        PMARK(9);
+    }
+#ifdef PROF
+    if (lane == 0 && FBC != nullptr) {
+        unsigned long long* pdst = reinterpret_cast<unsigned long long*>(FBC + 256);
+        for (int kb = 0; kb < 16; kb++) atomicAdd(pdst + wid * 16 + kb, pacc[kb]);
+    }
+#endif
+}

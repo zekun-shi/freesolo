@@ -610,3 +610,204 @@ def test_decode_pair_one_launch(monkeypatch, Bq, dmax, rc_tensor):
     assert fast.forest_beam_pair(F, SP, W, dl, 16, Fu, SPu, Wu, du, 16, q, qpos, lam, sigv, 0.125, 32, dmax, "bound",
                                  rc, bud=bud, bud_u=budu) is None
 
+
+
+# ---- lean row kernel (FSB_BEAM_V2=1: fsb_beam_rows2) ---------------------------------------------------------------
+
+def _bf16_pair(seed, M=512, nbc=32, Bq=128):
+    # a prefill stage's two beams (all cells; cells above the median norm) over bf16 queries, width 16, one cell per
+    # frontier node: fsb_beam_rows2's configuration
+    F, SP, q, qpos, lam, sigv = _forest_stage(seed, M, nbc=nbc, Bq=max(Bq, 128))
+    Fu, SPu, *_ = _forest_stage(seed, M, nbc=nbc, Bq=max(Bq, 128), admit_all=False)
+    q, qpos = q[:, :Bq].to(torch.bfloat16).contiguous(), qpos[:, :Bq].contiguous()
+    W, _, bud = _rows_args(F, SP, q, qpos, lam, sigv, 16, 0)
+    Wu, _, budu = _rows_args(Fu, SPu, q, qpos, lam, sigv, 16, 0)
+    return [(F, SP, W, bud, 16), (Fu, SPu, Wu, budu, 16)], q, qpos, lam, sigv
+
+
+def _launch_names(monkeypatch):
+    # -> a function returning the names of the kernels launched since its last call
+    seen = []
+    real = bc.launch
+    monkeypatch.setattr(bc, "launch", lambda fn, *a, **k: seen.append(fn.value) or real(fn, *a, **k))
+
+    def names():
+        by_fn = {f.value: key[2] for key, (f, _, _) in bc._funcs.items()}
+        out = [by_fn[v] for v in seen]
+        seen.clear()
+        return out
+    return names
+
+
+def _rows2(monkeypatch, *args, **kw):
+    monkeypatch.setenv("FSB_BEAM_V2", "1")
+    try:
+        return bc.forest_beam_rows_cuda(*args, **kw)
+    finally:
+        monkeypatch.setenv("FSB_BEAM_V2", "0")
+
+
+@gpu
+@pytest.mark.parametrize("Bq", [128, 77, 200])
+@pytest.mark.parametrize("node_score,rc_tensor", [("bound", False), ("bound", True), ("mean", False)])
+def test_rows2_key64_matches_rows(monkeypatch, Bq, node_score, rc_tensor):
+    # the lean kernel with 64-bit keys (every score bit above the child index) == fsb_beam_rows bitwise: both beams'
+    # cells, in order, and visit counts; rows that fill a block partly or need two, and a quarter of the rows with
+    # per-query widths 0..16 and budgets 2^0..2^8 (roots carried at once, width-0 queries)
+    beams, q, qpos, lam, sigv = _bf16_pair(51 + Bq, Bq=Bq)
+    (F, SP, W, bud, _), (Fu, SPu, Wu, budu, _) = beams
+    rows = q.shape[0]
+    g = torch.Generator().manual_seed(Bq)
+    edge = (torch.arange(rows) % 4 == 0)[:, None].cuda()
+    W = torch.where(edge, torch.randint(0, 17, W.shape, generator=g).cuda(), W)
+    dl = torch.randint(0, 9, bud.shape, generator=g).cuda()
+    bud = torch.where(edge, torch.bitwise_left_shift(torch.ones_like(bud), dl), bud)
+    beams = [(F, SP, W, bud, 16), (Fu, SPu, Wu, budu, 16)]
+    rc = torch.rand(rows, generator=torch.Generator().manual_seed(1)).cuda() * 8 + 1 if rc_tensor else 8.0
+    args = (beams, q, qpos, lam, sigv, 0.125, 32, 0, node_score, rc)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    ref = bc.forest_beam_rows_cuda(*args)
+    names = _launch_names(monkeypatch)
+    got = _rows2(monkeypatch, *args, key64=True)
+    assert names() == ["fsb_beam_rows2"]
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
+    assert bool((W == 0).any()) and bool((got[0][0][W == 0] == -1).all())
+
+
+@gpu
+def test_rows2_keys_agree_and_separated_scores_match(monkeypatch):
+    # the 32-bit keys order two children by child index only where their scores agree in the top 27 bits: nearly every
+    # row keeps its cells and visits; with bf16-valued scores (mean bound, no position prior: the score is the rounded
+    # dot) no two scores share that band without being equal, so the selections match fsb_beam_rows exactly
+    beams, q, qpos, lam, sigv = _bf16_pair(61)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    ref = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    got = _rows2(monkeypatch, beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    for (rc_, rn), (gc, gn) in zip(ref, got):
+        assert (rc_ == gc).all(-1).float().mean() > 0.995 and (rn == gn).float().mean() > 0.995
+    lam0 = torch.zeros_like(lam)
+    ref = bc.forest_beam_rows_cuda(beams, q, qpos, lam0, sigv, 0.125, 32, 0, "mean", 8.0)
+    got = _rows2(monkeypatch, beams, q, qpos, lam0, sigv, 0.125, 32, 0, "mean", 8.0)
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
+
+
+@gpu
+def test_rows2_union_overflow_falls_back(monkeypatch):
+    # an overflowing union restarts the level in the warp-per-query descent (fp32 dots, per-query position prior) from
+    # the block's frontiers there. The default 128 slots overflow on a few blocks of these forests, as fsb_beam_rows'
+    # do: the cells match it on nearly every row. With 32 slots most blocks hand over from the first selecting levels
+    # on, and the cell sets then match the warp kernel's own descent on nearly every row (fsb_beam_rows' bf16 dots and
+    # block position prior differ from it on several percent); the visit counts match throughout
+    beams, q, qpos, lam, sigv = _bf16_pair(71)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    fb1 = torch.zeros(65, dtype=torch.int32, device="cuda")
+    ref = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0, fallback=fb1)
+    warp = [bc.forest_beam_cuda(F, SP, q, qpos, lam, sigv, 0.125, 32, W, bud, 16, 0, "bound", 8.0)
+            for F, SP, W, bud, _ in beams]
+    nblk = 2 * q.shape[0]
+    fell = []
+    for uc2, against in ((None, ref), (32, warp)):
+        fb = torch.zeros(65, dtype=torch.int32, device="cuda")
+        got = _rows2(monkeypatch, beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0, fallback=fb, uc2=uc2)
+        n, by_level = int(fb[0]), fb[1:].tolist()
+        assert sum(by_level) == n and by_level[0] == 0, (uc2, n)
+        fell.append(n)
+        for (rc_, rn), (gc, gn) in zip(against, got):
+            same = (torch.sort(rc_, -1).values == torch.sort(gc, -1).values).all(-1).float().mean()
+            assert same > (0.995 if uc2 is None else 0.985) and bool((rn == gn).all()), (uc2, float(same))
+    assert fell[0] == int(fb1[0]) and fell[0] < nblk // 8 and fell[1] > nblk // 2, (fell, int(fb1[0]))
+
+
+@gpu
+def test_rows2_strided_stage_view(monkeypatch):
+    # rows at and beyond q_nq of a strided stage view read as zero queries: the same as the zero-padded packed copy,
+    # bitwise, with the pad region poisoned with NaNs
+    beams, q, qpos, lam, sigv = _bf16_pair(41, M=256)
+    rows, Bq, Dh = q.shape
+    nq = 3 * Bq // 4
+    qbig = torch.randn(rows, 3 * Bq, Dh, generator=torch.Generator().manual_seed(5)).cuda().to(torch.bfloat16)
+    qbig[:, nq:Bq].fill_(float("nan"))
+    qref = torch.zeros(rows, Bq, Dh, device="cuda", dtype=torch.bfloat16)
+    qref[:, :nq] = qbig[:, :nq]
+    ref = _rows2(monkeypatch, beams, qref, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    got = _rows2(monkeypatch, beams, qbig[:, :Bq], qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0, q_nq=nq)
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
+
+
+@gpu
+def test_rows2_flag_dispatch_and_graph(monkeypatch):
+    # FSB_BEAM_V2 unset launches fsb_beam_rows; 1 launches fsb_beam_rows2 for bf16 queries with up to 4 cells per
+    # frontier node, while float queries, eight cells per slot and the tile / union test hooks keep fsb_beam_rows. The
+    # lean kernel replays in a CUDA graph equal to eager, also after its inputs change in place
+    beams, q, qpos, lam, sigv = _bf16_pair(81, nbc=4)
+    names = _launch_names(monkeypatch)
+    monkeypatch.delenv("FSB_BEAM_V2", raising=False)
+    off = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    assert names() == ["fsb_beam_rows"]
+    monkeypatch.setenv("FSB_BEAM_V2", "1")
+    for qq, dm, kw in ((q.float(), 0, {}), (q, 3, {}), (q, 0, {"umax": 128})):
+        bc.forest_beam_rows_cuda(beams, qq, qpos, lam, sigv, 0.125, 32, dm, "bound", 8.0, **kw)
+        assert names() == ["fsb_beam_rows"], (qq.dtype, dm, kw)
+    eager = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    assert names() == ["fsb_beam_rows2"]
+    assert all(((x == y).all(-1).float().mean() > 0.99) for r, o in zip(off, eager) for x, y in zip(r, o))
+    qs, ps = q.clone(), qpos.clone()
+    eager = [t.clone() for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+             for t in o]
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    torch.cuda.current_stream().wait_stream(st)
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        out = [t for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, 0.125, 32, 0, "bound", 8.0) for t in o]
+    gr.replay()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(out, eager))
+    qs.add_((0.3 * torch.randn(qs.shape, generator=torch.Generator().manual_seed(77))).to(qs))
+    ps.add_(5.0)
+    gr.replay()
+    torch.cuda.synchronize()
+    eager2 = [t for o in bc.forest_beam_rows_cuda(beams, qs, ps, lam, sigv, 0.125, 32, 0, "bound", 8.0) for t in o]
+    assert not torch.equal(eager2[0], eager[0])
+    assert all(torch.equal(a, b) for a, b in zip(out, eager2))
+
+
+@gpu
+def test_rows2_build_failure_keeps_rows(monkeypatch):
+    # a lean kernel that fails to build warns once, latches FSB_BEAM_V2 off and leaves the rows to fsb_beam_rows
+    beams, q, qpos, lam, sigv = _bf16_pair(91, nbc=2)
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    ref = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    real_load = bc.load_function
+
+    def no_rows2(dev, src, name):
+        if name == "fsb_beam_rows2":
+            raise RuntimeError("NVRTC compile failed: (simulated)")
+        return real_load(dev, src, name)
+    monkeypatch.setattr(bc, "_rows2_failed", [])
+    monkeypatch.setattr(bc, "_beam_fns", {k: v for k, v in bc._beam_fns.items() if k[0] != "rows2"})
+    monkeypatch.setattr(bc, "load_function", no_rows2)
+    monkeypatch.setenv("FSB_BEAM_V2", "1")
+    with pytest.warns(UserWarning, match="FSB_BEAM_V2"):
+        got = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
+    assert len(bc._rows2_failed) == 1 and not bc.beam_v2_on() and bc.beam_rows_on()
+
+
+@gpu
+def test_rows2_compact_and_full_layout(monkeypatch):
+    # the lean kernel emits 2^delta_max cells per frontier slot (up to 4) from the same selection: with fsb_delta 0
+    # every node holds one cell, so the delta_max = 2 layout is the compact one with three empty slots per node (what
+    # FSB_CHECK_COMPACT=1 checks), and its 64-bit-key build matches fsb_beam_rows' full layout bitwise
+    beams, q, qpos, lam, sigv = _bf16_pair(17)
+    full = _rows2(monkeypatch, beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0)
+    comp = _rows2(monkeypatch, beams, q, qpos, lam, sigv, 0.125, 32, 0, "bound", 8.0)
+    for (cf, nf), (cc, nc) in zip(full, comp):
+        assert cc.shape[-1] == 16 and torch.equal(cf[..., ::4], cc) and torch.equal(nf, nc)
+        assert bool((cf.view(*cf.shape[:2], 16, 4)[..., 1:] == -1).all())
+    monkeypatch.setenv("FSB_BEAM_V2", "0")
+    ref = bc.forest_beam_rows_cuda(beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0)
+    got = _rows2(monkeypatch, beams, q, qpos, lam, sigv, 0.125, 32, 2, "bound", 8.0, key64=True)
+    assert all(torch.equal(a, b) for r, o in zip(ref, got) for a, b in zip(r, o))
