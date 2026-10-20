@@ -524,6 +524,7 @@ if triton is not None:
         CELL_SIZE: tl.constexpr, QUERY_BLOCK: tl.constexpr, K_SELECT: tl.constexpr,
         BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
         NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
+        COMBINE: tl.constexpr,
         AUTOCAST_BF16: tl.constexpr,
     ):
         bh = tl.program_id(0)
@@ -657,14 +658,13 @@ if triton is not None:
 
         xf = out.to(tl.float32)
         wq = tl.load(W_NORM + offs_d, mask=d_mask, other=0.0).to(tl.float32)
-        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         lrs = tl.load(LRS + h).to(tl.float32)
         if NORM_FP32:
             sq = xf * xf
             ms = tl.sum(sq, axis=0) * (1.0 / D)
             rms = tl.math.rsqrt(ms + eps)
             out_long = (xf * rms) * wq
-            y = (sr + lrs * out_long).to(O.dtype.element_ty)
+            scaled_lr = lrs * out_long
         else:
             sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)
             ms = (tl.sum(sq, axis=0) * (1.0 / D)).to(Q.dtype.element_ty).to(tl.float32)
@@ -675,11 +675,13 @@ if triton is not None:
                 out_long = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
             if W_BF16 and LRS_BF16:
                 scaled_lr = (lrs * out_long).to(Q.dtype.element_ty).to(tl.float32)
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
             else:
                 scaled_lr = lrs * out_long
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
-
+        if COMBINE:
+            sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+            y = (sr + scaled_lr).to(O.dtype.element_ty)
+        else:
+            y = scaled_lr                     # into an fp32 O: _lr_combine_kernel adds the window output
         tl.store(O + b * (H * D) + h * D + offs_d, y, mask=d_mask)
 
     @triton.jit
@@ -787,6 +789,7 @@ if triton is not None:
         K_SELECT: tl.constexpr, BLOCK_P: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
         NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
+        COMBINE: tl.constexpr,
     ):
         bh = tl.program_id(0)
         b = bh // H
@@ -863,14 +866,13 @@ if triton is not None:
 
         xf = out.to(tl.float32)
         wq = tl.load(W_NORM + offs_d, mask=d_mask, other=0.0).to(tl.float32)
-        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         lrs = tl.load(LRS + h).to(tl.float32)
         if NORM_FP32:
             sq = xf * xf
             ms = tl.sum(sq, axis=0) * (1.0 / D)
             rms = tl.math.rsqrt(ms + eps)
             out_long = (xf * rms) * wq
-            y = (sr + lrs * out_long).to(O.dtype.element_ty)
+            scaled_lr = lrs * out_long
         else:
             sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)
             ms = (tl.sum(sq, axis=0) * (1.0 / D)).to(Q.dtype.element_ty).to(tl.float32)
@@ -881,12 +883,27 @@ if triton is not None:
                 out_long = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
             if W_BF16 and LRS_BF16:
                 scaled_lr = (lrs * out_long).to(Q.dtype.element_ty).to(tl.float32)
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
             else:
                 scaled_lr = lrs * out_long
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
-
+        if COMBINE:
+            sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+            y = (sr + scaled_lr).to(O.dtype.element_ty)
+        else:
+            y = scaled_lr                     # into an fp32 O: _lr_combine_kernel adds the window output
         tl.store(O + b * (H * D) + h * D + offs_d, y, mask=d_mask)
+
+    @triton.jit
+    def _lr_combine_kernel(SR, LR, O, srb, srh, H: tl.constexpr, D: tl.constexpr, BLOCK_D: tl.constexpr):
+        # the last step of the fused decode reads, for a read that stopped before it (COMBINE=0): the window output
+        # plus the read's fp32 long-range term, rounded to O's dtype, the operations their COMBINE=1 tails apply
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh - b * H
+        offs_d = tl.arange(0, BLOCK_D)
+        d_mask = offs_d < D
+        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        lr = tl.load(LR + b * (H * D) + h * D + offs_d, mask=d_mask, other=0.0)
+        tl.store(O + b * (H * D) + h * D + offs_d, (sr + lr).to(O.dtype.element_ty), mask=d_mask)
 
 
 def available() -> bool:
@@ -1215,6 +1232,20 @@ def fsl_pool_refresh(topP: torch.Tensor, Kbar_all: torch.Tensor, ceil_all: torch
     return res
 
 
+def _lr_outputs(q_t: torch.Tensor, out_short, out_dt):
+    # The output and window-output arguments of the fused decode reads: (destination, SR, its batch and head strides,
+    # the result). With the window output they write W_o's input, (B, 1, H * D) in out_dt. Without it (the read alone,
+    # lr_decode_read) they stop before the combine and write their fp32 term lrs * lr_norm(readout) instead; the result
+    # is that term and the W_o input buffer lr_combine fills from it (sized as the read with the window output would
+    # size it, for a window output of q_t's dtype: lr_combine_ok)
+    B, H, _, D = q_t.shape
+    out = torch.empty((B, 1, H * D), device=q_t.device, dtype=out_dt)
+    if out_short is not None:
+        return out, out_short[:, :, 0, :], out_short.stride(0), out_short.stride(1), out
+    lr = torch.empty((B, 1, H * D), device=q_t.device, dtype=torch.float32)
+    return lr, lr, 0, 0, (lr, out)
+
+
 def fsl_lr_decode_combine_ok(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: torch.Tensor,
                              out_short: torch.Tensor, pool: dict, pos_t: torch.Tensor, sigma: torch.Tensor) -> bool:
     if (compiling() or not available() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
@@ -1223,6 +1254,8 @@ def fsl_lr_decode_combine_ok(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: 
         return False
     if getattr(attn, "sel_content_only", False) or pool.get("empty", False):
         return False
+    if out_short is None:
+        out_short = q_t                       # (lr_decode_read: lr_combine_ok checks the window output at the join)
     B, H, N, D = q_t.shape
     C = int(pool.get("C", 0))
     M_vis = int(pool.get("M_vis", 0))
@@ -1272,7 +1305,8 @@ def fsl_lr_decode_combine_ok(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: 
 
 def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: torch.Tensor,
                           out_short: torch.Tensor, pool: dict, pos_t: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Bit-exact fused FS-L / Base FS candidate scoring + top-k cell selection + online softmax readout + lr_norm + SR combine."""
+    """Bit-exact fused FS-L / Base FS candidate scoring + top-k cell selection + online softmax readout + lr_norm + SR combine.
+    Without out_short, the read alone (lr_decode_read): see _lr_outputs."""
     B, H, _, D = q_t.shape
     C = int(pool["C"])
     M_vis = int(pool["M_vis"])
@@ -1286,10 +1320,11 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
     norm_fp32 = bool(torch.is_autocast_enabled() or q_t.dtype == torch.float32)
     out_dt = adt or (
         torch.float32 if norm_fp32 else torch.promote_types(
-            out_short.dtype, torch.promote_types(lrs.dtype, torch.promote_types(q_t.dtype, w_norm.dtype))
+            (q_t if out_short is None else out_short).dtype,
+            torch.promote_types(lrs.dtype, torch.promote_types(q_t.dtype, w_norm.dtype))
         )
     )
-    out = torch.empty((B, 1, H * D), device=q_t.device, dtype=out_dt)
+    dst, sr, srb, srh, res = _lr_outputs(q_t, out_short, out_dt)
     block_s = max(16, triton.next_power_of_2(s))
     if pool.get("dense", False):
         k_sel = min(max(1, int(attn.cell_topk)), 16)
@@ -1322,18 +1357,18 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
             )
         _fs_dense_decode_readout_combine_kernel[(B * H,)](
             q_t[:, :, 0, :], part_s, part_c, pos_t, m_vis_t,
-            kbuf, vbuf, out_short[:, :, 0, :], w_norm, lrs, out,
+            kbuf, vbuf, sr, w_norm, lrs, dst,
             q_t.stride(0), q_t.stride(1),
             kbuf.stride(0), kbuf.stride(1), kbuf.stride(2),
             vbuf.stride(0), vbuf.stride(1), vbuf.stride(2),
-            out_short.stride(0), out_short.stride(1),
+            srb, srh,
             int(kbuf.shape[2]), float(attn.lr_norm.eps),
             H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block),
             K_SELECT=k_sel, BLOCK_P=block_p, BLOCK_D=64, BLOCK_S=block_s,
-            NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16,
+            NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16, COMBINE=out_short is not None,
             num_warps=4, num_stages=2, enable_fp_fusion=False,
         )
-        return out
+        return res
     k_sel = min(int(attn.cell_topk), M_vis, C)
     Kbar_cand = pool["Kbar_cand"]
     Kbar_cand_t = pool.get("Kbar_cand_t")
@@ -1351,21 +1386,21 @@ def fsl_lr_decode_combine(attn, q_t: torch.Tensor, kbuf: torch.Tensor, vbuf: tor
     block_c = max(16, triton.next_power_of_2(C))
     _fsl_lr_decode_combine_kernel[(B * H,)](
         q_t[:, :, 0, :], kb_src, ceil_cand, cen_cand, ok_cell, cand_c, pos_t, attn.sel_scale, sigma,
-        kbuf, vbuf, out_short[:, :, 0, :], w_norm, lrs, out,
+        kbuf, vbuf, sr, w_norm, lrs, dst,
         q_t.stride(0), q_t.stride(1),
         kb_src.stride(0), kb_src.stride(1), skbc, skbd,
         ceil_cand.stride(0), ceil_cand.stride(1),
         kbuf.stride(0), kbuf.stride(1), kbuf.stride(2),
         vbuf.stride(0), vbuf.stride(1), vbuf.stride(2),
-        out_short.stride(0), out_short.stride(1),
+        srb, srh,
         int(kbuf.shape[2]), float(attn.scale), float(attn.lr_norm.eps), C,
         H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block), K_SELECT=k_sel,
         BLOCK_C=block_c, BLOCK_D=64, BLOCK_S=block_s,
-        NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16,
+        NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16, COMBINE=out_short is not None,
         AUTOCAST_BF16=autocast_bf16,
         num_warps=4, num_stages=2, enable_fp_fusion=False,
     )
-    return out
+    return res
 
 
 
@@ -1384,11 +1419,15 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
     the K / V gather reads idx < n_q as int8 * bf16 cell scale rounded to bf16 (the same values the
     bf16 kernel sees on the materialized cache), idx >= n_q as the bf16 hot rows; every other value is
     computed by the identical operations, so selection statistics and all roundings match. None when
-    the support envelope of the fused kernels is exceeded (the caller's reference path then applies)."""
+    the support envelope of the fused kernels is exceeded (the caller's reference path then applies).
+    Without out_short, the read alone (lr_decode_read): see _lr_outputs."""
     if (compiling() or os.environ.get("FSL_TRUNK_FUSED", "1") == "0"
             or os.environ.get("FSL_LR_DECODE_FUSED", "1") == "0" or torch.is_grad_enabled()
             or not q_t.is_cuda or getattr(attn, "sel_content_only", False) or pool.get("empty", False)):
         return None
+    combine = out_short is not None
+    if not combine:
+        out_short = q_t                       # (lr_decode_read: lr_combine_ok checks the window output at the join)
     B, H, N, D = q_t.shape
     C = int(pool.get("C", 0))
     M_vis = int(pool.get("M_vis", 0))
@@ -1436,7 +1475,7 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
             out_short.dtype, torch.promote_types(lrs.dtype, torch.promote_types(q_t.dtype, w_norm.dtype))
         )
     )
-    out = torch.empty((B, 1, H * D), device=q_t.device, dtype=out_dt)
+    dst, sr, srb, srh, res = _lr_outputs(q_t, out_short if combine else None, out_dt)
     block_s = max(16, triton.next_power_of_2(s))
     if is_dense:
         k_sel = min(max(1, int(attn.cell_topk)), 16)          # the dense selection's own width,
@@ -1465,20 +1504,20 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
         _fsd_comb_int8_kernel[(B * H,)](
             q_t[:, :, 0, :], part_s, part_c, pos_t, m_vis_t,
             qk, skt, khot, qv, svt, vhot, nq_t,
-            out_short[:, :, 0, :], w_norm, lrs, out,
+            sr, w_norm, lrs, dst,
             q_t.stride(0), q_t.stride(1),
             qk.stride(0), qk.stride(1), qk.stride(2), skt.stride(0), skt.stride(1),
             khot.stride(0), khot.stride(1), khot.stride(2),
             qv.stride(0), qv.stride(1), qv.stride(2), svt.stride(0), svt.stride(1),
             vhot.stride(0), vhot.stride(1), vhot.stride(2),
-            out_short.stride(0), out_short.stride(1),
+            srb, srh,
             float(attn.lr_norm.eps), qk.shape[2] // s + 1,
             H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block),
             K_SELECT=k_sel, BLOCK_P=block_p, BLOCK_D=64, BLOCK_S=block_s,
-            NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16,
+            NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16, COMBINE=combine,
             num_warps=4, num_stages=2, enable_fp_fusion=False,
         )
-        return out
+        return res
     Kbar_cand = pool["Kbar_cand"]
     Kbar_cand_t = pool.get("Kbar_cand_t")
     if (Kbar_cand_t is not None and tuple(Kbar_cand_t.shape) == (B, H, D, C)
@@ -1493,7 +1532,7 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
         q_t[:, :, 0, :], kb_src, pool["ceil_cand"], pool["cen_cand"], pool["ok_cell"], pool["cand_c"],
         pos_t, attn.sel_scale, sigma,
         qk, skt, khot, qv, svt, vhot, nq_t,
-        out_short[:, :, 0, :], w_norm, lrs, out,
+        sr, w_norm, lrs, dst,
         q_t.stride(0), q_t.stride(1),
         kb_src.stride(0), kb_src.stride(1), skbc, skbd,
         pool["ceil_cand"].stride(0), pool["ceil_cand"].stride(1),
@@ -1501,13 +1540,42 @@ def lr_comb_int8(attn, q_t: torch.Tensor, out_short: torch.Tensor, pool: dict, p
         khot.stride(0), khot.stride(1), khot.stride(2),
         qv.stride(0), qv.stride(1), qv.stride(2), svt.stride(0), svt.stride(1),
         vhot.stride(0), vhot.stride(1), vhot.stride(2),
-        out_short.stride(0), out_short.stride(1),
+        srb, srh,
         float(attn.scale), float(attn.lr_norm.eps), C, qk.shape[2] // s + 1,
         H=H, D=D, SCALE=float(attn.scale), CELL_SIZE=s, QUERY_BLOCK=int(attn._cell_block),
         K_SELECT=k_sel, BLOCK_C=block_c, BLOCK_D=64, BLOCK_S=block_s,
-        NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16,
+        NORM_FP32=norm_fp32, W_BF16=w_bf16, LRS_BF16=lrs_bf16, COMBINE=combine,
         AUTOCAST_BF16=autocast_bf16,
         num_warps=4, num_stages=2, enable_fp_fusion=False,
+    )
+    return res
+
+
+def lr_decode_read(attn, q_t: torch.Tensor, kbuf, vbuf, pool: dict, pos_t: torch.Tensor, sigma: torch.Tensor,
+                   st=None):
+    """The long-range read of fsl_lr_decode_combine (bf16 history kbuf / vbuf) or lr_comb_int8 (int8 state st) without
+    the window output, for a read that runs beside the window (FS_DECODE_FORK): the same kernels, stopped before their
+    combine, return (lr, out) for lr_combine; None where they do not apply (the caller's serial path then runs)."""
+    if st is not None:
+        return lr_comb_int8(attn, q_t, None, pool, pos_t, sigma, st)
+    if fsl_lr_decode_combine_ok(attn, q_t, kbuf, vbuf, None, pool, pos_t, sigma):
+        return fsl_lr_decode_combine(attn, q_t, kbuf, vbuf, None, pool, pos_t, sigma)
+    return None
+
+
+def lr_combine_ok(out_short: torch.Tensor, q_t: torch.Tensor) -> bool:
+    # the window output's checks in fsl_lr_decode_combine_ok / lr_comb_int8, and the dtype lr_decode_read sized W_o's
+    # input for: where they fail, the caller's serial path runs (lr_decode_read checked everything else)
+    return out_short.shape == q_t.shape and out_short.dtype == q_t.dtype and out_short.stride(-1) == 1
+
+
+def lr_combine(out_short: torch.Tensor, lr: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """W_o's input from a read that stopped before its combine (lr_decode_read) and the window output: the values the
+    read computes when it combines in its kernel, bit for bit (the same fp32 operations on the same operands)."""
+    B, H, _, D = out_short.shape
+    _lr_combine_kernel[(B * H,)](
+        out_short[:, :, 0, :], lr, out, out_short.stride(0), out_short.stride(1),
+        H=H, D=D, BLOCK_D=max(16, triton.next_power_of_2(D)), num_warps=1, enable_fp_fusion=False,
     )
     return out
 
@@ -1542,6 +1610,7 @@ if triton is not None:
         CELL_SIZE: tl.constexpr, QUERY_BLOCK: tl.constexpr, K_SELECT: tl.constexpr,
         BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
         NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
+        COMBINE: tl.constexpr,
         AUTOCAST_BF16: tl.constexpr,
     ):
         # _fsl_lr_decode_combine_kernel with the K / V tile reads on the int8 cache state
@@ -1679,14 +1748,13 @@ if triton is not None:
 
         xf = out.to(tl.float32)
         wq = tl.load(W_NORM + offs_d, mask=d_mask, other=0.0).to(tl.float32)
-        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         lrs = tl.load(LRS + h).to(tl.float32)
         if NORM_FP32:
             sq = xf * xf
             ms = tl.sum(sq, axis=0) * (1.0 / D)
             rms = tl.math.rsqrt(ms + eps)
             out_long = (xf * rms) * wq
-            y = (sr + lrs * out_long).to(O.dtype.element_ty)
+            scaled_lr = lrs * out_long
         else:
             sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)
             ms = (tl.sum(sq, axis=0) * (1.0 / D)).to(Q.dtype.element_ty).to(tl.float32)
@@ -1697,11 +1765,13 @@ if triton is not None:
                 out_long = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
             if W_BF16 and LRS_BF16:
                 scaled_lr = (lrs * out_long).to(Q.dtype.element_ty).to(tl.float32)
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
             else:
                 scaled_lr = lrs * out_long
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
-
+        if COMBINE:
+            sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+            y = (sr + scaled_lr).to(O.dtype.element_ty)
+        else:
+            y = scaled_lr                     # into an fp32 O: _lr_combine_kernel adds the window output
         tl.store(O + b * (H * D) + h * D + offs_d, y, mask=d_mask)
 
     @triton.jit
@@ -1719,6 +1789,7 @@ if triton is not None:
         K_SELECT: tl.constexpr, BLOCK_P: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_S: tl.constexpr,
         NORM_FP32: tl.constexpr, W_BF16: tl.constexpr, LRS_BF16: tl.constexpr,
+        COMBINE: tl.constexpr,
     ):
         # _fs_dense_decode_readout_combine_kernel with the K / V tile reads on the int8 cache state
         bh = tl.program_id(0)
@@ -1798,14 +1869,13 @@ if triton is not None:
 
         xf = out.to(tl.float32)
         wq = tl.load(W_NORM + offs_d, mask=d_mask, other=0.0).to(tl.float32)
-        sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         lrs = tl.load(LRS + h).to(tl.float32)
         if NORM_FP32:
             sq = xf * xf
             ms = tl.sum(sq, axis=0) * (1.0 / D)
             rms = tl.math.rsqrt(ms + eps)
             out_long = (xf * rms) * wq
-            y = (sr + lrs * out_long).to(O.dtype.element_ty)
+            scaled_lr = lrs * out_long
         else:
             sq = (xf * xf).to(Q.dtype.element_ty).to(tl.float32)
             ms = (tl.sum(sq, axis=0) * (1.0 / D)).to(Q.dtype.element_ty).to(tl.float32)
@@ -1816,9 +1886,11 @@ if triton is not None:
                 out_long = (xf * rms).to(Q.dtype.element_ty).to(tl.float32) * wq
             if W_BF16 and LRS_BF16:
                 scaled_lr = (lrs * out_long).to(Q.dtype.element_ty).to(tl.float32)
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
             else:
                 scaled_lr = lrs * out_long
-                y = (sr + scaled_lr).to(O.dtype.element_ty)
-
+        if COMBINE:
+            sr = tl.load(SR + b * srb + h * srh + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+            y = (sr + scaled_lr).to(O.dtype.element_ty)
+        else:
+            y = scaled_lr                     # into an fp32 O: _lr_combine_kernel adds the window output
         tl.store(O + b * (H * D) + h * D + offs_d, y, mask=d_mask)

@@ -116,13 +116,13 @@ ATTN_DEFAULTS = {"FSL_SLIDING_MODE": "chunked", "FSL_WINDOW_BATCHED": "1", "FSL_
                  "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1", "FSL_PREFILL_CELL_REUSE": "1",
                  "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0", "FSL_READOUT_G": "64", "FSL_READOUT_WARPS": "4",
                  "FSL_READOUT_STAGES": "2", "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1",
-                 "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "0"}
+                 "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0"}
 ATTN_FLAGS = tuple(k for k in ATTN_DEFAULTS if k != "FSL_SLIDING_MODE")
 
 
 @pytest.mark.parametrize("fsb", [True, False])
 @pytest.mark.parametrize("overrides", [{}, {name: "0" for name in ATTN_FLAGS}, {"FSL_SLIDING_MODE": "off"},
-                                       {"FSL_WINDOW_STREAM": "1"}, {"FS_WINDOW_OVERLAP": "1"}])
+                                       {"FSL_WINDOW_STREAM": "1"}, {"FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1"}])
 def test_attention_execution_env_recorded(ruler_driver, monkeypatch, tmp_path, capsys, fsb, overrides):
     for name in (*ATTN_FLAGS, "FSL_SLIDING_MODE"):
         monkeypatch.delenv(name, raising=False)

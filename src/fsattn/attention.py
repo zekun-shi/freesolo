@@ -33,6 +33,17 @@ class _ForkEvent(torch.cuda.Event):
     the stream order makes record_stream unnecessary there."""
 
 
+_DECODE_READ_STREAMS: dict = {}
+
+
+def _decode_read_stream(dev):
+    # FS_DECODE_FORK: the stream an FS / FS-L decode layer's long-range read forks to (FSAttn.graph_decode_layer)
+    s = _DECODE_READ_STREAMS.get(dev)
+    if s is None:
+        s = _DECODE_READ_STREAMS[dev] = torch.cuda.Stream(device=dev)
+    return s
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-8):
         super().__init__()
@@ -1394,13 +1405,33 @@ class FSAttn(nn.Module):
                 raise RuntimeError("the int8 long-range decode fallback must not be captured: it reads a "
                                    "materialized history whose baked shape goes stale at replay")
             kbuf, vbuf = cache.read_full_kv()
-        out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
         pool = buf["pool"]
+        st = ((cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf, cache._k_hot, cache._v_hot, cache._nq_t,
+               cache.s) if int8 else None)
+        if (Q.is_cuda and not pool.get("empty", False) and os.environ.get("FS_DECODE_FORK", "0") == "1"
+                and not compiling()):
+            # FS_DECODE_FORK: the long-range read needs the window output only in its last step (the combine), so it
+            # forks to its own stream and runs beside the window (in a captured decode step, two parallel branches of
+            # the graph), stopped before that step (lr_decode_read); after the join lr_combine applies it with the
+            # read's own operations, so W_o's input is the serial one bit for bit. The read touches no row the window
+            # writes (it reads cells completed before the query block; the window writes the new token's row). No
+            # record_stream (under capture it would hold the read's buffers out of the graph pool): the read's output
+            # comes from the side stream's pool and is freed after its consumers on this stream, and every fork waits
+            # on this stream before allocating, so the side stream reuses a block only after its last reader.
+            cur = torch.cuda.current_stream(Q.device)
+            side = _decode_read_stream(Q.device)
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                read = _tt.lr_decode_read(self, Q, kbuf, vbuf, pool, pos_t, sigma, st)
+            out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
+            cur.wait_stream(side)
+            if read is not None and _tt.lr_combine_ok(out_short, Q):
+                return self.W_o(_tt.lr_combine(out_short, *read))
+        else:
+            out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
         if pool.get("empty", False):
             out_long = Q.new_zeros(B, H, 1, D)
         elif int8:
-            st = (cache._qk_buf, cache._qv_buf, cache._ks_buf, cache._vs_buf,
-                  cache._k_hot, cache._v_hot, cache._nq_t, cache.s)
             out = _tt.lr_comb_int8(self, Q, out_short, pool, pos_t, sigma, st)
             if out is not None:
                 return self.W_o(out)
