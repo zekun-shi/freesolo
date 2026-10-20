@@ -1367,8 +1367,8 @@ __device__ void g_node(const Args& A, const GS& S, const int f, const int t, con
 
 // ---- K1: forest construction tasks (512 threads; dynamic shared memory) ----
 // task record (8 ints): type, f, t, k, j0, nsub, l0, n0.  type 0: batch of nsub chunks j0 + (i << l0) of height
-// k <= 9 (nsub << k <= 512 slots; l0 = 0: consecutive chunks, 1: every other chunk); LAY: bases[16] | leafbases[16] |
-// fold mask (bit k: Kpad(k) > k)
+// k <= 9 (nsub << k <= 512 slots; l0 = 0: consecutive chunks, 1: every other chunk), for k <= 5 of the n0 heads
+// t .. t + n0 - 1 (0: one head); LAY: bases[16] | leafbases[16] | fold mask (bit k: Kpad(k) > k)
 
 // records of the n chunks ja + (c << jsh) of height k that hold no admitted cell: mu = signed zeros of Kbar[t, 0] (the
 // cell an empty slot reads), rad = amax = 0, pmin = 2^30, static fields; leaves -1. One warp per node record.
@@ -1463,19 +1463,27 @@ __device__ __forceinline__ void zb_of_row(const SM& S, const int ci, const int r
     if (lane == 0) S.zb[ci] = (u64)lo | ((u64)hi << 32);
 }
 
-// type 0, k <= 5: a batch of nsub chunks of height k, one warp per 32 slots
+// type 0, k <= 5: a batch of nsub chunks of height k, one warp per 32 slots. np > 1 packs the same chunks of the np
+// heads t0 .. t0 + np - 1 into one block, 16 / 2^ceil(log2 np) warps per head (the table keeps each head's slots
+// within them); warps are independent here, so each one is a warp of that head's own batch
 template <bool LEAN = false>
-__device__ __forceinline__ void task_wbatch(const Args& A, const int f, const int t, const int k, const int j0, const int nsub,
-                                         const int jsh, const bool fold) {
+__device__ __forceinline__ void task_wbatch(const Args& A, const int f, const int t0, const int k, const int j0,
+                                         const int nsub, const int jsh, const int np, const bool fold) {
     extern __shared__ float smem[];
     const SM S = carve(smem);
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     const int M = A.M, has_sp = A.has_sp;
+    const int jo = LEAN ? 0 : j0;
+    for (int p = 0; p < np; p++) {
+        const int nf_p = batch_full((int)A.mt[f][t0 + p], k, j0, nsub, jsh);
+        empty_chunks(A, f, t0 + p, k, jo + (nf_p << jsh), nsub - nf_p, jsh);
+    }
+    const int pb = np > 1 ? 32 - __clz(np - 1) : 0;       // the head of warp wid: wid >> (4 - pb)
+    const int t = t0 + (wid >> (4 - pb));
+    if (t >= t0 + np) return;
     const int mt = (int)A.mt[f][t];
     const int nfull = batch_full(mt, k, j0, nsub, jsh);
-    const int jo = LEAN ? 0 : j0;
-    empty_chunks(A, f, t, k, jo + (nfull << jsh), nsub - nfull, jsh);
-    const int gs0 = 32 * wid;
+    const int gs0 = 32 * (wid & ((16 >> pb) - 1));       // the warp's first slot in its head's batch
     if (gs0 >= (nfull << k)) return;
     Rec R;
     R.node = A.node_mu[f] != nullptr ? nullptr : A.node[f] + (i64)t * A.Ntot * NC;
@@ -1513,7 +1521,7 @@ __device__ __forceinline__ void task_wbatch(const Args& A, const int f, const in
     __syncwarp();
     DBG_MARK(1);
     int org = lane;
-    w_phase(k, x, cell, ce, sp, org, zb, Xw, pw, S.cell + gs0, R, lane, gs0, fold, has_sp != 0);
+    w_phase(k, x, cell, ce, sp, org, zb, Xw, pw, S.cell + 32 * wid, R, lane, gs0, fold, has_sp != 0);
 }
 
 // the C phase from nodes of 2^lv0 rows (rows already in S.Xs / x), then each warp's W phase; zrow(i): the S.zb entry
@@ -1680,7 +1688,7 @@ __device__ __forceinline__ void build_task(const int* __restrict__ TASKS, const 
     const bool fold = (LAY[32] >> k) & 1;
     DBG_MARK(0);
     if (type == 0) {
-        if (k <= 5) task_wbatch<LEAN>(A, f, t, k, j0, nsub, l0, fold);
+        if (k <= 5) task_wbatch<LEAN>(A, f, t, k, j0, nsub, l0, max(n0, 1), fold);
         else task_cbatch<LEAN>(A, f, t, k, j0, nsub, l0, fold);
     } else if (type == 1) {
         task_gnode<LEAN>(A, f, t, k, j0, l0, n0, fold, flag, dep);

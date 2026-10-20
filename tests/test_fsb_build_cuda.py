@@ -630,11 +630,12 @@ def _chunk_rows(F, k, j):
 
 
 @pytest.mark.parametrize("T,M,Dh", [(16, 512, 64), (4, 4096, 64), (2, 8192, 64), (8, 1000, 32), (4, 7, 64),
-                                    (16, 300, 64), (2, 2048, 32)])
+                                    (16, 300, 64), (2, 2048, 32), (16, 128, 64), (12, 40, 64), (16, 200, 32)])
 def test_prefill_trim_builds_exactly_the_spine_chunks(monkeypatch, T, M, Dh):
     # a build with mb_max writes every chunk a spine of some m_b <= mb_max reads, with the full build's bits, and no
     # other chunk; the prologue's tables and every spine of the layer's m_b are unchanged (both forests, random,
-    # all-but-one, none and all admitted, with and without spreads, prefill block starts and random ones)
+    # all-but-one, none and all admitted, with and without spreads, prefill block starts and random ones; short
+    # prefills pack 2 to 16 heads into a W batch, also with a partial last pack)
     bc = _bc()
     monkeypatch.setenv("FSB_BUILD_GROUP", "4")
     g = torch.Generator().manual_seed(17 * M + T + Dh)

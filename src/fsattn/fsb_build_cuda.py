@@ -262,10 +262,11 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
     # _TABLES_MAX most recently used shapes, plus every table a CUDA graph captured (_table_lookup). Built outside
     # graph capture: the first call of a shape runs before any capture of it, as for the kernels.
     # Records (10 ints): type, f, t, k, j, nsub, l, n, flag, dep. type 0: batch of nsub chunks j + (i << l) of height
-    # k <= 9; type 1: G node (level l, index n) of a chunk of height >= 10, raising flag when its slot lists are
-    # written; type 2: the 512-cell subtree n (at level k - 9) of such a chunk. dep: the flag a task waits for (its
-    # parent G node), -1 none. The chunks of each height are spine_chunks(M, k, mb_max): every chunk, or with mb_max
-    # only those a prefill spine can read (every other chunk, batched with l = 1).
+    # k <= 9, of the n heads t .. t + n - 1 (0: of head t); type 1: G node (level l, index n) of a chunk of height
+    # >= 10, raising flag when its slot lists are written; type 2: the 512-cell subtree n (at level k - 9) of such a
+    # chunk. dep: the flag a task waits for (its parent G node), -1 none. The chunks of each height are
+    # spine_chunks(M, k, mb_max): every chunk, or with mb_max only those a prefill spine can read (every other chunk,
+    # batched with l = 1; up to 16 heads per W batch when they fill it only partly).
     # Order: G roots (tallest first), then the batches longest first; each dependent task is inserted once the
     # estimated dispatch time (sum of earlier task costs / SMs) passes its parent's estimated finish, so waits are
     # rare; a task only ever waits for an earlier one, which is resident or finished by then (blocks start in index
@@ -323,11 +324,15 @@ def _tasks(T: int, M: int, nf: int, g: int, dev: torch.device, kmax_cuda: int, o
         for k in sorted((k for k in use if k <= 9), reverse=True):
             per = 512 >> k
             ja, jsh, nj = chunks[k]
+            # the spine chunks of a short prefill fill a fraction of a block: its W batches (k <= 5, independent warps)
+            # take the same chunks of several heads, 2^ceil(log2(warps per head)) warps each
+            npk = max(1, 16 // (1 << (-(-(nj << k) // 32) - 1).bit_length())) if mb_max is not None and k <= 5 else 1
             for f in range(nf):
-                for t in range(T):
+                for t in range(0, T, npk):
                     for i0 in range(0, nj, per):
                         flush()
-                        push([0, f, t, k, ja + (i0 << jsh), min(per, nj - i0), jsh, 0, -1, -1])
+                        push([0, f, t, k, ja + (i0 << jsh), min(per, nj - i0), jsh, min(npk, T - t) if npk > 1 else 0,
+                              -1, -1])
         while ready:
             flush(force=True)
         assert not children
