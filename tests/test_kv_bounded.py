@@ -2,7 +2,8 @@
 the cells it holds after the prefill and after every block refresh (the top P under torch.topk's tie order and the
 cells the window and the newest Wc reach), the values held (kv_int8's quantization cell for cell), the pool it
 assembles (trunk_triton.fsl_pool_refresh value for value), the window and long-range decode kernels reading through
-its table, and GraphedDecoder's teacher-forced logits, which must be identical with the flag on and off. Kernels
+its table (the long-range read also stopped before its combine, as FS_DECODE_FORK runs it), and GraphedDecoder's
+teacher-forced logits, which must be identical with the flag on and off, serial and forked. Kernels
 are checked at the released models' attention shape (16 heads of 64, 32-token cells, window 512, top 4 of a
 64 + 8 pool)."""
 import os
@@ -290,7 +291,13 @@ def test_long_range_decode_through_slots_matches_full_int8_store(N, ln_f32):
                  else (st.qk, st.qv, st.sk, st.sv, kh, vh, nq_t, S))
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = tt.lr_comb_int8(a, q, sr, pool, pos_t, a.sigma, state, slots=slots)
+            # the same read stopped before its combine (FS_DECODE_FORK: lr_decode_read beside the window), then
+            # lr_combine with the window output
+            read = tt.lr_decode_read(a, q, None, None, pool, pos_t, a.sigma, state, slots=slots)
+            assert read is not None and tt.lr_combine_ok(sr, q)
+            split = tt.lr_combine(sr, *read)
         assert out is not None
+        assert torch.equal(split, out)
         outs.append(out)
     assert torch.equal(outs[0], outs[1])
     # the bf16 kernel on the dequantized history (int8 * scale rounded to bf16, the values the int8 reads produce)
@@ -345,9 +352,10 @@ def _env(monkeypatch):
                                             (8192, False, "1")])
 @torch.no_grad()
 def test_graphed_decoder_bounded_matches_full_store(monkeypatch, L, ties, prealloc):
-    # teacher-forced: both runs decode the same tokens; every step's logits must be identical with the flag on and
-    # off, across many block refreshes (the tied prompt makes most layer-0 cell ceilings exactly equal); without
-    # KV_PREALLOC the prefill allocates the store itself
+    # teacher-forced: every run decodes the same tokens; every step's logits must be identical with the flag on and
+    # off, across many block refreshes (the tied prompt makes most layer-0 cell ceilings exactly equal), with the
+    # long-range read serial and forked beside the window (FS_DECODE_FORK, whose read goes through the same slot
+    # table); without KV_PREALLOC the prefill allocates the store itself
     from decode_graph import GraphedDecoder
     _env(monkeypatch)
     monkeypatch.setenv("KV_PREALLOC", prealloc)
@@ -358,23 +366,26 @@ def test_graphed_decoder_bounded_matches_full_store(monkeypatch, L, ties, preall
     forced = torch.randint(0, hi, (700,), generator=g).cuda()
     runs = {}
     for flag in ("0", "1"):
-        monkeypatch.setenv("FSL_KV_BOUNDED", flag)
-        gd = GraphedDecoder(m, prompt, Lmax=L + len(forced) + 16, device="cuda", dtype=torch.bfloat16)
-        gd.prefill()
-        assert gd.bounded_kv == (flag == "1")
-        assert all(c.use_int8 for c in gd.cache)
-        logits = []
-        for t in forced:
-            gd.next_tok = t.view(1)
-            gd.step()
-            logits.append(gd.static_logits.clone())
-        runs[flag] = torch.stack(logits)
-        if flag == "1":
-            assert gd.kv_faults() == (0, 0)
-            for c in gd.cache:
-                assert int(c._slots.held().max()) <= c._slots.n_slots < c._ncell     # cells were dropped
-                assert c._qk_buf is None and c._k_buf is None
-    assert torch.equal(runs["0"], runs["1"])
+        for fork in ("0", "1"):
+            monkeypatch.setenv("FSL_KV_BOUNDED", flag)
+            monkeypatch.setenv("FS_DECODE_FORK", fork)
+            gd = GraphedDecoder(m, prompt, Lmax=L + len(forced) + 16, device="cuda", dtype=torch.bfloat16)
+            gd.prefill()
+            assert gd.bounded_kv == (flag == "1")
+            assert all(c.use_int8 for c in gd.cache)
+            logits = []
+            for t in forced:
+                gd.next_tok = t.view(1)
+                gd.step()
+                logits.append(gd.static_logits.clone())
+            runs[flag, fork] = torch.stack(logits)
+            if flag == "1":
+                assert gd.kv_faults() == (0, 0)
+                for c in gd.cache:
+                    assert int(c._slots.held().max()) <= c._slots.n_slots < c._ncell     # cells were dropped
+                    assert c._qk_buf is None and c._k_buf is None
+    for key, run in runs.items():
+        assert torch.equal(runs["0", "0"], run), key
 
 
 @torch.no_grad()

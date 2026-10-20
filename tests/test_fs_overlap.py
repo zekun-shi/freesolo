@@ -1,8 +1,9 @@
 """FS (dense) and FS-L (sparse) under the scheduling the FS-B paths use: each prefill layer's window branch forked next
 to its long-range branch (FS_WINDOW_OVERLAP) and each graphed decode layer's long-range read forked beside its window
 (FS_DECODE_FORK), against the serial paths bit for bit: the eager and the CUDA-graph prefill, teacher-forced
-GraphedDecoder steps across query blocks on the int8 and the bf16 KV store, and the fused decode reads stopped before
-their combine (lr_decode_read + lr_combine) in every rounding branch of that last step."""
+GraphedDecoder steps across query blocks on the int8, the bounded int8 (FSL_KV_BOUNDED) and the bf16 KV store, and the
+fused decode reads stopped before their combine (lr_decode_read + lr_combine) in every rounding branch of that last
+step."""
 import os
 import sys
 from contextlib import nullcontext
@@ -103,7 +104,10 @@ def test_decode_fork_matches_serial(monkeypatch, serve, int8):
     # FS_DECODE_FORK=1: every graphed decode layer's long-range read runs on its own stream beside the window (two
     # parallel branches of the step graph) and stops before its combine, which lr_combine applies after the join:
     # teacher-forced steps that cross query-block boundaries (pool refreshes and re-captures) and cell closes (int8
-    # quantization) give the serial step's logits bit for bit, and every layer of every traced step forked a read
+    # quantization) give the serial step's logits bit for bit, and every layer of every traced step forked a read.
+    # Masked FS-L on the int8 store also runs on the bounded store (FSL_KV_BOUNDED=1, src/fsattn/kv_bounded.py),
+    # where the window and the forked read both go through its cell -> slot table: every combination of the two
+    # switches gives the serial full-store logits
     from decode_graph import GraphedDecoder
     _serve(monkeypatch, serve)
     monkeypatch.setenv("FS_KV_INT8", int8)
@@ -115,40 +119,47 @@ def test_decode_fork_matches_serial(monkeypatch, serve, int8):
 
     def spy(*a, **k):
         r = real(*a, **k)
-        reads.append(r is not None)
+        reads.append(r is not None and (k.get("slots") is not None) == (bounded == "1"))
         return r
 
     monkeypatch.setattr(tt, "lr_decode_read", spy)
     runs = {}
-    for fork in ("0", "1"):
-        monkeypatch.setenv("FS_DECODE_FORK", fork)
-        reads.clear()
-        gd = GraphedDecoder(m, prompt, Lmax=L + len(forced) + 16, device="cuda", dtype=torch.bfloat16)
-        gd.prefill()
-        assert all(getattr(c, "use_int8", False) == (int8 == "1") for c in gd.cache)
-        logits = []
-        for t in forced:
-            gd.next_tok = t.view(1)                           # teacher-forced: both runs see the same tokens
-            gd.step()
-            logits.append(gd.static_logits.clone())
-        runs[fork] = torch.stack(logits)
-        assert (len(reads) > 0 and all(reads)) if fork == "1" else not reads, (fork, reads)
-    assert torch.isfinite(runs["0"]).all()
-    assert torch.equal(runs["0"], runs["1"])
+    for bounded in ("0", "1") if serve == "sparse" and int8 == "1" else ("0",):
+        for fork in ("0", "1"):
+            monkeypatch.setenv("FS_DECODE_FORK", fork)
+            monkeypatch.setenv("FSL_KV_BOUNDED", bounded)
+            reads.clear()
+            gd = GraphedDecoder(m, prompt, Lmax=L + len(forced) + 16, device="cuda", dtype=torch.bfloat16)
+            gd.prefill()
+            assert all(getattr(c, "use_int8", False) == (int8 == "1") for c in gd.cache)
+            assert gd.bounded_kv == (bounded == "1")
+            logits = []
+            for t in forced:
+                gd.next_tok = t.view(1)                       # teacher-forced: every run sees the same tokens
+                gd.step()
+                logits.append(gd.static_logits.clone())
+            runs[fork, bounded] = torch.stack(logits)
+            assert (len(reads) > 0 and all(reads)) if fork == "1" else not reads, (fork, bounded, reads)
+            assert gd.kv_faults() == (0, 0)
+    assert torch.isfinite(runs["0", "0"]).all()
+    for key, run in runs.items():
+        assert torch.equal(runs["0", "0"], run), key
 
 
-@pytest.mark.parametrize("serve", ["dense", "sparse"])
-@pytest.mark.parametrize("int8", [True, False])
+@pytest.mark.parametrize("serve,store", [("dense", "int8"), ("dense", "bf16"), ("sparse", "int8"), ("sparse", "bf16"),
+                                         ("sparse", "bounded")])
 @pytest.mark.parametrize("autocast,w32", [(True, False), (False, False), (False, True)])
 @torch.no_grad()
-def test_read_then_combine_matches_fused_read(monkeypatch, serve, int8, autocast, w32):
+def test_read_then_combine_matches_fused_read(monkeypatch, serve, store, autocast, w32):
     # lr_decode_read + lr_combine against the fused read that combines in its kernel (fsl_lr_decode_combine on the
-    # bf16 history, lr_comb_int8 on the int8 state), bit for bit and in the same dtype, in each rounding branch of the
-    # last step: bf16 autocast (fp32 norm), no autocast with bf16 norm weights and long-range scales (bf16 roundings),
-    # no autocast with fp32 ones
+    # bf16 history, lr_comb_int8 on the int8 state, on the bounded store through its cell -> slot table), bit for bit
+    # and in the same dtype, in each rounding branch of the last step: bf16 autocast (fp32 norm), no autocast with bf16
+    # norm weights and long-range scales (bf16 roundings), no autocast with fp32 ones
     from decode_graph import GraphedDecoder
     _serve(monkeypatch, serve)
+    int8 = store != "bf16"
     monkeypatch.setenv("FS_KV_INT8", "1" if int8 else "0")
+    monkeypatch.setenv("FSL_KV_BOUNDED", "1" if store == "bounded" else "0")
     L = 1024
     m = _model(serve, L, 1, 61)
     attn = m.blocks[0].attn.fsattn
@@ -161,19 +172,22 @@ def test_read_then_combine_matches_fused_read(monkeypatch, serve, int8, autocast
     prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(59)).cuda()
     gd = GraphedDecoder(m, prompt, Lmax=L + 64, device="cuda", dtype=torch.bfloat16)
     gd.prefill()
+    assert gd.bounded_kv == (store == "bounded")
     buf, c = gd.layer_bufs[0], gd.cache[0]
     pool = buf["pool"]
     assert not pool.get("empty", False) and bool(pool.get("dense", False)) == (serve == "dense")
-    st = (c._qk_buf, c._qv_buf, c._ks_buf, c._vs_buf, c._k_hot, c._v_hot, c._nq_t, c.s) if int8 else None
+    st = c.int8_state() if int8 else None
+    slots = c.slot_table() if int8 else None
+    assert (slots is not None) == (store == "bounded")
     kbuf, vbuf = buf.get("kbuf"), buf.get("vbuf")
     q_t, sr = (torch.randn(1, 4, 1, 64, device="cuda", generator=g).to(torch.bfloat16) for _ in range(2))
     with torch.amp.autocast("cuda", dtype=torch.bfloat16) if autocast else nullcontext():
         if int8:
-            ref = tt.lr_comb_int8(attn, q_t, sr, pool, gd.pos_t, attn.sigma, st)
+            ref = tt.lr_comb_int8(attn, q_t, sr, pool, gd.pos_t, attn.sigma, st, slots=slots)
         else:
             assert tt.fsl_lr_decode_combine_ok(attn, q_t, kbuf, vbuf, sr, pool, gd.pos_t, attn.sigma)
             ref = tt.fsl_lr_decode_combine(attn, q_t, kbuf, vbuf, sr, pool, gd.pos_t, attn.sigma)
-        read = tt.lr_decode_read(attn, q_t, kbuf, vbuf, pool, gd.pos_t, attn.sigma, st)
+        read = tt.lr_decode_read(attn, q_t, kbuf, vbuf, pool, gd.pos_t, attn.sigma, st, slots=slots)
         assert ref is not None and read is not None and tt.lr_combine_ok(sr, q_t)
         got = tt.lr_combine(sr, *read)
     assert read[0].dtype == torch.float32 and got.dtype == ref.dtype and got.shape == ref.shape
