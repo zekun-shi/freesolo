@@ -58,9 +58,9 @@ Both variants retrieve single needles at 262k — 64x the training length — wi
 | NAtS-L | 60.1* / 154.0* / 154.0* / 134.9* | 267.8 / 233.7 / 172.3 / 118.2 | 1.2* / 2.6* / 8.2* / 15.6* | 1.4 / 3.1 / 9.9 / 19.0 |
 | Raven | 141.6 / 171.1 / 176.7 / 176.7 | 238.1 / 236.7 / 245.6 / 238.5 | 1.0 / 1.8 / 5.1 / 9.5 | 0.9 / 1.8 / 5.1 / 9.5 |
 | Raven-full | 102.3 / 112.4 / 101.6 / 88.5 | 234.8 / 232.6 / 211.7 / 182.7 | 1.0 / 1.9 / 5.5 / 10.3 | 1.1 / 2.1 / 6.0 / 11.3 |
-| **FS** | 142.7 / 172.7 / 154.3 / 132.7 | 502.2 / 488.7 / 429.6 / 386.2 | 0.8 / 1.0 / 1.4 / 2.0 | 1.0 / 1.8 / 4.6 / 8.5 |
-| **FS-L** | 141.9 / 180.1 / 183.3 / 183.6 | 518.6 / 517.2 / 518.5 / 516.9 | 0.8 / 1.0 / 1.4 / 2.0 | 0.9 / 1.1 / 1.5 / 2.2 |
-| **FS-B** | 119.5 / 140.7 / 132.8 / 127.5 | 470.5 / 448.8 / 440.8 / 422.4 | 0.8 / 1.0 / 1.7 / 2.7 | 1.0 / 1.8 / 5.0 / 9.1 |
+| **FS** | 142.7 / 172.7 / 154.5 / 132.8 | 500.3 / 489.6 / 429.9 / 386.5 | 0.8 / 1.0 / 1.4 / 2.0 | 1.0 / 1.8 / 4.6 / 8.5 |
+| **FS-L** | 141.8 / 180.0 / 182.8 / 183.1 | 517.1 / 521.0 / 513.7 / 508.9 | 0.8 / 1.0 / 1.4 / 2.0 | 0.9 / 1.1 / 1.5 / 2.2 |
+| **FS-B** | 120.8 / 144.1 / 139.2 / 133.8 | 494.8 / 471.3 / 452.2 / 444.3 | 0.8 / 1.0 / 1.7 / 2.7 | 1.0 / 1.8 / 5.0 / 9.1 |
 
 ## Models
 
@@ -104,9 +104,9 @@ CUDA_VISIBLE_DEVICES=0 freesolo-benchmark --model zekun-shi/FreeSolo-B-341M \
 The command downloads the checkpoint (and portable thresholds for FS-B), then invokes the
 paper's benchmark with bf16, batch 1, one warm-up, three measured repetitions,
 256 decode steps, and no memory cap. It prints eager and CUDA-graph measurements;
-compare the graph columns with **154.3/132.7 Ktok/s prefill** and **429.6/386.2 tok/s decode** for `FreeSolo-341M`, **183.3/183.6 Ktok/s prefill** and
-**518.5/516.9 tok/s decode** for `FreeSolo-L-341M`, or **132.8/127.5 Ktok/s prefill** and
-**440.8/422.4 tok/s decode** for `FreeSolo-B-341M` at 64k/131k. GPU clocks, host load, and software versions
+compare the graph columns with **154.5/132.8 Ktok/s prefill** and **429.9/386.5 tok/s decode** for `FreeSolo-341M`, **182.8/183.1 Ktok/s prefill** and
+**513.7/508.9 tok/s decode** for `FreeSolo-L-341M`, or **139.2/133.8 Ktok/s prefill** and
+**452.2/444.3 tok/s decode** for `FreeSolo-B-341M` at 64k/131k. GPU clocks, host load, and software versions
 affect timing. The JSON includes graph/eager logit checks and kernel fallback status.
 The reference stack uses PyTorch 2.5.1+cu121 and Triton 3.1.0.
 
