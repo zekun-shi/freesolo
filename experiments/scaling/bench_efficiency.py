@@ -19,12 +19,12 @@ DT = torch.bfloat16
 # inference execution switches shared by every serve config (window, trunk glue, readout, FS-L selection, cache cell
 # statistics; the FS / FS-L stream forks: prefill window beside the long-range branch, graphed decode read beside the
 # window); "0" restores the eager path. FSL_KV_BOUNDED=1: the FS-L graph decode keeps only the K / V cells it can still
-# read (src/fsattn/kv_bounded.py). FS_GLUE_KV=1 (default 0): an FS / FS-L prefill that keeps no KV cache takes K and V
+# read (src/fsattn/kv_bounded.py). FS_GLUE_KV=1 (the default): an FS / FS-L prefill that keeps no KV cache takes K and V
 # in the projections' token-major layout instead of copying them (FSAttn._kv_token_major_ok)
 ATTN_FLAGS = {"FSL_WINDOW_BATCHED": "1", "FSL_TRUNK_FUSED": "1", "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1",
               "FSL_PREFILL_CELL_REUSE": "1", "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0",
               "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1", "FSL_FAST_CACHE_STATS": "1",
-              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1", "FS_GLUE_KV": "0", "FS_DECODE_CELLS": "0"}
+              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1", "FS_GLUE_KV": "1", "FS_DECODE_CELLS": "0"}
 
 
 def attn_flags():
@@ -43,7 +43,7 @@ FSB_FLAGS = {"FSB_FAST_BEAM": "1", "FSB_BEAM_CUDA": "1", "FSB_BEAM_ROWS": "1", "
              "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
              "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
              "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "1", "FSB_BUILD_UNIFORM": "1",
-             "FSB_BEAM_LONG": "1", "FSB_GLUE_KV": "0", "FSB_GLUE_FORK": "0", "FSB_DECODE_SHARE": "0", "FSB_DECODE_CELLS": "0"}
+             "FSB_BEAM_LONG": "1", "FSB_GLUE_KV": "1", "FSB_GLUE_FORK": "1", "FSB_DECODE_SHARE": "1", "FSB_DECODE_CELLS": "0"}
 
 
 def fsb_flags():

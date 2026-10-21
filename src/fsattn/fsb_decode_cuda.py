@@ -15,8 +15,9 @@ child it visits, its nodes follow from the tree's shape alone; those top levels 
 pass of scores, the frontier order replayed), the shape walk is cached per row in the forest's plan buffer
 (ForestCache._plan) and reused while the row's shape holds, and the preamble issues the query's load first.
 
-FSB_DECODE_SHARE=1 (default 0) builds the kernel with one copy of the descent code for both descents and one copy of the
-re-rank code for both re-rank passes, and has the re-rank load each cell's prior ceiling with its key rows (DEC_SHARE in
+FSB_DECODE_SHARE=1 (the default) builds the kernel with one copy of the descent code for both descents and one copy
+of the re-rank code for both re-rank passes (0 keeps a copy per pass), and has the re-rank load each cell's prior
+ceiling with its key rows (DEC_SHARE in
 fsb_decode.cu): the same read cells and outputs bit for bit, and a launch runs from 80 KB of code instead of 148 KB.
 Inside a decode step the other layers' weights evict the kernel's code from L2 between its launches, so every launch
 fetches the instructions it runs from DRAM on its critical path.
@@ -52,9 +53,10 @@ def v3_on() -> bool:
 
 
 def share_on() -> bool:
-    # FSB_DECODE_SHARE=1 (default 0): the build whose descents and re-rank passes share their code and whose re-rank
-    # loads the prior ceilings with the key rows (fsb_decode.cu, DEC_SHARE), the same read cells and outputs bit for bit
-    return os.environ.get("FSB_DECODE_SHARE", "0") == "1"
+    # FSB_DECODE_SHARE=1 (the default; 0 builds a separate copy per pass): the build whose descents and re-rank
+    # passes share their code and whose re-rank loads the prior ceilings with the key rows (fsb_decode.cu,
+    # DEC_SHARE), the same read cells and outputs bit for bit
+    return os.environ.get("FSB_DECODE_SHARE", "1") == "1"
 
 
 class _DecBeam(ctypes.Structure):

@@ -705,8 +705,8 @@ _FORK_STREAMS: dict = {}
 
 
 def glue_fork_on() -> bool:
-    # FSB_GLUE_FORK=1 (default 0): fork_layer_forests
-    return os.environ.get("FSB_GLUE_FORK", "0") == "1"
+    # FSB_GLUE_FORK=1 (the default; 0 keeps the fork off): fork_layer_forests
+    return os.environ.get("FSB_GLUE_FORK", "1") == "1"
 
 
 def _fork_now() -> bool:

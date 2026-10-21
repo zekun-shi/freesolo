@@ -891,16 +891,17 @@ class FSAttn(nn.Module):
                 "FSKVCache requires sel_strict_causal=1 (block-causal path is non-cacheable).")
 
     def _kv_token_major_ok(self, x, cache, pre=None) -> bool:
-        # FSB_GLUE_KV=1 (FS-B layers) / FS_GLUE_KV=1 (FS and FS-L layers), both default 0: a standard prefill whose
-        # cache keeps no K / V (retain_kv=False, as in the prefill benchmarks) takes K and V as (B, H, N, D) views of
-        # the projections' token-major (B, N, H * D) output instead of copying them into the (B, H, N, D) layout.
+        # FSB_GLUE_KV=1 (FS-B layers) / FS_GLUE_KV=1 (FS and FS-L layers), both the default (0 keeps the copies):
+        # a standard prefill whose cache keeps no K / V (retain_kv=False, as in the prefill benchmarks) takes K and
+        # V as (B, H, N, D) views of the projections' token-major (B, N, H * D) output instead of copying them into
+        # the (B, H, N, D) layout.
         # Every reader of them in the prefill takes them through their strides and computes the same values: the
         # window branch (the RoPE kernel and SDPA; with B > 1 it copies V itself, to fold the batch into the head
         # index), the cell statistics, FS-B's re-rank token keys, the readout, and the FS / FS-L selection and readout
         # fallbacks (torch reductions and cuBLAS products on the strided views; bit for bit at the released shape,
         # tests/test_fs_glue.py). With the cache's preallocated buffers (pre) the projections are written into those
         # buffers' storage (_project_into), which keeps the prefill's memory where it was.
-        if not (os.environ.get("FSB_GLUE_KV" if self.fsb_enabled else "FS_GLUE_KV", "0") == "1"
+        if not (os.environ.get("FSB_GLUE_KV" if self.fsb_enabled else "FS_GLUE_KV", "1") == "1"
                 and not getattr(cache, "retain_kv", True) and x.is_cuda and not torch.is_grad_enabled()
                 and not compiling()):
             return False
@@ -924,8 +925,8 @@ class FSAttn(nn.Module):
         return out.view(B, N, H, D).transpose(1, 2)
 
     def _fork_forests(self, fork: bool, K, N: int) -> None:
-        # FSB_GLUE_FORK=1 (FS-B standard prefill; default 0): in a captured prefill the layer's cell statistics and
-        # forests, which read only K, start on a side stream as soon as K exists (fsb_prefill.fork_layer_forests),
+        # FSB_GLUE_FORK=1 (FS-B standard prefill; the default): in a captured prefill the layer's cell statistics
+        # and forests, which read only K, start on a side stream as soon as K exists (fsb_prefill.fork_layer_forests),
         # beside the V and Q projections; the long-range branch joins them (and _forward_cached joins any it did not
         # take)
         if fork:
@@ -944,7 +945,7 @@ class FSAttn(nn.Module):
         cap = N + max(0, int(getattr(cache, "reserve", 0))) if pre is not None else 0
         pre_kv = (pre is not None and torch.is_tensor(pre[2]) and pre[0] == B and pre[1] == N
                   and tuple(pre[2].shape) == (B, H, cap, D) and pre[2].device == x.device)
-        fork = self.fsb_enabled and is_std_prefill and os.environ.get("FSB_GLUE_FORK", "0") == "1"
+        fork = self.fsb_enabled and is_std_prefill and os.environ.get("FSB_GLUE_FORK", "1") == "1"
         if pre_kv and self._kv_token_major_ok(x, cache, pre):
             K = self._project_into(self.W_k, x, pre[2])
             self._fork_forests(fork, K, N)

@@ -18,7 +18,7 @@ ROWS_FLAGS = {"FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP":
               "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
               "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
               "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "1", "FSB_BUILD_UNIFORM": "1",
-              "FSB_BEAM_LONG": "1", "FSB_GLUE_KV": "0", "FSB_GLUE_FORK": "0", "FSB_DECODE_SHARE": "0", "FSB_DECODE_CELLS": "0"}
+              "FSB_BEAM_LONG": "1", "FSB_GLUE_KV": "1", "FSB_GLUE_FORK": "1", "FSB_DECODE_SHARE": "1", "FSB_DECODE_CELLS": "0"}
 
 
 @pytest.fixture
@@ -136,7 +136,7 @@ ATTN_DEFAULTS = {"FSL_SLIDING_MODE": "chunked", "FSL_WINDOW_BATCHED": "1", "FSL_
                  "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0", "FSL_READOUT_G": "64", "FSL_READOUT_WARPS": "4",
                  "FSL_READOUT_STAGES": "2", "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1",
                  "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1",
-                 "FS_GLUE_KV": "0", "FS_DECODE_CELLS": "0"}
+                 "FS_GLUE_KV": "1", "FS_DECODE_CELLS": "0"}
 ATTN_FLAGS = tuple(k for k in ATTN_DEFAULTS if k != "FSL_SLIDING_MODE")
 
 
