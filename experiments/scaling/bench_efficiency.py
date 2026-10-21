@@ -19,11 +19,12 @@ DT = torch.bfloat16
 # inference execution switches shared by every serve config (window, trunk glue, readout, FS-L selection, cache cell
 # statistics; the FS / FS-L stream forks: prefill window beside the long-range branch, graphed decode read beside the
 # window); "0" restores the eager path. FSL_KV_BOUNDED=1: the FS-L graph decode keeps only the K / V cells it can still
-# read (src/fsattn/kv_bounded.py)
+# read (src/fsattn/kv_bounded.py). FS_GLUE_KV=1 (default 0): an FS / FS-L prefill that keeps no KV cache takes K and V
+# in the projections' token-major layout instead of copying them (FSAttn._kv_token_major_ok)
 ATTN_FLAGS = {"FSL_WINDOW_BATCHED": "1", "FSL_TRUNK_FUSED": "1", "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1",
               "FSL_PREFILL_CELL_REUSE": "1", "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0",
               "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1", "FSL_FAST_CACHE_STATS": "1",
-              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1"}
+              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1", "FS_GLUE_KV": "0"}
 
 
 def attn_flags():

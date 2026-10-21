@@ -891,13 +891,16 @@ class FSAttn(nn.Module):
                 "FSKVCache requires sel_strict_causal=1 (block-causal path is non-cacheable).")
 
     def _kv_token_major_ok(self, x, cache, pre=None) -> bool:
-        # FSB_GLUE_KV=1 (FS-B layers; default 0): a standard prefill whose cache keeps no K / V (retain_kv=False, as in
-        # the prefill benchmarks) takes K and V as (B, H, N, D) views of the projections' token-major (B, N, H * D)
-        # output instead of copying them into the (B, H, N, D) layout. Every reader of them in the prefill (the window
-        # branch, the cell statistics, the re-rank's token keys, the readout) takes them through their strides, so it
-        # reads the same values. With the cache's preallocated buffers (pre) the projections are written into those
+        # FSB_GLUE_KV=1 (FS-B layers) / FS_GLUE_KV=1 (FS and FS-L layers), both default 0: a standard prefill whose
+        # cache keeps no K / V (retain_kv=False, as in the prefill benchmarks) takes K and V as (B, H, N, D) views of
+        # the projections' token-major (B, N, H * D) output instead of copying them into the (B, H, N, D) layout.
+        # Every reader of them in the prefill takes them through their strides and computes the same values: the
+        # window branch (the RoPE kernel and SDPA; with B > 1 it copies V itself, to fold the batch into the head
+        # index), the cell statistics, FS-B's re-rank token keys, the readout, and the FS / FS-L selection and readout
+        # fallbacks (torch reductions and cuBLAS products on the strided views; bit for bit at the released shape,
+        # tests/test_fs_glue.py). With the cache's preallocated buffers (pre) the projections are written into those
         # buffers' storage (_project_into), which keeps the prefill's memory where it was.
-        if not (self.fsb_enabled and os.environ.get("FSB_GLUE_KV", "0") == "1"
+        if not (os.environ.get("FSB_GLUE_KV" if self.fsb_enabled else "FS_GLUE_KV", "0") == "1"
                 and not getattr(cache, "retain_kv", True) and x.is_cuda and not torch.is_grad_enabled()
                 and not compiling()):
             return False
