@@ -808,3 +808,91 @@ def test_prefix_decode_matches_level_loop(monkeypatch):
     assert (s0 >= 0).float().mean() > 0.9
     assert torch.equal(s0, s1)
     assert torch.equal(l0, l1)
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("L,v3,periodic", [(1024, "0", False), (4096, "0", False), (1408, "1", False),
+                                           (4096, "1", False), (2944, "1", True)])
+def test_shared_code_read_matches_two_copies(monkeypatch, L, v3, periodic):
+    # FSB_DECODE_SHARE=1: the build whose two descents and two re-rank passes run one copy of their code gives, at the
+    # released shape, both beams' cells, the levels each V3 prefix covered, the read cells, their provenance and the
+    # output (with and without the window combine) of the build with two copies, bit for bit, for queries over the
+    # scale of the real ones and tie-heavy cells (a periodic prompt), with the V3 prefix plans walked and cached
+    from src.fsattn.fsb_tree import beam_delta_eff, fsb_decode_token
+    m = _model(monkeypatch, L)
+    gen = torch.Generator().manual_seed(131)
+    if periodic:
+        prompt = torch.randint(0, 512, (1, 32), generator=gen).repeat(1, L // 32).cuda()
+    else:
+        prompt = torch.randint(0, 512, (1, L), generator=gen).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", "1")
+    monkeypatch.setenv("FSB_DECODE_V3", v3)
+    gd = _decoder(m, prompt, 16)
+    for _ in range(3):
+        gd.step()
+    attn, cache = gd.attn[0], gd.cache[0]
+    fc = cache._fsb_forest
+    tk, T = fc._tok, 16
+    pos_t = torch.full((), gd.pos, dtype=torch.int64, device="cuda")
+    pos_f = torch.full((1,), float(gd.pos), device="cuda")
+    cells = torch.full((T, 2 * attn.fsb_W_max << beam_delta_eff(attn)), -7, dtype=torch.int64, device="cuda")
+    lev0 = torch.full((T, 2), -1, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(dcu, "_CELLS", cells)
+    monkeypatch.setattr(dcu, "_LEV0", lev0)
+    ran = _spy(monkeypatch)
+    g = torch.Generator(device="cuda").manual_seed(137)
+    plans = [p for p in (getattr(fc, "_plan", None), getattr(fc.utau, "_plan", None)) if p is not None]
+    for scale in (0.25, 1.0, 4.0, 16.0):
+        q_t = (torch.randn(1, T, 1, 64, device="cuda", generator=g) * scale).to(torch.bfloat16)
+        sr = (torch.randn(1, T, 1, 64, device="cuda", generator=g) * scale).to(torch.bfloat16)
+        got = {}
+        for walk in (True, False):              # the prefix plans walked (cleared caches), then cached
+            for share in ("0", "1"):
+                monkeypatch.setenv("FSB_DECODE_SHARE", share)
+                for p in plans if walk else ():
+                    p.zero_()
+                outs = [fsb_decode_token(attn, q_t, cache, tk["sigma"], pos_t, pos_f=pos_f, sr=x) for x in (None, sr)]
+                got[(walk, share)] = (outs, cells.clone(), lev0.clone(), fc._last_sel.clone(), fc._last_prov.clone())
+            (o0, c0, v0, s0, p0), (o1, c1, v1, s1, p1) = got[(walk, "0")], got[(walk, "1")]
+            assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(o0, o1)), (scale, walk)
+            assert torch.equal(c0, c1) and torch.equal(v0, v1), (scale, walk)
+            assert torch.equal(s0, s1) and torch.equal(p0, p1), (scale, walk)
+            assert (c0 >= 0).any() and (s0 >= 0).any()
+    assert len(ran) == 32 and all(r is not None for r in ran)
+    assert not dcu._failed
+
+
+@gpu
+@torch.no_grad()
+def test_shared_code_decode_matches_two_copies(monkeypatch):
+    # FSB_DECODE_SHARE=1 in the whole-step decode (V3, the fork, the one-kernel join and the device-decided block
+    # changes): teacher-forced steps across query blocks give the read cells and the logits of the build with two
+    # copies of the code bit for bit, every read through the fused kernel
+    m = _model(monkeypatch, 2944, n_layers=2)
+    prompt = torch.randint(0, 512, (1, 2944), generator=torch.Generator().manual_seed(139)).cuda()
+    forced = torch.randint(0, 512, (400,), generator=torch.Generator().manual_seed(149)).cuda()
+    for k, v in (("FSB_DECODE_V2", "1"), ("FSB_DECODE_V3", "1"), ("FSB_DECODE_FORK", "1"), ("FSB_DECODE_JOIN", "1"),
+                 ("FSB_DECODE_ASYNC", "1")):
+        monkeypatch.setenv(k, v)
+    restore = _taus(m)
+    ran = _spy(monkeypatch)
+    runs = {}
+    for share in ("0", "1"):
+        monkeypatch.setenv("FSB_DECODE_SHARE", share)
+        restore()
+        ran.clear()
+        gd = _decoder(m, prompt, len(forced))
+        logits, sels = [], []
+        for t in forced:
+            gd.next_tok = t.view(1)
+            gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
+        runs[share] = (torch.stack(logits), torch.stack(sels))
+        assert ran and all(r is not None for r in ran), (share, len(ran))
+    assert not dcu._failed
+    (l0, s0), (l1, s1) = runs["0"], runs["1"]
+    assert (s0 >= 0).float().mean() > 0.9
+    assert torch.equal(s0, s1)
+    assert torch.equal(l0, l1)

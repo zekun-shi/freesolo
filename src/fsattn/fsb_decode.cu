@@ -18,8 +18,12 @@
 // row is read only where the level loop starts at the root; the keep-all top levels run as one batch (team_prefix:
 // their nodes from the tree's shape, cached per row, staged in one round, scored in one pass, the frontier order
 // replayed); and the ranks compare through register masks rather than predicate chains.
+// DEC_SHARE (FSB_DECODE_SHARE=1) gives the two descents one copy of the descent code and the two re-rank passes one
+// copy of the re-rank code, and loads each re-ranked cell's prior ceiling with its key rows, with the same cells and
+// outputs bit for bit: half the instructions a launch fetches, and one global round trip fewer per re-rank round.
 // Requires _HELPERS (fsb_beam.cu). Compile-time: DH (64), NA (9), NC, WM (<= 16), R, KK (cells read: 1, 2, 4 or 8),
-// SCELL (cell size, 32), BOUND, RC_T, LSE_ON, POS_ON, HAS_SR, W_BF16, LRS_BF16, PROV_BIT, NWARP (16), DEC_V3.
+// SCELL (cell size, 32), BOUND, RC_T, LSE_ON, POS_ON, HAS_SR, W_BF16, LRS_BF16, PROV_BIT, NWARP (16), DEC_V3,
+// DEC_SHARE.
 
 #define C_ALL (2 * WM * R)
 #define CA (WM * R)
@@ -28,6 +32,9 @@
 #define POS_INF __int_as_float(0x7f800000)
 #ifndef DEC_TIMING
 #define DEC_TIMING 0
+#endif
+#ifndef DEC_SHARE
+#define DEC_SHARE 0
 #endif
 // diagnostic build (DEC_TIMING=1): lane 0 of the recording warp stores the SM clock at phase boundaries
 #if DEC_TIMING
@@ -902,8 +909,9 @@ __device__ __forceinline__ float halve_x(float (&x)[DH / 2]) {
 // u scores of candidates c_begin + wrank + nw i (one warp per candidate, lane j its token j): _fsb_upar_int8_kernel's
 // token keys (int8 * cell scale with one rounding below n_q, the bf16 hot rows above), q.k by the halving order, lse and
 // the lse_pos prior; the raw q.k of every token stays in s_raw for the readout. A warp takes G candidates at a time:
-// their key rows load in one round (their value rows go into L2 for the readout), and each step of the computation
-// runs for all G before the next, so their dependent shuffle / exp / log chains overlap
+// their key rows load in one round (their value rows go into L2 for the readout; with DEC_SHARE their prior
+// ceilings too, which otherwise load only after the lse chain), and each step of the computation runs for all G
+// before the next, so their dependent shuffle / exp / log chains overlap
 template <int G>
 __device__ __forceinline__ void rerank_range(const int c_begin, const int c_end, const int wrank, const int nw,
                                              const int lane, const int* s_cell, float* s_u, float (*s_raw)[32],
@@ -918,6 +926,9 @@ __device__ __forceinline__ void rerank_range(const int c_begin, const int c_end,
         uint4 kr[G][DH / 16];
         float ksc[G], raw[G], m[G], res[G];
         int cells[G];
+#if DEC_SHARE && POS_ON
+        float pa[G];                                // DEC_SHARE: each cell's prior ceiling, loaded with its key rows
+#endif
 #pragma unroll
         for (int i = 0; i < G; i++) {
             const int c = c0 + nw * i;
@@ -933,6 +944,9 @@ __device__ __forceinline__ void rerank_range(const int c_begin, const int c_end,
                 }
                 prefetch_l2(qv_row + tok * sqv_n);
             }
+#if DEC_SHARE && POS_ON
+            pa[i] = cella_row[(i64)min(max(cells[i], 0), Mc - 1) * ca1];
+#endif
         }
 #pragma unroll
         for (int i = 0; i < G; i++) {
@@ -991,7 +1005,11 @@ __device__ __forceinline__ void rerank_range(const int c_begin, const int c_end,
         for (int i = 0; i < G; i++) {
             const int cell = max(cells[i], 0);
             const float xx = f_div_rn(f_abs(f_sub(qp, f_mul(f_add((float)cell, 0.5f), (float)SCELL))), sig2);
+#if DEC_SHARE
+            const float a = pa[i];
+#else
             const float a = cella_row[(i64)min(cell, Mc - 1) * ca1];
+#endif
             res[i] = f_add(res[i], f_mul(f_mul(lam_r, a), erf_torch(xx)));
         }
 #endif
@@ -1071,6 +1089,48 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
     constexpr int NRW = NWARP - 8;                            // re-rank warps
     if (wid == 0) TSTAMP(1);
     if (tid >= 256 && tid < 256 + KK) s_slot[tid - 256] = -1;
+#if DEC_SHARE
+    // DEC_SHARE: both teams run one copy of the descent code (each with its beam's tables and its own shared state) and
+    // both re-rank passes one copy of the re-rank code (the union pass takes as many cells per round as the main
+    // pass), the same operations on the same values as the two copies each. Between two launches the decode step's
+    // weights evict the kernel's code from L2, so a launch fetches the instructions it runs from DRAM, and the
+    // fetches of each phase's first pass lie on its critical path: one copy halves the code (148 KB to 80 KB),
+    // teams 0 and 1 fetch the descent's lines once, and the main pass runs code the union pass has just fetched
+    int pass = 1;                                             // re-rank pass: 0 the union beam's cells, 1 the main's
+    if (team < 2) {
+        DecBeam B;
+#define DEC_PICK(f) B.f = team ? BB.f : BA.f
+        DEC_PICK(ROOT); DEC_PICK(WBEAM); DEC_PICK(BUDGET); DEC_PICK(TIDX); DEC_PICK(CHUNK); DEC_PICK(CHUNK_AX);
+        DEC_PICK(SPINE); DEC_PICK(LEAF); DEC_PICK(ADM); DEC_PICK(HGT); DEC_PICK(PLAN); DEC_PICK(Ntot); DEC_PICK(Sp);
+        DEC_PICK(Ltot); DEC_PICK(Mm); DEC_PICK(KMAXP1);
+#undef DEC_PICK
+        B.pad_ = 0;
+        team_descend(B, s_team[team], s_cell + team * CA, s_q[team], tt, 1 + team, r, Q, q_bf16, rcq, qp, lam_r, sig2,
+                     scale, cell_size, qk_row, sqk_n, sk_row,
+                     team == 0 && DEC_TIMING && TIMES != nullptr ? TIMES + r * 256 + 16 : nullptr,
+                     LEV0_OUT != nullptr ? LEV0_OUT + 2 * r + team : nullptr
+#if DEC_V3
+                     , s_pref[team]
+#endif
+                     );
+        if (tt == 0) TSTAMP(2 + team);
+        if (team == 1) asm volatile("bar.arrive 3, %0;" :: "r"((NRW + 4) * 32) : "memory");
+    } else {
+        asm volatile("bar.sync 3, %0;" :: "r"((NRW + 4) * 32) : "memory");
+        pass = 0;
+    }
+    for (; pass < 2; pass++) {
+        if (pass == 1) {
+            __syncthreads();
+            if (wid == 0) TSTAMP(4);
+            if (CELLS_OUT != nullptr && tid < C_ALL) CELLS_OUT[r * C_ALL + tid] = s_cell[tid];   // test hook
+        }
+        rerank_range<(CA + NWARP - 1) / NWARP < 4 ? (CA + NWARP - 1) / NWARP : 4>(
+            pass ? 0 : CA, pass ? CA : C_ALL, pass ? wid : wid - 8, pass ? NWARP : NRW, lane, s_cell, s_u, s_raw,
+            s_q[1], qk_row, sk_row, hk_row, qv_row, sqk_n, shk_n, sqv_n, nq, Mc, cella_row, ca1, qp, lam_r, sig2,
+            scale);
+    }
+#else
     if (team == 0) {
         team_descend(BA, s_team[0], s_cell, s_q[0], tt, 1, r, Q, q_bf16, rcq, qp, lam_r, sig2, scale, cell_size,
                      qk_row, sqk_n, sk_row, DEC_TIMING && TIMES != nullptr ? TIMES + r * 256 + 16 : nullptr,
@@ -1101,6 +1161,7 @@ fsb_decode_fused(const DecBeam BA, const DecBeam BB, const void* __restrict__ Q,
     rerank_range<(CA + NWARP - 1) / NWARP < 4 ? (CA + NWARP - 1) / NWARP : 4>(
         0, CA, wid, NWARP, lane, s_cell, s_u, s_raw, s_q[1], qk_row, sk_row, hk_row, qv_row, sqk_n, shk_n, sqv_n, nq,
         Mc, cella_row, ca1, qp, lam_r, sig2, scale);
+#endif
     // selpv's union deduplication: a second-beam cell already among the first beam's drops out (u = -inf)
     for (int c = CA + tid; c < C_ALL; c += NWARP * 32) {
         const int cell = s_cell[c];

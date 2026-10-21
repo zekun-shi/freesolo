@@ -14,6 +14,12 @@ fsb_decode.cu): the same read cells and outputs bit for bit with a shorter chain
 child it visits, its nodes follow from the tree's shape alone; those top levels are batched (one round of loads, one
 pass of scores, the frontier order replayed), the shape walk is cached per row in the forest's plan buffer
 (ForestCache._plan) and reused while the row's shape holds, and the preamble issues the query's load first.
+
+FSB_DECODE_SHARE=1 (default 0) builds the kernel with one copy of the descent code for both descents and one copy of the
+re-rank code for both re-rank passes, and has the re-rank load each cell's prior ceiling with its key rows (DEC_SHARE in
+fsb_decode.cu): the same read cells and outputs bit for bit, and a launch runs from 80 KB of code instead of 148 KB.
+Inside a decode step the other layers' weights evict the kernel's code from L2 between its launches, so every launch
+fetches the instructions it runs from DRAM on its critical path.
 """
 from __future__ import annotations
 
@@ -45,6 +51,12 @@ def v3_on() -> bool:
     return os.environ.get("FSB_DECODE_V3", "1") == "1"
 
 
+def share_on() -> bool:
+    # FSB_DECODE_SHARE=1 (default 0): the build whose descents and re-rank passes share their code and whose re-rank
+    # loads the prior ceilings with the key rows (fsb_decode.cu, DEC_SHARE), the same read cells and outputs bit for bit
+    return os.environ.get("FSB_DECODE_SHARE", "0") == "1"
+
+
 class _DecBeam(ctypes.Structure):
     # struct DecBeam of fsb_decode.cu (one beam's tables), passed by value
     _fields_ = ([(k, ctypes.c_void_p) for k in ("ROOT", "WBEAM", "BUDGET", "TIDX", "CHUNK", "CHUNK_AX", "SPINE",
@@ -54,10 +66,11 @@ class _DecBeam(ctypes.Structure):
 
 
 def decode_source(DH: int, WM: int, R: int, KK: int, bound: bool, rc_t: bool, lse: bool, pos: bool, has_sr: bool,
-                  w_bf16: bool, lrs_bf16: bool, timing: bool, prov_bit: int, v3: bool = False) -> str:
+                  w_bf16: bool, lrs_bf16: bool, timing: bool, prov_bit: int, v3: bool = False,
+                  share: bool = False) -> str:
     defs = dict(DH=DH, DHP=DH, NA=9, NC=DH + 9, WM=WM, R=R, KK=KK, SCELL=32, BOUND=int(bound), RC_T=int(rc_t),
                 LSE_ON=int(lse), POS_ON=int(pos), HAS_SR=int(has_sr), W_BF16=int(w_bf16), LRS_BF16=int(lrs_bf16),
-                DEC_TIMING=int(timing), PROV_BIT=int(prov_bit), NWARP=_NWARP, DEC_V3=int(v3))
+                DEC_TIMING=int(timing), PROV_BIT=int(prov_bit), NWARP=_NWARP, DEC_V3=int(v3), DEC_SHARE=int(share))
     return "".join(f"#define {k} {v}\n" for k, v in defs.items()) + bc._HELPERS + _SRC
 
 
@@ -159,13 +172,13 @@ def decode_read_fused(attn, fc, tk: dict, cache, q_t: torch.Tensor, q: torch.Ten
     w_bf16, lrs_bf16 = lnw.dtype == torch.bfloat16, lrs.dtype == torch.bfloat16
     times = _TIMES
     cfg = (dev.index, Dh, WM, R, K, attn.fsb_node_score == "bound", rc_t, rr != "max", rr == "lse_pos", has_sr,
-           w_bf16, lrs_bf16, times is not None, v3_on())
+           w_bf16, lrs_bf16, times is not None, v3_on(), share_on())
     fn = _fns.get(cfg)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             return None                                                      # never compile inside a graph capture
         try:
-            fn = _fns[cfg] = bc.load_function(dev, decode_source(*cfg[1:-1], PROV_UTAU, v3=cfg[-1]),
+            fn = _fns[cfg] = bc.load_function(dev, decode_source(*cfg[1:-2], PROV_UTAU, v3=cfg[-2], share=cfg[-1]),
                                               "fsb_decode_fused")
         except Exception as e:                                               # no NVRTC / driver: the chain runs
             if not _failed:
