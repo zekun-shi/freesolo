@@ -24,7 +24,7 @@ DT = torch.bfloat16
 ATTN_FLAGS = {"FSL_WINDOW_BATCHED": "1", "FSL_TRUNK_FUSED": "1", "FSL_NORM_ONEPASS": "1", "FSL_ROPE_FUSED": "1",
               "FSL_PREFILL_CELL_REUSE": "1", "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0",
               "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1", "FSL_FAST_CACHE_STATS": "1",
-              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1", "FS_GLUE_KV": "0"}
+              "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1", "FS_GLUE_KV": "0", "FS_DECODE_CELLS": "0"}
 
 
 def attn_flags():

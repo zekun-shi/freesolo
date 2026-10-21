@@ -248,9 +248,34 @@ class GraphedDecoder:
         o, m = torch.stack([c._slots.flags for c in self.cache]).sum(0).tolist()
         return (int(o), int(m))
 
+    def _cell_inplace(self, i) -> bool:
+        # whether the token the graph wrote at step pos advances layer i's cache in place (True) or appends the graph
+        # pool's rows to it (False, when the pool holds its own K / V buffers)
+        c = self.cache[i]
+        buf = self.layer_bufs[i]
+        if buf.get("cache") is c:               # int8 store: the window kernel wrote the hot row at replay
+            return True
+        return buf["kbuf"] is c._k_buf and buf["vbuf"] is c._v_buf
+
     @torch.no_grad()
     def _advance_cache_bookkeeping(self):
         p = self.pos
+        if ((p + 1) % self.s == 0 and os.environ.get("FS_DECODE_CELLS", "0") == "1"
+                and all(self._cell_inplace(i) and _fs_cell_fork_ok(self.cache[i]) for i in range(self.nL))):
+            # FS_DECODE_CELLS=1 (default 0): a step that completes a cell runs the layers' cell bookkeeping (the
+            # cell's statistics and their stores: a few small launches per layer) on side streams forked from the
+            # decode stream after the replay and joined back before anything reads the stores, the same kernels on
+            # the same values, as FSBGraphedDecoder's FSB_DECODE_CELLS does
+            cur = torch.cuda.current_stream(self.dev)
+            side = _cell_streams(self.dev)
+            for st in side:
+                st.wait_stream(cur)
+            for i in range(self.nL):
+                with torch.cuda.stream(side[i % len(side)]):
+                    self.cache[i].advance_in_place()
+            for st in side:
+                cur.wait_stream(st)
+            return
         for i in range(self.nL):
             c = self.cache[i]
             buf = self.layer_bufs[i]
@@ -269,7 +294,8 @@ _CELL_NSTREAMS = 8
 
 
 def _cell_streams(dev) -> list:
-    # FSB_DECODE_CELLS=1: the side streams a step that completes a cell spreads its layers' cell bookkeeping over
+    # FSB_DECODE_CELLS / FS_DECODE_CELLS=1: the side streams a step that completes a cell spreads its layers' cell
+    # bookkeeping over
     ss = _CELL_STREAMS.get(str(dev))
     if ss is None:
         ss = _CELL_STREAMS[str(dev)] = [torch.cuda.Stream(device=dev) for _ in range(_CELL_NSTREAMS)]
@@ -282,6 +308,16 @@ def _cell_fork_ok(cache) -> bool:
     nxt = 0 if cache._kbar is None else cache._kbar.shape[2]
     return (not getattr(cache, "bounded_kv", False) and not cache.fsb_leaf_radius and cache._kbar_buf is not None
             and cache._ceil_buf is not None and nxt < cache._kbar_buf.shape[2])
+
+
+def _fs_cell_fork_ok(cache) -> bool:
+    # the FS / FS-L cache's half of _cell_fork_ok: its next completed cell writes only tensors that outlive the step
+    if cache.fsb_leaf_radius:
+        return False                          # the spread column would be torch.cat'd
+    if cache.bounded_kv:
+        return cache._slots is not None       # store_cell writes the slot store's own buffers
+    nxt = 0 if cache._kbar is None else cache._kbar.shape[2]
+    return (cache._kbar_buf is not None and cache._ceil_buf is not None and nxt < cache._kbar_buf.shape[2])
 
 
 class FSBGraphedDecoder:

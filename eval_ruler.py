@@ -37,7 +37,7 @@ def _attn_execution_env():
                 "FSL_READOUT_FUSED": "1", "FSL_WINDOW_STREAM": "0", "FSL_READOUT_G": "64", "FSL_READOUT_WARPS": "4",
                 "FSL_READOUT_STAGES": "2", "FSL_FAST_SELECT": "1", "FSL_FUSED_CONTENT": "1",
                 "FSL_FAST_CACHE_STATS": "1", "FS_WINDOW_OVERLAP": "1", "FS_DECODE_FORK": "1", "FSL_KV_BOUNDED": "1",
-                "FS_GLUE_KV": "0"}
+                "FS_GLUE_KV": "0", "FS_DECODE_CELLS": "0"}
     return {name: os.environ.get(name, default) for name, default in defaults.items()}
 
 def _file_sha256_once(path):

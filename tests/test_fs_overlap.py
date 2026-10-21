@@ -193,3 +193,59 @@ def test_read_then_combine_matches_fused_read(monkeypatch, serve, store, autocas
     assert read[0].dtype == torch.float32 and got.dtype == ref.dtype and got.shape == ref.shape
     assert torch.equal(got, ref)
     assert not torch.equal(ref, tt.lr_combine(torch.zeros_like(sr), *read))     # the window output is in it
+
+
+@pytest.mark.parametrize("serve", ["dense", "sparse"])
+@pytest.mark.parametrize("int8", ["1", "0"])
+@torch.no_grad()
+def test_decode_cells_matches_serial(monkeypatch, serve, int8):
+    # FS_DECODE_CELLS=1: a step that completes a cell spreads the layers' cell bookkeeping over side streams forked
+    # after the replay and joined back before the stores are read (as FSB_DECODE_CELLS does for FS-B): teacher-forced
+    # steps across query blocks and cell closes give the serial step's logits and final cache state bit for bit on
+    # every KV store (int8, bf16, the bounded int8 of FSL_KV_BOUNDED=1), and the fork runs once per cell close
+    import decode_graph as dg
+    from decode_graph import GraphedDecoder
+    _serve(monkeypatch, serve)
+    monkeypatch.setenv("FS_KV_INT8", int8)
+    L, steps = 1024, 300
+    m = _model(serve, L, 2, 52)
+    prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(53)).cuda()
+    forced = torch.randint(0, 512, (steps,), generator=torch.Generator().manual_seed(57)).cuda()
+    forks, real = [0], dg._cell_streams
+
+    def spy(dev):
+        forks[0] += 1
+        return real(dev)
+
+    monkeypatch.setattr(dg, "_cell_streams", spy)
+    runs, states = {}, {}
+    for bounded in ("0", "1") if serve == "sparse" and int8 == "1" else ("0",):
+        for cells in ("0", "1"):
+            monkeypatch.setenv("FS_DECODE_CELLS", cells)
+            monkeypatch.setenv("FSL_KV_BOUNDED", bounded)
+            forks[0] = 0
+            gd = GraphedDecoder(m, prompt, Lmax=L + steps + 16, device="cuda", dtype=torch.bfloat16)
+            gd.prefill()
+            assert gd.bounded_kv == (bounded == "1")
+            logits = []
+            for t in forced:
+                gd.next_tok = t.view(1)
+                gd.step()
+                logits.append(gd.static_logits.clone())
+            runs[bounded, cells] = torch.stack(logits)
+            states[bounded, cells] = [(c._len, c._n_q, None if c._kbar is None else c._kbar.clone(),
+                                       None if c._ceil is None else c._ceil.clone()) for c in gd.cache]
+            want = sum(1 for k in range(steps) if (L + k + 1) % gd.s == 0)
+            assert forks[0] == (want if cells == "1" else 0), (bounded, cells, forks[0], want)
+            assert gd.kv_faults() == (0, 0)
+            del gd
+    assert torch.isfinite(runs["0", "0"]).all()
+    for key, run in runs.items():
+        assert torch.equal(runs["0", "0"], run), key
+    for key, state in states.items():
+        if key[1] != "1":                                   # each store's forked run against its own serial one
+            continue
+        for base, got in zip(states[key[0], "0"], state):
+            assert base[:2] == got[:2] and all(
+                (a is None) == (b is None) and (a is None or torch.equal(a, b))
+                for a, b in zip(base[2:], got[2:])), key
