@@ -29,9 +29,11 @@ if _HAVE_TRITON:
 
 @pytest.fixture(autouse=True)
 def _build_kernel_first(monkeypatch):
-    # a short or mid prefill's trimmed build runs fsb_forest_build_small by default (FSB_BUILD_SMALL=1, the same bits):
-    # the tests here build with the build kernel, and the small kernel's tests switch FSB_BUILD_SMALL on themselves
+    # a short or mid prefill's trimmed build runs fsb_forest_build_small by default (FSB_BUILD_SMALL=1, the same bits),
+    # and the split-table build kernels come from the uniform module (FSB_BUILD_UNIFORM=1, the same bits): the tests
+    # here build with the build module's kernels, and the small and uniform kernels' tests switch them on themselves
     monkeypatch.setenv("FSB_BUILD_SMALL", "0")
+    monkeypatch.setenv("FSB_BUILD_UNIFORM", "0")
 
 
 def _bc():

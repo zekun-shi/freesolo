@@ -14,8 +14,9 @@ order two children whose scores agree in their top 27 bits by child index; the e
 default) finds such ties among a query's kept ranks and the first dropped one and selects that level again with
 64-bit keys, so its selections are fsb_beam_rows' exactly (FSB_BEAM_V2_EXACT=0: the faster 32-bit build, whose
 selections can differ at such ties); its key64 test build selects with 64-bit keys at every level. Its AKEY build
-(FSB_BEAM_LONG=1, over the exact build) selects exactly with 32-bit keys that hold each child's score bits relative to
-its query's best child, so it needs no 64-bit re-selection and runs three blocks per SM instead of two.
+(FSB_BEAM_LONG=1, the default, over the exact build; 0 keeps the exact build) selects exactly with 32-bit keys that
+hold each child's score bits relative to its query's best child, so it needs no 64-bit re-selection and runs three
+blocks per SM instead of two.
 
 fsb_beam_cuda (decode, small rows): one warp per query, lane l holds child slot l (frontier slot l // 2); each level
 loads the children's node fields once, the dot products of the valid children run as a shuffle reduce-scatter, and
@@ -453,9 +454,9 @@ def beam_v2_exact() -> bool:
 
 
 def beam_long_on() -> bool:
-    # FSB_BEAM_LONG=1: fsb_beam_rows2's AKEY build in place of its exact build (the same selections: 32-bit keys
-    # relative to each query's best child, no 64-bit re-selection, three blocks per SM)
-    return os.environ.get("FSB_BEAM_LONG", "0") == "1"
+    # FSB_BEAM_LONG=1 (the default): fsb_beam_rows2's AKEY build in place of its exact build (the same selections:
+    # 32-bit keys relative to each query's best child, no 64-bit re-selection, three blocks per SM); 0: the exact build
+    return os.environ.get("FSB_BEAM_LONG", "1") == "1"
 
 
 _AKEY_WIN = 1 << 27                    # the AKEY build's key window (order-preserving score units below a query's best)

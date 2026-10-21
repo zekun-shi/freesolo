@@ -3467,15 +3467,16 @@ def _ingest_async_many(items: list) -> list:
 @torch.no_grad()
 def fsb_decode_prepare_all(attns, caches, B, H, Dh, dev, pos):
     # fsb_decode_prepare for every layer at a block change, the newly completed cells appended to all forests first and
-    # their admitted counts read in one host transfer. FSB_DECODE_ASYNC=1: forests whose ingest provably needs none of
-    # this block's counts on the host (_async_go) skip that read and decide their chunk rebuilds on the device, all in
-    # one batch of launches (_ingest_async_many), so the block change enqueues behind the decode steps still running
-    # instead of waiting for them, and with less host work than the host-decided one even when nothing is queued; the
-    # layers' remaining updates (independent forests) run on side streams forked from this stream after the steps before
-    # the block and joined back before the next one, so their small kernels overlap. A block in which some forest
-    # needs its counts on the host takes that read for every forest: it waits for the queue anyway
+    # their admitted counts read in one host transfer. FSB_DECODE_ASYNC=1 (the default; 0 reads every forest's counts on
+    # the host): forests whose ingest provably needs none of this block's counts on the host (_async_go) skip that read
+    # and decide their chunk rebuilds on the device, all in one batch of launches (_ingest_async_many), so the block
+    # change enqueues behind the decode steps still running instead of waiting for them, and with less host work than
+    # the host-decided one even when nothing is queued; the layers' remaining updates (independent forests) run on side
+    # streams forked from this stream after the steps before the block and joined back before the next one, so their
+    # small kernels overlap. A block in which some forest needs its counts on the host takes that read for every forest:
+    # it waits for the queue anyway
     T = B * H
-    async_on = os.environ.get("FSB_DECODE_ASYNC", "0") == "1"
+    async_on = os.environ.get("FSB_DECODE_ASYNC", "1") == "1"
     capturing = torch.device(dev).type == "cuda" and torch.cuda.is_current_stream_capturing()
     forests = []
     for cache in caches:

@@ -22,11 +22,12 @@ gpu = pytest.mark.skipif(not (torch.cuda.is_available() and fast._HAVE_TRITON an
 
 @pytest.fixture(autouse=True)
 def _rows_kernel_first(monkeypatch):
-    # forest_beam_rows_cuda runs fsb_beam_rows2's exact build by default (FSB_BEAM_V2=1, FSB_BEAM_V2_EXACT=1): the
-    # tests here start on fsb_beam_rows and the lean kernel's fast build, and the lean kernel's tests switch
-    # FSB_BEAM_V2 / FSB_BEAM_V2_EXACT on themselves
+    # forest_beam_rows_cuda runs fsb_beam_rows2's AKEY build by default (FSB_BEAM_V2=1, FSB_BEAM_V2_EXACT=1,
+    # FSB_BEAM_LONG=1): the tests here start on fsb_beam_rows, the lean kernel's fast build and its exact build, and the
+    # lean kernel's tests switch FSB_BEAM_V2 / FSB_BEAM_V2_EXACT / FSB_BEAM_LONG on themselves
     monkeypatch.setenv("FSB_BEAM_V2", "0")
     monkeypatch.setenv("FSB_BEAM_V2_EXACT", "0")
+    monkeypatch.setenv("FSB_BEAM_LONG", "0")
 
 
 if fast._HAVE_TRITON:

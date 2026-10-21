@@ -16,9 +16,10 @@ group build's signed zeros (folded once per sum), first-index argmax, and torch'
 -0 == +0, ties by slot). The source is compiled at first use with NVRTC through fsb_beam_cuda's loader; without
 NVRTC, or for shapes it does not cover, the existing builder runs. With FSB_BUILD_SMALL=1 (the default; 0 keeps the
 build kernel) a short or mid prefill's trimmed build runs its chunks (all at most 2^8 cells high) in
-fsb_forest_build_small instead, with the same bits (small_on, _small_units). With FSB_BUILD_UNIFORM=1 the split-table
-build kernels (the prefill's fsb_forest_build16 and the decode ingest's fsb_forest_build_lean16) come from a second
-module compiled with warp-uniform branches, again with the same bits (uniform_on).
+fsb_forest_build_small instead, with the same bits (small_on, _small_units). With FSB_BUILD_UNIFORM=1 (the default; 0
+keeps the build module's) the split-table build kernels (the prefill's fsb_forest_build16 and the decode ingest's
+fsb_forest_build_lean16) come from a second module compiled with warp-uniform branches, again with the same bits
+(uniform_on).
 """
 from __future__ import annotations
 
@@ -77,14 +78,14 @@ def small_on() -> bool:
 
 
 def uniform_on() -> bool:
-    # FSB_BUILD_UNIFORM=1: the split-table build kernels (fsb_forest_build16 of every whole-forest build, the prefill's,
-    # and fsb_forest_build_lean16 of the decode ingest's chunk builds) run from a module compiled with BUILD_UNIFORM:
-    # every branch around shuffle code tests a value ptxas can prove warp-uniform (no divergence-checked second copy
-    # that runs each shuffle through a WARPSYNC call), and every task kind reaches the C levels and the per-warp levels
-    # from one call site (one copy of the level code instead of up to three): a third of the instructions and far
-    # fewer spills. The same task tables and the same arithmetic in the same order: the same bits. 0 (the default):
-    # the build module's kernels
-    return os.environ.get("FSB_BUILD_UNIFORM", "0") == "1"
+    # FSB_BUILD_UNIFORM=1 (the default): the split-table build kernels (fsb_forest_build16 of every whole-forest build,
+    # the prefill's, and fsb_forest_build_lean16 of the decode ingest's chunk builds) run from a module compiled with
+    # BUILD_UNIFORM: every branch around shuffle code tests a value ptxas can prove warp-uniform (no divergence-checked
+    # second copy that runs each shuffle through a WARPSYNC call), and every task kind reaches the C levels and the
+    # per-warp levels from one call site (one copy of the level code instead of up to three): a third of the
+    # instructions and far fewer spills. The same task tables and the same arithmetic in the same order: the same bits.
+    # 0: the build module's kernels
+    return os.environ.get("FSB_BUILD_UNIFORM", "1") == "1"
 
 
 def _small_fits(M: int, mb_max) -> bool:

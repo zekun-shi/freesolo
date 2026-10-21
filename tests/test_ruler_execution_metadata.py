@@ -17,8 +17,8 @@ ROWS_FLAGS = {"FSB_ROWS_IMPL": "cuda", "FSB_ROWS_DEFER": "1", "FSB_ROWS_LOSKIP":
               "FSB_BEAM_COMPACT": "1", "FSB_CHECK_COMPACT": "0", "FSB_FAST_PREFILL": "1",
               "FSB_FAST_PREFILL_BLKCHUNK": "128", "FSB_FAST_PREFILL_SCRATCH_MB": "2048", "FSB_PREFILL_STATS": "0",
               "FSB_WINDOW_OVERLAP": "1", "FSB_BUILD_PREFILL_TRIM": "1", "FSB_PREFILL_NOCOPY": "1", "FSB_ROWS_V3": "1",
-              "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "1", "FSB_BUILD_UNIFORM": "0",
-              "FSB_BEAM_LONG": "0"}
+              "FSB_BEAM_V2": "1", "FSB_BEAM_V2_EXACT": "1", "FSB_BUILD_SMALL": "1", "FSB_BUILD_UNIFORM": "1",
+              "FSB_BEAM_LONG": "1"}
 
 
 @pytest.fixture
@@ -73,7 +73,7 @@ def ruler_driver(monkeypatch):
     {"FSB_DECODE_GRAPH_CHECK": "1"},
     {"FSB_DECODE_V2": "0"},
     {"FSB_DECODE_V2": "0", "FSB_DECODE_FORK": "0"},
-    {"FSB_DECODE_JOIN": "0", "FSB_DECODE_ASYNC": "1", "FSB_DECODE_V3": "0"},
+    {"FSB_DECODE_JOIN": "0", "FSB_DECODE_ASYNC": "0", "FSB_DECODE_V3": "0"},
     {"FSB_BEAM_CUDA": "0"},
     {"FSB_BEAM_ROWS": "0"},
     {"FSB_TRAVERSE_TRITON": "0"},
@@ -88,8 +88,8 @@ def ruler_driver(monkeypatch):
      "FSB_BEAM_V2_EXACT": "0"},
     {"FSB_BEAM_V2_EXACT": "0"},
     {"FSB_BUILD_SMALL": "0"},
-    {"FSB_BUILD_UNIFORM": "1"},
-    {"FSB_BEAM_LONG": "1"},
+    {"FSB_BUILD_UNIFORM": "0"},
+    {"FSB_BEAM_LONG": "0"},
 ])
 def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, tmp_path, capsys, overrides):
     for name, value in overrides.items():
@@ -108,7 +108,7 @@ def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, t
     flags = report["meta"]["fsb_execution_env"]
     expected = {**dict.fromkeys(FAST_FLAGS, "1"), "FSB_DECODE_GRAPH": "1",
                 "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1", "FSB_DECODE_JOIN": "1",
-                "FSB_DECODE_ASYNC": "0", "FSB_DECODE_V3": "1", "FSB_TRAIN_GRAPH": "0", **ROWS_FLAGS, **overrides}
+                "FSB_DECODE_ASYNC": "1", "FSB_DECODE_V3": "1", "FSB_TRAIN_GRAPH": "0", **ROWS_FLAGS, **overrides}
     assert flags == expected
     env_line = next(line for line in capsys.readouterr().out.splitlines() if "FS-B eval env:" in line)
     for name, value in expected.items():
