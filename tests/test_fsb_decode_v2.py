@@ -896,3 +896,53 @@ def test_shared_code_decode_matches_two_copies(monkeypatch):
     assert (s0 >= 0).float().mean() > 0.9
     assert torch.equal(s0, s1)
     assert torch.equal(l0, l1)
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("share", ["0", "1"])
+def test_side_stream_cell_bookkeeping_matches_serial(monkeypatch, share):
+    # FSB_DECODE_CELLS=1: the steps that complete a cell run the layers' cell bookkeeping on side streams; across cell
+    # completions and query blocks (the fork, the one-kernel join, the device-decided block changes) the logits, the
+    # read cells and the caches' int8 store, cell scales, cell statistics and n_q equal the serial bookkeeping's bit
+    # for bit, and every cell completion took the side streams
+    m = _model(monkeypatch, 2944, n_layers=2)
+    import decode_graph as dg
+    prompt = torch.randint(0, 512, (1, 2944), generator=torch.Generator().manual_seed(151)).cuda()
+    forced = torch.randint(0, 512, (300,), generator=torch.Generator().manual_seed(157)).cuda()
+    for k, v in (("FSB_DECODE_V2", "1"), ("FSB_DECODE_V3", "1"), ("FSB_DECODE_FORK", "1"), ("FSB_DECODE_JOIN", "1"),
+                 ("FSB_DECODE_ASYNC", "1"), ("FSB_DECODE_SHARE", share)):
+        monkeypatch.setenv(k, v)
+    restore = _taus(m)
+    forks = []
+    real_streams = dg._cell_streams
+    monkeypatch.setattr(dg, "_cell_streams", lambda dev: forks.append(dev) or real_streams(dev))
+    runs = {}
+    for cells in ("0", "1"):
+        monkeypatch.setenv("FSB_DECODE_CELLS", cells)
+        restore()
+        forks.clear()
+        gd = _decoder(m, prompt, len(forced))
+        logits, sels = [], []
+        for t in forced:
+            gd.next_tok = t.view(1)
+            gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
+        torch.cuda.synchronize()
+        store = []
+        for c in gd.cache:
+            nq, nc = c._n_q, c._kbar.shape[2]
+            store.append((nq, c._qk_buf[:, :, :nq].clone(), c._qv_buf[:, :, :nq].clone(),
+                          c._ks_buf[:, :, :nq // c.s].clone(), c._vs_buf[:, :, :nq // c.s].clone(),
+                          c._kbar[:, :, :nc].clone(), c._ceil[:, :, :nc].clone(), int(c._nq_t.item())))
+        runs[cells] = (torch.stack(logits), torch.stack(sels), store, len(forks))
+    (l0, s0, st0, f0), (l1, s1, st1, f1) = runs["0"], runs["1"]
+    completed = sum(1 for p in range(2944, 2944 + len(forced)) if (p + 1) % 32 == 0)
+    assert f0 == 0 and f1 == completed > 0, (f0, f1, completed)
+    assert torch.equal(s0, s1) and (s0 >= 0).float().mean() > 0.9
+    assert torch.equal(l0.view(torch.int32), l1.view(torch.int32))
+    for a, b in zip(st0, st1):
+        assert a[0] == b[0] and a[-1] == b[-1] == a[0]
+        for x, y in zip(a[1:-1], b[1:-1]):
+            assert x.shape == y.shape and torch.equal(x.view(torch.uint8), y.view(torch.uint8))

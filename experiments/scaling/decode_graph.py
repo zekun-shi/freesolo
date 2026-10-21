@@ -264,13 +264,37 @@ class GraphedDecoder:
                 c.append(k_t, v_t)
 
 
+_CELL_STREAMS: dict = {}
+_CELL_NSTREAMS = 8
+
+
+def _cell_streams(dev) -> list:
+    # FSB_DECODE_CELLS=1: the side streams a step that completes a cell spreads its layers' cell bookkeeping over
+    ss = _CELL_STREAMS.get(str(dev))
+    if ss is None:
+        ss = _CELL_STREAMS[str(dev)] = [torch.cuda.Stream(device=dev) for _ in range(_CELL_NSTREAMS)]
+    return ss
+
+
+def _cell_fork_ok(cache) -> bool:
+    # whether a cache's next completed cell writes only tensors that outlive the step (its quantized rows, scales, cell
+    # statistics buffers and n_q): no allocation made on a side stream is kept for later use on the decode stream
+    nxt = 0 if cache._kbar is None else cache._kbar.shape[2]
+    return (not getattr(cache, "bounded_kv", False) and not cache.fsb_leaf_radius and cache._kbar_buf is not None
+            and cache._ceil_buf is not None and nxt < cache._kbar_buf.shape[2])
+
+
 class FSBGraphedDecoder:
     """Whole-step CUDA-graph decode for FS-B: every layer's token step (projections, window, FS-B read, FFN) and the
     fp32 head replay as one graph. At each query block the forests are brought up to date eagerly
     (fsb_decode_prepare); the step graph is re-captured only when the tensors it reads moved (arena growth, a live
     flip, a path switch): the prepare refreshes its forest slot tensors in place, so one capture serves every block
     whose registry is unchanged. The KV cache's cell bookkeeping runs after each replay. The operations are those
-    of cached_generate's decode, so the tokens match it."""
+    of cached_generate's decode, so the tokens match it.
+    FSB_DECODE_CELLS=1 (default 0): a step that completes a cell runs the layers' cell bookkeeping (quantising the cell,
+    its statistics, their copies into the cache buffers: seven small launches per layer) on side streams forked from
+    the decode stream after the replay and joined back before the next step, the same kernels on the same values; on
+    the decode stream alone those 168 launches run one after another (about 0.9 ms per completed cell)."""
 
     def __init__(self, model, prompt_ids, max_new_tokens, device="cuda", dtype=torch.bfloat16, lean_prefill=False):
         self.m = model
@@ -403,8 +427,22 @@ class FSBGraphedDecoder:
                 self._blk = p // self.Bq        # slots refreshed in place: the capture survives the block change
         self.graph.replay()
         self.next_tok = self.static_next
-        for c in self.cache:                    # cell bookkeeping of the token the graph wrote at position p
-            c.advance_in_place()
+        if ((p + 1) % self.cache[0].s == 0 and os.environ.get("FSB_DECODE_CELLS", "0") == "1"
+                and all(_cell_fork_ok(c) for c in self.cache)):
+            # the layers' caches are independent: their cell bookkeeping overlaps on side streams, which wait for the
+            # replay that wrote the cell's rows and which the decode stream waits for before anything reads the cell
+            cur = torch.cuda.current_stream(self.dev)
+            side = _cell_streams(self.dev)
+            for st in side:
+                st.wait_stream(cur)
+            for i, c in enumerate(self.cache):
+                with torch.cuda.stream(side[i % len(side)]):
+                    c.advance_in_place()
+            for st in side:
+                cur.wait_stream(st)
+        else:
+            for c in self.cache:                # cell bookkeeping of the token the graph wrote at position p
+                c.advance_in_place()
         self.pos = p + 1
         return self.next_tok
 
