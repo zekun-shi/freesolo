@@ -1,0 +1,8 @@
+pa|recall_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|rag_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|longqa_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|summ_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|icl_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|rerank_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|cite_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
+pa|ruler_64k|fsb13b|freesolo:FS-B:1.3b_fs:/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B
