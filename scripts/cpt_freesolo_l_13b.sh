@@ -9,7 +9,7 @@
 set -u
 RUN=${RUN:-freesolo_l_13b_cpt}
 INIT_FROM=${INIT_FROM:?set INIT_FROM to the dense-trained FreeSolo 1.3B checkpoint (weights-only warm start)}
-PER_GPU=1; ACCUM=8        # 1 * 16 GPUs * accum 8 * 4096 = 524288 tok/step (halve procs -> halve tokens/step; MAXSTEPS counts optimizer steps)
+PER_GPU=${PER_GPU:-4}                          # layout below keeps 128 sequences x 4096 = 524288 tok/step
 SEQLEN=4096; VOCAB=32000; TOPK=4
 COMPILE=${COMPILE:-0}; CF=""; [ "$COMPILE" = "1" ] && CF="--compile"
 MAXSTEPS=${MAXSTEPS:-6000}                    # cosine 4e-4 -> 4e-5 over 6000 steps (~3.15B tokens)
@@ -18,6 +18,8 @@ SAVE_EVERY=${SAVE_EVERY:-50}                  # frequent checkpoints for the ret
 EVAL_EVERY=${EVAL_EVERY:-999999}              # in-loop val eval off; checkpoints are evaluated offline
 NNODES=${NNODES:-2}; NODE_RANK=${NODE_RANK:-0}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}; NPROC=$((NNODES * GPUS_PER_NODE))
+ACCUM=$((128 / (NPROC * PER_GPU)))
+[ $((NPROC * PER_GPU * ACCUM * SEQLEN)) = 524288 ] || { echo "layout must give 128 seq x 4096 = 524288 tok/step"; exit 2; }
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}; MASTER_PORT=${MASTER_PORT:-29541}
 DATA=${DATA:-./data/fineweb_edu_llama32k_40bt.bin}   # same corpus the dense model was trained on
 RUNS=${RUNS:-./runs}
