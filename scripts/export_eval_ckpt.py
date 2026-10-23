@@ -68,10 +68,13 @@ def strip_prefixes(source, destination, discard):
 def git_revision(repo):
     import subprocess
 
-    return subprocess.run(
+    result = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit("no git checkout here; pass --code-revision")
+    return result.stdout.strip()
 
 
 def parse_pairs(values):
@@ -98,6 +101,8 @@ def main():
                     help="full evaluation environment, repeatable (default: template's)")
     ap.add_argument("--base-model", default=None,
                     help="Hub id of the weights this run started from, or 'none'")
+    ap.add_argument("--parameters", type=int, required=True,
+                    help="parameter count the training run reported")
     ap.add_argument("--pretrain-steps", type=int, required=True)
     ap.add_argument("--cpt-steps", type=int, default=0)
     ap.add_argument("--step", type=int, default=None,
@@ -136,6 +141,13 @@ def main():
         "d_ff": shape["d_ff"],
     })
 
+    # The file holds buffers too (log_sigma, long_range_scale), so its element count
+    # runs slightly ahead of the parameter count the run reported; accept that gap only.
+    excess = facts["params"] - args.parameters
+    if not 0 <= excess <= args.parameters * 1e-4:
+        raise SystemExit(f"weights hold {facts['params']:,} elements, the run reported "
+                         f"{args.parameters:,} parameters; wrong checkpoint?")
+
     step = args.step
     if step is None and (run / "step.txt").is_file():
         step = int((run / "step.txt").read_text().strip())
@@ -151,7 +163,7 @@ def main():
     config.update({
         "freesolo_config": args.model_config,
         "variant": args.variant,
-        "parameters": facts["params"],
+        "parameters": args.parameters,
         "vocab_size": shape["vocab_size"],
         "architecture": architecture,
         "eval_flags": args.eval_flags.split() if args.eval_flags else template["eval_flags"],
@@ -166,8 +178,8 @@ def main():
     })
     config.pop("union_calibration", None)
 
-    print(f"[export] {facts['tensors']} tensors, {facts['params']:,} params, "
-          f"step {step}, {tokens['total']:,} tokens")
+    print(f"[export] {facts['tensors']} tensors, {facts['params']:,} elements, "
+          f"{args.parameters:,} parameters, step {step}, {tokens['total']:,} tokens")
     if args.dry_run:
         print(json.dumps(config, indent=2))
         return
