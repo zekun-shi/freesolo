@@ -59,5 +59,5 @@ exec accelerate launch --num_processes "$WORLD" --num_machines 1 \
   --max_seq_len 4096 --vocab 32000 --per_gpu_batch_size "$PER_GPU" --grad_accum_steps "$ACCUM" \
   --max_steps "$MAXSTEPS" --lr "$LR" --min_lr "$MINLR" --warmup_steps "$WARMUP" \
   --weight_decay 0.1 --grad_clip 1.0 --seed 42 --save_every "$SAVE_EVERY" --eval_every 999999 \
-  --save_final $CF --init_from "$INIT_FROM" --pretokenized "$DATA" \
+  $CF --init_from "$INIT_FROM" --pretokenized "$DATA" \
   --run_name "$RUN" --output_dir "$RUNS/$RUN" >> "$L" 2>&1 < /dev/null
