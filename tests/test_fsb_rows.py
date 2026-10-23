@@ -173,6 +173,52 @@ def test_whole_step_decode_matches_cached_generate(monkeypatch):
     assert float(acc["1"][:, 3].sum()) > 0                       # reads found only by the second beam
 
 
+@gpu
+def test_whole_step_capture_failure_falls_back_to_eager(monkeypatch, capsys):
+    # a capture that fails at run time (a runtime that reports a stream left unjoined) must not abort the generation:
+    # the decoder runs the graph's operations eagerly for the rest of the generation - the eager loop's tokens and read
+    # statistics - and does not try to capture again at a block change
+    from experiments.scaling.model import FreeSoloLM
+    from kv_cache import cached_generate, make_caches, _trunk_cached
+    kw = dict(window_size=64, long_range_variant="cell_topk", cell_stride=32, cell_topk=4, cell_select="score",
+              sel_strict_causal=1, use_rope=True, fs_uniform_sr=True, rope_long_range=False, cell_prune_kernel=0,
+              fsb_enabled=True, fsb_policy="fixed", fsb_width=4, fsb_delta=0, fsb_node_score="bound",
+              fsb_bound_radius_coef=8.0, fsb_tree="forest", fsb_read_top=4, fsb_rerank_score="lse_pos",
+              fsb_rerank_query="raw", fsb_union_width=4, fsb_union_tau_quantile=0.5)
+    torch.manual_seed(0)
+    m = FreeSoloLM(vocab_size=256, d_model=128, n_layers=2, n_heads=4, d_ff=256, max_seq_len=512,
+                   attn_type="fsattn", **kw).cuda().eval()
+    layers = [mod for mod in m.modules() if getattr(mod, "fsb_enabled", False)]
+    prompt = torch.randint(0, 256, (1, 300), generator=torch.Generator().manual_seed(1))
+    monkeypatch.setenv("FS_KV_INT8", "0")
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        caches = make_caches(m)
+        _trunk_cached(m, prompt.cuda(), caches)
+        for mod, c in zip(layers, caches):
+            mod.fsb_tau.fill_(0.0)
+            mod.fsb_tau_union.copy_(c._ceil[0].float().median(dim=-1).values)
+    monkeypatch.setenv("FSB_DECODE_WHOLE", "0")
+    ft.fsb_read_stats_reset(m)
+    ref = cached_generate(m, prompt, 300, device="cuda", dtype="bfloat16")
+    ref_acc = torch.stack([mod._fsb_read_acc for mod in layers])
+    calls = []
+
+    def unjoined(g, fn):
+        calls.append(1)
+        raise RuntimeError("CUDA error: capturing stream has unjoined work")
+
+    monkeypatch.setattr(ft, "_capture_decode_graph", unjoined)
+    monkeypatch.setenv("FSB_DECODE_WHOLE", "1")
+    ft.fsb_read_stats_reset(m)
+    got = cached_generate(m, prompt, 300, device="cuda", dtype="bfloat16")
+    got_acc = torch.stack([mod._fsb_read_acc for mod in layers])
+    ft.fsb_read_stats_reset(m, on=False)
+    assert calls == [1]                                          # tried once; later block changes stay eager
+    assert torch.equal(got, ref)
+    assert torch.equal(got_acc, ref_acc)
+    assert capsys.readouterr().out.count("whole-step capture failed") == 1
+
+
 def _tiny_fsb(N, layers=2, **over):
     # the paper's FS-B serve config (fixed policy, 16-wide beams, union beam on the median-ceiling forest, top-4 lse_pos
     # re-rank) on a tiny random model, two query blocks per prefill stage; thresholds set from one prefill

@@ -330,7 +330,9 @@ class FSBGraphedDecoder:
     FSB_DECODE_CELLS=1 (default 0): a step that completes a cell runs the layers' cell bookkeeping (quantising the cell,
     its statistics, their copies into the cache buffers: seven small launches per layer) on side streams forked from
     the decode stream after the replay and joined back before the next step, the same kernels on the same values; on
-    the decode stream alone those 168 launches run one after another (about 0.9 ms per completed cell)."""
+    the decode stream alone those 168 launches run one after another (about 0.9 ms per completed cell).
+    A capture that fails at run time (for example a runtime that leaves a stream unjoined) leaves the decoder on the
+    eager step for the rest of the generation instead of aborting it: the eager step runs the graph's operations."""
 
     def __init__(self, model, prompt_ids, max_new_tokens, device="cuda", dtype=torch.bfloat16, lean_prefill=False):
         self.m = model
@@ -345,6 +347,7 @@ class FSBGraphedDecoder:
         self.lean_prefill = lean_prefill
         self.graph = None
         self._reg = None
+        self._graph_failed = False
 
     def _registry(self):
         from src.fsattn.fsb_tree import fsb_graph_registry
@@ -415,8 +418,9 @@ class FSBGraphedDecoder:
 
     @torch.no_grad()
     def _capture(self):
-        from src.fsattn.fsb_tree import fsb_decode_prepare_all
+        from src.fsattn.fsb_tree import _capture_decode_graph, fsb_decode_prepare_all
         fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, self.pos)
+        self._blk = self.pos // self.Bq
         accs = [getattr(a, "_fsb_read_acc", None) for a in self.attn]
         for a in self.attn:                     # the warm-up step must not add to the read statistics
             a._fsb_read_acc = None
@@ -435,13 +439,26 @@ class FSBGraphedDecoder:
             for a, acc in zip(self.attn, accs):
                 a._fsb_read_acc = acc
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph), _autocast_ctx(self.dev, self.dt):
-                self.static_logits = self._step_body()
+            with _autocast_ctx(self.dev, self.dt):
+                self.static_logits = _capture_decode_graph(self.graph, self._step_body)
+        except RuntimeError as exc:
+            # a capture fault must not abort the generation: the eager step runs the graph's operations; a context the
+            # failed capture left unusable surfaces there, with the FSB_DECODE_WHOLE=0 message
+            self.graph = None
+            self._graph_failed = True
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError:
+                pass
+            print(f"[fsb-graph] whole-step capture failed at pos {self.pos} ({type(exc).__name__}: {exc}); "
+                  "decoding this generation eagerly (FSB_DECODE_WHOLE=0 does so from the start)", flush=True)
         finally:
             for blk in self.blocks:
                 blk.ffn._use_gu_cache = False
-        self._blk = self.pos // self.Bq
-        self._reg = self._registry()
+            for a, acc in zip(self.attn, accs):
+                a._fsb_read_acc = acc
+        if self.graph is not None:
+            self._reg = self._registry()
 
     @torch.no_grad()
     def step(self):
@@ -452,13 +469,19 @@ class FSBGraphedDecoder:
                                f"larger max_new_tokens")
         self.tok_static.copy_(self.next_tok.view(1, 1))
         self.pos_t.fill_(p)
+        if self._graph_failed:
+            return self._eager_step()
         if self.graph is None:
             self._capture()                     # warms up (writes this token's K / V) and captures; same values
+            if self._graph_failed:
+                return self._eager_step()
         elif p // self.Bq != self._blk:
             from src.fsattn.fsb_tree import fsb_decode_prepare_all
             fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, p)
             if self._registry() != self._reg:
                 self._capture()                 # the tensors the graph reads moved: re-capture over the new state
+                if self._graph_failed:
+                    return self._eager_step()
             else:
                 self._blk = p // self.Bq        # slots refreshed in place: the capture survives the block change
         self.graph.replay()
@@ -479,6 +502,28 @@ class FSBGraphedDecoder:
         else:
             for c in self.cache:                # cell bookkeeping of the token the graph wrote at position p
                 c.advance_in_place()
+        self.pos = p + 1
+        return self.next_tok
+
+    @torch.no_grad()
+    def _eager_step(self):
+        # the captured step's operations run eagerly (the same kernels on the same buffers and caches): used once a
+        # capture has failed, so the rest of the generation is the eager decode loop's tokens
+        p = self.pos
+        if p // self.Bq != self._blk:
+            from src.fsattn.fsb_tree import fsb_decode_prepare_all
+            fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, p)
+            self._blk = p // self.Bq
+        try:
+            with _autocast_ctx(self.dev, self.dt):
+                logits = self._step_body()
+        except RuntimeError as exc:
+            raise RuntimeError("FSBGraphedDecoder: the whole-step CUDA-graph capture failed and the eager fallback "
+                               "cannot run on this process; set FSB_DECODE_WHOLE=0 to decode without the whole-step "
+                               "graph") from exc
+        self.next_tok = logits.argmax(dim=-1)
+        for c in self.cache:
+            c.advance_in_place()
         self.pos = p + 1
         return self.next_tok
 
