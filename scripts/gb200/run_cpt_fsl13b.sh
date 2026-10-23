@@ -42,7 +42,7 @@ else
 fi
 L=$RUNS/${RUN}.log
 {
-  echo "GB200_FSL13B_CPT $(date -u +%FT%TZ) run=$RUN world=$WORLD per_gpu=$PER_GPU accum=$ACCUM max_steps=$MAXSTEPS rev=$(cat /workspace/freesolo-gb200.rev 2>/dev/null) host=$(hostname)"
+  echo "GB200_FSL13B_CPT $(date -u +%FT%TZ) run=$RUN world=$WORLD per_gpu=$PER_GPU accum=$ACCUM max_steps=$MAXSTEPS rev=$(cat "$REPO.rev" 2>/dev/null) host=$(hostname)"
   echo "NCCL mode=$FS_COMM mnnvl=$NCCL_MNNVL_ENABLE nvls=$NCCL_NVLS_ENABLE ib_disable=$NCCL_IB_DISABLE net_plugin=${NCCL_NET_PLUGIN:-} nthreads=${NCCL_SOCKET_NTHREADS:-}"
   echo "FS_PRUNE kernel=$FS_PRUNE_KERNEL pool=$FS_PRUNE_POOL window=$FS_PRUNE_WINDOW blkchunk=$FS_PRUNE_BLKCHUNK"
   echo "INIT_FROM $INIT_FROM DATA $DATA"
