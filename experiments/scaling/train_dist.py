@@ -1001,6 +1001,8 @@ def main():
                 next(train_iter)
         accelerator.print("  resume dataloader fast-forward done.")
     running = 0.0
+    skipped = 0
+    accum_bad = False
     ppo_info = None
     rew_acc = {}
     rd_acc = {}
@@ -1071,9 +1073,29 @@ def main():
                         accelerator.clip_grad_norm_(_pol, args.fsb_policy_clip)
                 else:
                     gnorm = accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            # A single non-finite loss or gradient poisons every parameter it touches, and one
+            # rank's NaN reaches the others through the allreduced gradients: decide together,
+            # then skip the update so the run continues from the last finite weights. A bad
+            # micro-batch marks the whole accumulation window.
+            if not torch.isfinite(loss_total.detach()):
+                accum_bad = True
+            if accelerator.sync_gradients:
+                _fp_bad = torch.zeros((), device=accelerator.device)
+                if accum_bad:
+                    _fp_bad += 1
+                if torch.is_tensor(gnorm) and not torch.isfinite(gnorm):
+                    _fp_bad += 1
+                _fp_bad = accelerator.reduce(_fp_bad, reduction="max")
+                if _fp_bad == 0:
+                    optimizer.step()
+                else:
+                    skipped += 1
+                    if skipped <= 5 or skipped % 50 == 0:
+                        accelerator.print(f"[skip] non-finite loss/grad at step {step + 1}: "
+                                          f"update skipped (skipped={skipped})")
+                accum_bad = False
             optimizer.zero_grad()
-            if _ppo and accelerator.sync_gradients:
+            if _ppo and accelerator.sync_gradients and _fp_bad == 0:
                 ppo_info = _fsb_ppo_update(lr)
 
         running += loss.item()
@@ -1091,7 +1113,8 @@ def main():
             gn = gnorm.item() if torch.is_tensor(gnorm) else (gnorm or 0.0)
             accelerator.print(
                 f"step {step:7d} | loss {avg_loss:.4f} | ppl {math.exp(min(avg_loss,20)):.1f} | "
-                f"lr {lr:.2e} | gnorm {gn:.2f} | {tps/1e3:.1f}K tok/s | {total_tokens/1e9:.2f}B")
+                f"lr {lr:.2e} | gnorm {gn:.2f} | {tps/1e3:.1f}K tok/s | {total_tokens/1e9:.2f}B"
+                + (f" | skipped {skipped}" if skipped else ""))
             if getattr(args, "fsb", False):
                 _fs = fsb_log_stats(model)
                 accelerator.print(f"  [fsb] cells_read {_fs['n_read']:.2f} | node_visits {_fs['n_visit']:.1f} | "
