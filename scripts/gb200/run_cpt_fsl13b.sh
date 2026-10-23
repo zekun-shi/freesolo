@@ -37,13 +37,14 @@ if [ "$FS_COMM" = tcp ]; then
   # Single node, no IMEX channel: tcp bootstrap on bond0, RoCE off, stock NCCL sockets.
   export NCCL_MNNVL_ENABLE=0 NCCL_NVLS_ENABLE=0 NCCL_IB_DISABLE=1 NCCL_NET_PLUGIN=none
   export NCCL_SOCKET_IFNAME=bond0 GLOO_SOCKET_IFNAME=bond0
+  export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}   # .5 needs 1: P2P allreduce NaNs the DDP buckets there
 else
   echo "without an IMEX channel device only FS_COMM=tcp is supported on this node" >&2; exit 2
 fi
 L=$RUNS/${RUN}.log
 {
   echo "GB200_FSL13B_CPT $(date -u +%FT%TZ) run=$RUN world=$WORLD per_gpu=$PER_GPU accum=$ACCUM max_steps=$MAXSTEPS rev=$(cat "$REPO.rev" 2>/dev/null) host=$(hostname)"
-  echo "NCCL mode=$FS_COMM mnnvl=$NCCL_MNNVL_ENABLE nvls=$NCCL_NVLS_ENABLE ib_disable=$NCCL_IB_DISABLE net_plugin=${NCCL_NET_PLUGIN:-} nthreads=${NCCL_SOCKET_NTHREADS:-}"
+  echo "NCCL mode=$FS_COMM mnnvl=$NCCL_MNNVL_ENABLE nvls=$NCCL_NVLS_ENABLE ib_disable=$NCCL_IB_DISABLE p2p_disable=$NCCL_P2P_DISABLE net_plugin=${NCCL_NET_PLUGIN:-} nthreads=${NCCL_SOCKET_NTHREADS:-}"
   echo "FS_PRUNE kernel=$FS_PRUNE_KERNEL pool=$FS_PRUNE_POOL window=$FS_PRUNE_WINDOW blkchunk=$FS_PRUNE_BLKCHUNK"
   echo "INIT_FROM $INIT_FROM DATA $DATA"
   nvidia-smi --query-gpu=index,name,memory.used --format=csv,noheader
