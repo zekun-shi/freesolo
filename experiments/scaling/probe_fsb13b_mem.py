@@ -1,8 +1,12 @@
 import json, os, sys, time, traceback
-CODE = "/home/aiops/shizk/fs13b_kernel_probe_20261023/freesolo"
-CKPT = "/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B"
-OUT = f"/home/aiops/shizk/fs13b_kernel_probe_20261023/probe_results_{os.environ.get('TAG','run')}.json"
+ROOT = os.environ.get("FS13B_PROBE_ROOT", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+CODE = ROOT
+CKPT = os.environ.get("FS13B_CKPT", "/home/aiops/shizk/fs_longctx_evals_20261016/ckpts/FreeSolo-B-1.3B")
+OUT = os.path.join(os.environ.get("FS13B_OUT", os.path.dirname(ROOT)),
+                   f"probe_results_{os.environ.get('TAG','run')}.json")
 sys.path.insert(0, CODE)
+# 2026-10-23 defaults as run: CODE=/home/aiops/shizk/fs13b_kernel_probe_20261023/freesolo,
+# out JSONs next to it; the tree this file ships in doubles as CODE when unset.
 import torch
 import eval_longbench as elb
 
@@ -15,7 +19,8 @@ a.pool = 64
 a.weight_dtype = "float32"
 a.fsb_union_tau_file = os.path.join(CKPT, "union_calibration.json")
 
-results = {"tag": os.environ.get("TAG", "run"), "runs": []}
+results = {"tag": os.environ.get("TAG", "run"), "code": CODE, "ckpt": CKPT,
+           "alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""), "runs": []}
 torch.set_grad_enabled(False)
 def save():
     results["env"] = {k: v for k, v in os.environ.items() if k.startswith(("FS_", "FSB_", "FSL_"))}
