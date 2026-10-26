@@ -347,6 +347,7 @@ def test_fsb_int8_graphed_decode_fp32_lr_norm_across_blocks(monkeypatch):
         for t in forced:
             gd.next_tok = t.view(1)           # teacher-forced: both runs see the same stream
             outs.append(gd.step().clone())
+        assert gd.graph is not None and not gd.graph_failed      # every step replayed a captured step graph
         runs[graph] = torch.cat(outs)
     agree = (runs[0] == runs[1]).float().mean().item()
     assert agree >= 0.99, agree

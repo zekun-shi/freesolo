@@ -133,16 +133,13 @@ def test_rows_path_is_opt_in(monkeypatch):
     assert (ref[0].sort(-1).values == got[0].sort(-1).values).all(-1).float().mean() > 0.999
 
 
-@gpu
-def test_whole_step_decode_matches_cached_generate(monkeypatch):
+def _whole_step_lm(monkeypatch):
     # the paper's FS-B serve config on a tiny random model, with 4-wide beams (narrower than the ~20 cells of the
     # context, so the filtered second forest - each head's threshold at the median cell ceiling of the prompt - adds
-    # reads of its own): whole-step graph decode across query-block boundaries and past the model's initial RoPE
-    # table gives the tokens and read statistics of the per-layer decode loop.
-    # Bit identity between the graph and the loop holds only on identical KV storage: pin the
-    # bf16 store (FS_KV_INT8=0); the int8 store has its own parity coverage in tests/test_kv_int8.py
+    # reads of its own), on the bf16 KV store (FS_KV_INT8=0), with cached_generate on the whole-step decoder and its
+    # capture-failure fallback on (the defaults): the model, its FS-B layers and a 300-token prompt
     from experiments.scaling.model import FreeSoloLM
-    from kv_cache import cached_generate, make_caches, _trunk_cached
+    from kv_cache import make_caches, _trunk_cached
     kw = dict(window_size=64, long_range_variant="cell_topk", cell_stride=32, cell_topk=4, cell_select="score",
               sel_strict_causal=1, use_rope=True, fs_uniform_sr=True, rope_long_range=False, cell_prune_kernel=0,
               fsb_enabled=True, fsb_policy="fixed", fsb_width=4, fsb_delta=0, fsb_node_score="bound",
@@ -154,12 +151,47 @@ def test_whole_step_decode_matches_cached_generate(monkeypatch):
     layers = [mod for mod in m.modules() if getattr(mod, "fsb_enabled", False)]
     prompt = torch.randint(0, 256, (1, 300), generator=torch.Generator().manual_seed(1))
     monkeypatch.setenv("FS_KV_INT8", "0")
+    monkeypatch.setenv("FSB_DECODE_WHOLE", "1")
+    monkeypatch.delenv("FSB_DECODE_CAPTURE_STRICT", raising=False)
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         caches = make_caches(m)
         _trunk_cached(m, prompt.cuda(), caches)
         for mod, c in zip(layers, caches):
             mod.fsb_tau.fill_(0.0)
             mod.fsb_tau_union.copy_(c._ceil[0].float().median(dim=-1).values)
+    return m, layers, prompt
+
+
+REFUSED = "the FS-B read refuses capture in a test"
+
+
+def _refuse_capture(monkeypatch, calls, captured_exc=None, eager_exc=None):
+    # FS-B's per-token read of the whole-step decode (fsb_decode_token; under FSB_DECODE_FORK=1 in the forked branch)
+    # raises inside a capture, as a capture guard does, and counts it in calls; after that an eager call raises
+    # eager_exc when one is given
+    real = ft.fsb_decode_token
+
+    def read(*a, **k):
+        if torch.cuda.is_current_stream_capturing():
+            calls.append(1)
+            raise captured_exc if captured_exc is not None else RuntimeError(REFUSED)
+        if calls and eager_exc is not None:
+            raise eager_exc
+        return real(*a, **k)
+
+    monkeypatch.setattr(ft, "fsb_decode_token", read)
+
+
+@gpu
+def test_whole_step_decode_matches_cached_generate(monkeypatch):
+    # whole-step graph decode across query-block boundaries and past the model's initial RoPE table gives the tokens
+    # and read statistics of the per-layer decode loop, every step a replay (FSB_DECODE_CAPTURE_STRICT=1: a capture
+    # that fails raises instead of decoding eagerly).
+    # Bit identity between the graph and the loop holds only on identical KV storage: pin the
+    # bf16 store (FS_KV_INT8=0); the int8 store has its own parity coverage in tests/test_kv_int8.py
+    from kv_cache import cached_generate
+    m, layers, prompt = _whole_step_lm(monkeypatch)
+    monkeypatch.setenv("FSB_DECODE_CAPTURE_STRICT", "1")
     out, acc = {}, {}
     for whole in ("0", "1"):
         monkeypatch.setenv("FSB_DECODE_WHOLE", whole)
@@ -174,49 +206,100 @@ def test_whole_step_decode_matches_cached_generate(monkeypatch):
 
 
 @gpu
-def test_whole_step_capture_failure_falls_back_to_eager(monkeypatch, capsys):
-    # a capture that fails at run time (a runtime that reports a stream left unjoined) must not abort the generation:
-    # the decoder runs the graph's operations eagerly for the rest of the generation - the eager loop's tokens and read
-    # statistics - and does not try to capture again at a block change
-    from experiments.scaling.model import FreeSoloLM
-    from kv_cache import cached_generate, make_caches, _trunk_cached
-    kw = dict(window_size=64, long_range_variant="cell_topk", cell_stride=32, cell_topk=4, cell_select="score",
-              sel_strict_causal=1, use_rope=True, fs_uniform_sr=True, rope_long_range=False, cell_prune_kernel=0,
-              fsb_enabled=True, fsb_policy="fixed", fsb_width=4, fsb_delta=0, fsb_node_score="bound",
-              fsb_bound_radius_coef=8.0, fsb_tree="forest", fsb_read_top=4, fsb_rerank_score="lse_pos",
-              fsb_rerank_query="raw", fsb_union_width=4, fsb_union_tau_quantile=0.5)
-    torch.manual_seed(0)
-    m = FreeSoloLM(vocab_size=256, d_model=128, n_layers=2, n_heads=4, d_ff=256, max_seq_len=512,
-                   attn_type="fsattn", **kw).cuda().eval()
-    layers = [mod for mod in m.modules() if getattr(mod, "fsb_enabled", False)]
-    prompt = torch.randint(0, 256, (1, 300), generator=torch.Generator().manual_seed(1))
-    monkeypatch.setenv("FS_KV_INT8", "0")
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        caches = make_caches(m)
-        _trunk_cached(m, prompt.cuda(), caches)
-        for mod, c in zip(layers, caches):
-            mod.fsb_tau.fill_(0.0)
-            mod.fsb_tau_union.copy_(c._ceil[0].float().median(dim=-1).values)
+@pytest.mark.parametrize("fork", ["0", "1"])
+def test_whole_step_capture_failure_falls_back_to_eager(monkeypatch, capsys, fork):
+    # a step that raises inside its capture (FS-B's read, as a capture guard does; with FSB_DECODE_FORK=1 in the forked
+    # branch, which still joins) ends the capture cleanly, so the generation goes on: the decoder runs that step and
+    # every later one eagerly - the per-layer loop's tokens and read statistics - never captures again at a block
+    # change, records the fallback (graph_failed) with each step's logits in static_logits, and leaves the process out
+    # of capture mode (empty_cache runs)
+    import decode_graph as dg
+    from kv_cache import cached_generate
+    m, layers, prompt = _whole_step_lm(monkeypatch)
+    monkeypatch.setenv("FSB_DECODE_FORK", fork)
     monkeypatch.setenv("FSB_DECODE_WHOLE", "0")
     ft.fsb_read_stats_reset(m)
     ref = cached_generate(m, prompt, 300, device="cuda", dtype="bfloat16")
     ref_acc = torch.stack([mod._fsb_read_acc for mod in layers])
-    calls = []
-
-    def unjoined(g, fn):
-        calls.append(1)
-        raise RuntimeError("CUDA error: capturing stream has unjoined work")
-
-    monkeypatch.setattr(ft, "_capture_decode_graph", unjoined)
+    calls, made = [], []
+    _refuse_capture(monkeypatch, calls)
+    real_init = dg.FSBGraphedDecoder.__init__
+    monkeypatch.setattr(dg.FSBGraphedDecoder, "__init__",
+                        lambda self, *a, **k: made.append(self) or real_init(self, *a, **k))
     monkeypatch.setenv("FSB_DECODE_WHOLE", "1")
     ft.fsb_read_stats_reset(m)
     got = cached_generate(m, prompt, 300, device="cuda", dtype="bfloat16")
     got_acc = torch.stack([mod._fsb_read_acc for mod in layers])
     ft.fsb_read_stats_reset(m, on=False)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     assert calls == [1]                                          # tried once; later block changes stay eager
+    assert len(made) == 1 and made[0].graph is None and made[0].graph_failed
     assert torch.equal(got, ref)
     assert torch.equal(got_acc, ref_acc)
+    assert int(made[0].static_logits.argmax(dim=-1)) == int(got[0, -1])     # the last step's logits
     assert capsys.readouterr().out.count("whole-step capture failed") == 1
+
+
+@gpu
+def test_whole_step_capture_strict_raises(monkeypatch):
+    # FSB_DECODE_CAPTURE_STRICT=1: a step that raises inside its capture raises its own error instead of decoding on
+    # eagerly
+    from kv_cache import cached_generate
+    m, _, prompt = _whole_step_lm(monkeypatch)
+    calls = []
+    _refuse_capture(monkeypatch, calls)
+    monkeypatch.setenv("FSB_DECODE_CAPTURE_STRICT", "1")
+    with pytest.raises(RuntimeError, match=REFUSED):
+        cached_generate(m, prompt, 40, device="cuda", dtype="bfloat16")
+    assert calls == [1]
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+
+@gpu
+def test_whole_step_capture_end_failure_raises(monkeypatch):
+    # a capture that fails to end (as a runtime reports a stream left unjoined after the step raised) can leave the
+    # caching allocator in capture mode: the decoder raises, naming the capture's error, the step's error under it and
+    # FSB_DECODE_WHOLE=0, instead of decoding on
+    from kv_cache import cached_generate
+    m, _, prompt = _whole_step_lm(monkeypatch)
+    calls = []
+
+    def unjoined(g, fn):                                         # the step's error, then the capture's end
+        calls.append(1)
+        try:
+            raise RuntimeError(REFUSED)
+        finally:
+            raise RuntimeError("CUDA error: capturing stream has unjoined work")
+
+    monkeypatch.setattr(ft, "_capture_decode_graph", unjoined)
+    with pytest.raises(RuntimeError, match="FSB_DECODE_WHOLE=0") as err:
+        cached_generate(m, prompt, 40, device="cuda", dtype="bfloat16")
+    assert calls == [1]
+    msg = str(err.value)
+    assert "whole-step CUDA-graph capture at pos 300 failed" in msg
+    assert "capturing stream has unjoined work" in msg and REFUSED in msg
+
+
+@gpu
+@pytest.mark.parametrize("where", ["capture", "eager"])
+def test_whole_step_decode_keeps_oom_type(monkeypatch, where):
+    # an out-of-memory error leaves the whole-step decoder as torch.cuda.OutOfMemoryError (the drivers record OOM rows
+    # and task statuses by its type), whether the captured step raises it or the eager step after a failed capture
+    from kv_cache import cached_generate
+    m, _, prompt = _whole_step_lm(monkeypatch)
+    oom = torch.cuda.OutOfMemoryError("CUDA out of memory in a test")
+    calls = []
+    if where == "capture":
+        _refuse_capture(monkeypatch, calls, captured_exc=oom)
+    else:
+        _refuse_capture(monkeypatch, calls, eager_exc=oom)
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="out of memory in a test"):
+        cached_generate(m, prompt, 40, device="cuda", dtype="bfloat16")
+    assert calls == [1]
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
 
 def _tiny_fsb(N, layers=2, **over):

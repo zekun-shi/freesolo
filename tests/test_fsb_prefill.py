@@ -998,6 +998,7 @@ def test_fsb_graphed_decoder_single_capture_across_blocks(monkeypatch):
     for _ in range(260):
         gd.step()
     assert captures[0] == 1, captures[0]
+    assert gd.graph is not None and not gd.graph_failed     # the one capture succeeded: every step was a replay
 
 
 @gpu
