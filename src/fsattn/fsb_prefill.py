@@ -86,10 +86,11 @@ def fast_status() -> dict:
     turned one off for the rest of the process (None: none; the CUDA beam then runs the Triton kernel, the row beam the
     warp kernel, the lean row beam of FSB_BEAM_V2 fsb_beam_rows, the row union the Triton rows path, the re-rank of
     FSB_ROWS_V3 fsb_rows_fused2, the small-chunk build of FSB_BUILD_SMALL the build kernel, the uniform build of
-    FSB_BUILD_UNIFORM the build module's kernels), and whether the fast prefill met a forest its fused beam does not take
-    (it then ran the stage loop's stages)."""
+    FSB_BUILD_UNIFORM the build module's kernels, the fused decode read of FSB_DECODE_V2 the kernel chain), and whether
+    the fast prefill met a forest its fused beam does not take (it then ran the stage loop's stages)."""
     from . import fsb_beam_cuda as bc
     from . import fsb_build_cuda as fbc
+    from . import fsb_decode_cuda as dcu
     from . import fsb_rows_cuda as rc
     return {"beam_cuda_failure": bc._failed[0] if bc._failed else None,
             "beam_rows_failure": bc._rows_failed[0] if bc._rows_failed else None,
@@ -98,6 +99,7 @@ def fast_status() -> dict:
             "rows_v3_failure": rc._v3_failed[0] if rc._v3_failed else None,
             "build_small_failure": next(iter(fbc._small_failed.values()), None),
             "build_uniform_failure": next(iter(fbc._uniform_failed.values()), None),
+            "decode_v2_failure": dcu._failed[0] if dcu._failed else None,
             "fast_prefill_unfused": bool(_warned)}
 
 

@@ -777,7 +777,7 @@ def test_prefill_blkchunk_bounds_fast_stages(monkeypatch):
 def test_bench_rows_record_fsb_switches_and_latches(monkeypatch):
     # bench_efficiency rows of FS-B record the resolved FS-B switches and the fallback latches
     import bench_efficiency as be
-    from src.fsattn import fsb_beam_cuda, fsb_build_cuda, fsb_rows_cuda
+    from src.fsattn import fsb_beam_cuda, fsb_build_cuda, fsb_decode_cuda, fsb_rows_cuda
     for name in be.FSB_FLAGS:
         monkeypatch.delenv(name, raising=False)
     assert be.fsb_flags() == be.FSB_FLAGS
@@ -790,12 +790,17 @@ def test_bench_rows_record_fsb_switches_and_latches(monkeypatch):
     monkeypatch.setattr(fsb_rows_cuda, "_v3_failed", ["RuntimeError('simulated')"])
     monkeypatch.setattr(fsb_build_cuda, "_small_failed", {(0, 64, ()): "RuntimeError('small')"})
     monkeypatch.setattr(fsb_build_cuda, "_uniform_failed", {(0, 64, ()): "RuntimeError('uniform')"})
+    monkeypatch.setattr(fsb_decode_cuda, "_failed", [])
     monkeypatch.setattr(fp, "_warned", [1])
-    assert be.fsb_fast_status() == {"beam_cuda_failure": None, "beam_rows_failure": "OSError('simulated')",
-                                    "beam_rows2_failure": None, "rows_union_failure": None,
-                                    "rows_v3_failure": "RuntimeError('simulated')",
-                                    "build_small_failure": "RuntimeError('small')",
-                                    "build_uniform_failure": "RuntimeError('uniform')", "fast_prefill_unfused": True}
+    expected = {"beam_cuda_failure": None, "beam_rows_failure": "OSError('simulated')", "beam_rows2_failure": None,
+                "rows_union_failure": None, "rows_v3_failure": "RuntimeError('simulated')",
+                "build_small_failure": "RuntimeError('small')", "build_uniform_failure": "RuntimeError('uniform')",
+                "decode_v2_failure": None, "fast_prefill_unfused": True}
+    assert be.fsb_fast_status() == expected
+    # a failed build of the fused decode read turns FSB_DECODE_V2 off for the process: the row records it
+    monkeypatch.setattr(fsb_decode_cuda, "_failed", ["RuntimeError('decode')"])
+    assert be.fsb_fast_status() == dict(expected, decode_v2_failure="RuntimeError('decode')")
+    assert not fsb_decode_cuda.v2_on()
 
 
 def test_scratch_budget_counts_the_layer_tables(monkeypatch):
