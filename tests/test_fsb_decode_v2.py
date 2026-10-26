@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -861,6 +862,37 @@ def test_shared_code_read_matches_two_copies(monkeypatch, L, v3, periodic):
             assert (c0 >= 0).any() and (s0 >= 0).any()
     assert len(ran) == 32 and all(r is not None for r in ran)
     assert not dcu._failed
+
+
+@gpu
+@torch.no_grad()
+@pytest.mark.parametrize("v3,share", [("1", "0"), ("1", "1"), ("0", "1")])
+def test_prefix_plans_follow_v3(monkeypatch, v3, share):
+    # the V3 kernel's per-row prefix plans (each forest's ForestCache._plan) go with FSB_DECODE_V3 whatever code layout
+    # FSB_DECODE_SHARE builds: with V3 every fused read is handed both forests' plans, which the first decode step
+    # allocates and whose every row then holds a walked plan (its key starts with the kernel's PLAN_MARK); the second
+    # version is handed none
+    m = _model(monkeypatch, 1024)
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(163)).cuda()
+    monkeypatch.setenv("FSB_DECODE_V2", "1")
+    monkeypatch.setenv("FSB_DECODE_V3", v3)
+    monkeypatch.setenv("FSB_DECODE_SHARE", share)
+    handed, real = [], dcu._beam_struct
+    monkeypatch.setattr(dcu, "_beam_struct", lambda *a: handed.append(a[5]) or real(*a))
+    ran = _spy(monkeypatch)
+    gd = _decoder(m, prompt, 4)
+    gd.step()
+    gd.step()
+    torch.cuda.synchronize()
+    assert ran and all(r is not None for r in ran)
+    fc = gd.cache[0]._fsb_forest
+    plans = [getattr(f, "_plan", None) for f in (fc, fc.utau)]
+    assert handed and all((p is not None) == (v3 == "1") for p in handed)
+    if v3 == "0":
+        assert all(p is None for p in plans)
+        return
+    mark = int(re.search(r"#define PLAN_MARK (0x[0-9A-Fa-f]+)", dcu._SRC).group(1), 16)
+    assert all(p is not None and bool((p[:, 0] == mark).all()) for p in plans)
 
 
 @gpu

@@ -173,14 +173,15 @@ def decode_read_fused(attn, fc, tk: dict, cache, q_t: torch.Tensor, q: torch.Ten
     rc_t = torch.is_tensor(rc)
     w_bf16, lrs_bf16 = lnw.dtype == torch.bfloat16, lrs.dtype == torch.bfloat16
     times = _TIMES
+    v3, share = v3_on(), share_on()
     cfg = (dev.index, Dh, WM, R, K, attn.fsb_node_score == "bound", rc_t, rr != "max", rr == "lse_pos", has_sr,
-           w_bf16, lrs_bf16, times is not None, v3_on(), share_on())
+           w_bf16, lrs_bf16, times is not None, v3, share)
     fn = _fns.get(cfg)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             return None                                                      # never compile inside a graph capture
         try:
-            fn = _fns[cfg] = bc.load_function(dev, decode_source(*cfg[1:-2], PROV_UTAU, v3=cfg[-2], share=cfg[-1]),
+            fn = _fns[cfg] = bc.load_function(dev, decode_source(*cfg[1:-2], PROV_UTAU, v3=v3, share=share),
                                               "fsb_decode_fused")
         except Exception as e:                                               # no NVRTC / driver: the chain runs
             if not _failed:
@@ -195,10 +196,11 @@ def decode_read_fused(attn, fc, tk: dict, cache, q_t: torch.Tensor, q: torch.Ten
     lm, sg = lam.reshape(-1).contiguous(), sigv.reshape(-1).contiguous()
     rct = rc.reshape(-1).float().contiguous() if rc_t else q
     keep = [qp, pos_i, lm, sg, rct]
-    # V3: the two descents cache their prefix walks in their own forests' plans (one forest for both: the second walks)
+    # V3: the two descents cache their prefix walks in their own forests' plans (one forest for both: the second walks),
+    # whichever code layout FSB_DECODE_SHARE builds; the second version reads no plan
     ut = getattr(fc, "utau", None)
-    pa = _plan_of(fc, T, dev) if cfg[-1] else None
-    pb = _plan_of(ut, T, dev) if cfg[-1] and ut is not None and Fu is ut.F else None
+    pa = _plan_of(fc, T, dev) if v3 else None
+    pb = _plan_of(ut, T, dev) if v3 and ut is not None and Fu is ut.F else None
     BA = _beam_struct(F, SP, W, bud, keep, pa)
     BB = _beam_struct(Fu, SPu, Wu, bud_u, keep, pb)
     q3 = q_t[:, :, 0, :]
