@@ -215,6 +215,10 @@ def benchmark_main():
     if serve == "fsb" and any(not isinstance(row.get(key), (float, int))
                               for row in rows for key in ("prefill_graph_ktoks", "decode_graph_tps")):
         raise SystemExit("A graph benchmark failed; inspect the output before comparing speeds.")
+    if serve == "fsb" and any(row.get("decode_graph_fallback") is not False for row in rows):
+        # a failed whole-step capture leaves FSBGraphedDecoder on its eager step: that rate is not a graph decode's
+        raise SystemExit("The FS-B graph decode is not recorded as a CUDA-graph run (decode_graph_fallback is not "
+                         "false); inspect the output before comparing speeds.")
 
 
 if __name__ == "__main__":

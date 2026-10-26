@@ -480,8 +480,10 @@ class FSBGraphedDecoder:
                 if os.environ.get("FSB_DECODE_CAPTURE_STRICT", "0") == "1":
                     raise
                 # the step raised inside a capture that then ended cleanly (a capture guard, a kernel that refuses
-                # capture): this process is as it was before the capture, so the generation goes on eagerly
+                # capture): this process is as it was before the capture, so the generation goes on eagerly. Callers
+                # that see only the tokens (cached_generate: eval_ruler's report) read the count kept on the model
                 self.graph_failed = True
+                self.m._fsb_graph_fallbacks = getattr(self.m, "_fsb_graph_fallbacks", 0) + 1
                 print(f"[fsb-graph] whole-step capture failed at pos {self.pos} ({type(exc).__name__}: {exc}); "
                       "decoding this generation eagerly (FSB_DECODE_CAPTURE_STRICT=1 raises instead)", flush=True)
             else:

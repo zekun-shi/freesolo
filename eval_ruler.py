@@ -525,6 +525,10 @@ def main():
                         "variant": variant, "config": a.config, "limit": a.limit,
                         "attn_execution_env": attn_env,
                         **({"fsb_execution_env": fsb_env} if a.fsb else {}),
+                        # FS-B generations whose whole-step decode capture failed and that finished on the decoder's
+                        # eager step (decode_graph.FSBGraphedDecoder counts them on the model)
+                        **({"fsb_decode_graph_fallbacks": int(getattr(model, "_fsb_graph_fallbacks", 0))}
+                           if a.fsb else {}),
                         **({"union_tau_sha256": _utau_info["tau_sha256"]}
                            if a.fsb and a.fsb_union_tau_quantile > 0 else {}),
                         "attn_kwargs": attn_kw, "cell_topk": a.cell_topk,

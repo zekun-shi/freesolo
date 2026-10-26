@@ -242,7 +242,7 @@ def bench_decode(m, ctx, serve, trunk, decode_mode="eager", steps=96, n_med=3, w
 
     total_steps = warm + n_med * steps          # every gd.step()/eager step advances one position
     rates = None
-    kv = {}
+    extra = {}
     if serve in ("dense", "sparse", "fsb") and decode_mode == "graph":
         from decode_graph import FSBGraphedDecoder, GraphedDecoder
         if serve == "fsb":
@@ -260,8 +260,11 @@ def bench_decode(m, ctx, serve, trunk, decode_mode="eager", steps=96, n_med=3, w
                 gd.step()
             torch.cuda.synchronize()
             rates.append(steps / (time.perf_counter() - t0))
-        if serve != "fsb":
-            kv = {"kv_bounded": gd.bounded_kv, "kv_faults": list(gd.kv_faults())}
+        if serve == "fsb":
+            # a failed whole-step capture left the decoder on its eager step: the rate is then not a graph decode's
+            extra = {"graph_fallback": gd.graph_failed}
+        else:
+            extra = {"kv_bounded": gd.bounded_kv, "kv_faults": list(gd.kv_faults())}
     else:
         os.environ["FS_FUSED_ATTN"] = "1"
         if serve == "fsb":
@@ -292,7 +295,7 @@ def bench_decode(m, ctx, serve, trunk, decode_mode="eager", steps=96, n_med=3, w
             if serve == "fsb":
                 os.environ.pop("FSB_DECODE_GRAPH", None)
     peak = torch.cuda.max_memory_allocated() / 1024**3
-    return dict(tps=statistics.median(rates), peak_gib=peak, reps=rates, **kv)
+    return dict(tps=statistics.median(rates), peak_gib=peak, reps=rates, **extra)
 
 
 def main():
@@ -342,7 +345,8 @@ def main():
     decode_impl = {"dense": {"eager": "eager trunk+lm_head", "graph": "GraphedDecoder (graphed single-token decode)"},
                    "sparse": {"eager": "eager trunk+lm_head", "graph": "GraphedDecoder (graphed single-token decode)"},
                    "fsb": {"eager": "eager trunk+lm_head (FSB_DECODE_GRAPH=0)",
-                           "graph": "FSBGraphedDecoder (one graph per decode step, re-captured per query block)"}}
+                           "graph": "FSBGraphedDecoder (one graph per decode step, re-captured per query block)",
+                           "graph_fallback": "FSBGraphedDecoder eager step (a whole-step capture failed: no graph)"}}
     rows = []
     for L in lengths:
         rec = {"serve": args.serve, "config": args.config, "label": label, "L": L, "cap40": args.cap40, "compile": args.compile,
@@ -410,6 +414,12 @@ def main():
                         rec[f"decode_{dm}_kv_bounded"] = de["kv_bounded"]
                         rec[f"decode_{dm}_kv_faults"] = de["kv_faults"]
                         kv_str = f"  kv_bounded={int(de['kv_bounded'])} faults={de['kv_faults']}"
+                    if "graph_fallback" in de:
+                        # the FS-B graph decode: true when a failed capture timed the decoder's eager step instead
+                        rec[f"decode_{dm}_fallback"] = de["graph_fallback"]
+                        if de["graph_fallback"]:
+                            rec[f"decode_{dm}_impl"] = decode_impl[args.serve]["graph_fallback"]
+                            kv_str = "  EAGER FALLBACK (a whole-step capture failed)"
                     print(f"[{label} L={L}] decode[{dm}]  {de['tps']:6.2f} tok/s  "
                           f"peak {de['peak_gib']:.2f} GiB  reps={[round(r,1) for r in de['reps']]}{kv_str}", flush=True)
                 except torch.cuda.OutOfMemoryError:

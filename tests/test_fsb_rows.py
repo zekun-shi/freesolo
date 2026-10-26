@@ -235,10 +235,26 @@ def test_whole_step_capture_failure_falls_back_to_eager(monkeypatch, capsys, for
     torch.cuda.empty_cache()
     assert calls == [1]                                          # tried once; later block changes stay eager
     assert len(made) == 1 and made[0].graph is None and made[0].graph_failed
+    assert m._fsb_graph_fallbacks == 1                           # the count eval_ruler's report reads
     assert torch.equal(got, ref)
     assert torch.equal(got_acc, ref_acc)
     assert int(made[0].static_logits.argmax(dim=-1)) == int(got[0, -1])     # the last step's logits
     assert capsys.readouterr().out.count("whole-step capture failed") == 1
+
+
+@gpu
+@pytest.mark.parametrize("refuse", [False, True])
+def test_bench_graph_decode_reports_the_eager_fallback(monkeypatch, refuse):
+    # bench_efficiency's FS-B graph decode returns whether a failed capture left its decoder on the eager step (the
+    # row's decode_graph_fallback, which freesolo-benchmark rejects)
+    import bench_efficiency as be
+    from kv_cache import _trunk_cached
+    m, _, _ = _whole_step_lm(monkeypatch)
+    calls = []
+    if refuse:
+        _refuse_capture(monkeypatch, calls)
+    de = be.bench_decode(m, 300, "fsb", _trunk_cached, decode_mode="graph", steps=4, n_med=1, warm=1)
+    assert de["graph_fallback"] is refuse and calls == ([1] if refuse else [])
 
 
 @gpu

@@ -1,9 +1,11 @@
 import hashlib
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
 
+from experiments.scaling import hub
 from experiments.scaling.hub import configure, download_model
 
 
@@ -62,3 +64,29 @@ def test_masked_and_bounded_fsl_are_explicit(monkeypatch):
     assert os.environ["FS_FUSED_ATTN"] == "0"
     with pytest.raises(ValueError, match="FS-L"):
         configure("fs-b", bounded_cache=True)
+
+
+@pytest.mark.parametrize("fallback", [False, True, None])
+def test_benchmark_rejects_rows_without_a_graph_decode(tmp_path, monkeypatch, fallback):
+    # freesolo-benchmark accepts an FS-B row only when its graph decode is recorded as a CUDA-graph run: a row whose
+    # decoder fell back to its eager step after a failed capture (decode_graph_fallback true), or that does not say,
+    # does not reproduce the graph speed
+    folder = tmp_path / "snapshot"
+    folder.mkdir()
+    config = {"variant": "fs-b", "freesolo_config": "340m"}
+    provenance = {"model": "owner/checkpoint", "revision": "a" * 40, "weights_sha256": "0" * 64}
+    output = tmp_path / "bench.json"
+    row = {"L": 65536, "prefill_graph_ktoks": 100.0, "decode_graph_tps": 50.0}
+    if fallback is not None:
+        row["decode_graph_fallback"] = fallback
+    monkeypatch.setattr(hub, "download_model", lambda *a, **k: (folder, config, provenance))
+    monkeypatch.setattr(hub, "configure", lambda *a, **k: None)
+    monkeypatch.setattr(hub, "environment", lambda: {})
+    monkeypatch.setattr(hub, "subprocess",
+                        SimpleNamespace(run=lambda command, check: output.write_text(json.dumps([row]))))
+    monkeypatch.setattr(sys, "argv", ["freesolo-benchmark", "--lengths", "65536", "--output", str(output)])
+    if fallback is False:
+        hub.benchmark_main()
+    else:
+        with pytest.raises(SystemExit, match="decode_graph_fallback"):
+            hub.benchmark_main()

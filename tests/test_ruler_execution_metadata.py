@@ -112,6 +112,7 @@ def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, t
     report = json.loads(output.read_text())
     assert report["results"]["niah_single_1"]["score"] == 100
     assert report["results"]["niah_single_1"]["n"] == 1
+    assert report["meta"]["fsb_decode_graph_fallbacks"] == 0
     flags = report["meta"]["fsb_execution_env"]
     expected = {**dict.fromkeys(FAST_FLAGS, "1"), "FSB_DECODE_GRAPH": "1",
                 "FSB_DECODE_GRAPH_CHECK": "0", "FSB_DECODE_V2": "1", "FSB_DECODE_FORK": "1", "FSB_DECODE_JOIN": "1",
@@ -120,6 +121,30 @@ def test_fsb_report_and_log_preserve_resolved_flags(ruler_driver, monkeypatch, t
     env_line = next(line for line in capsys.readouterr().out.splitlines() if "FS-B eval env:" in line)
     for name, value in expected.items():
         assert f"{name}={value}" in env_line.split()
+
+
+def test_fsb_report_counts_eager_decode_fallbacks(ruler_driver, monkeypatch, tmp_path):
+    # the FS-B report records how many generations finished on the whole-step decoder's eager step after a failed
+    # capture: the count FSBGraphedDecoder keeps on the model, which the fake generation below bumps for every prompt
+    real = ruler_driver.cached_generate
+
+    def generate(model, *args, **kwargs):
+        model._fsb_graph_fallbacks = getattr(model, "_fsb_graph_fallbacks", 0) + 1
+        return real(model, *args, **kwargs)
+
+    monkeypatch.setattr(ruler_driver, "cached_generate", generate)
+    task = tmp_path / "niah_single_1"
+    task.mkdir()
+    (task / "validation.jsonl").write_text(
+        "".join(json.dumps({"input": f"question {i}", "outputs": ["answer"]}) + "\n" for i in range(2)))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["eval_ruler.py", "--fsb", "--ckpt", str(tmp_path / "model"),
+                                     "--data_dir", str(tmp_path), "--tasks", "niah_single_1",
+                                     "--length", "2048", "--output", str(output)])
+    ruler_driver.main()
+    report = json.loads(output.read_text())
+    assert report["results"]["niah_single_1"]["n"] == 2
+    assert report["meta"]["fsb_decode_graph_fallbacks"] == 2
 
 
 def test_bench_rows_record_the_ruler_fsb_switch_table(ruler_driver, monkeypatch):
