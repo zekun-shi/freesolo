@@ -57,6 +57,10 @@ def configure(variant, bounded_cache=False, device="cuda"):
     os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
     if variant == "fs-l":
         os.environ.update(FS_PRUNE_POOL="64", FS_PRUNE_WINDOW="8", FS_PRUNE_BLKCHUNK="16")
+    if variant == "fs-b":
+        # as the eval drivers: eval-mode forwards must not grow the training CUDA-graph forest stage, and the switch
+        # tables environment() records hold this value (a value the caller exported wins)
+        os.environ.setdefault("FSB_TRAIN_GRAPH", "0")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 

@@ -90,3 +90,21 @@ def test_benchmark_rejects_rows_without_a_graph_decode(tmp_path, monkeypatch, fa
     else:
         with pytest.raises(SystemExit, match="decode_graph_fallback"):
             hub.benchmark_main()
+
+
+def test_fsb_configure_sets_the_recorded_train_graph_default(monkeypatch):
+    # configure("fs-b") sets FSB_TRAIN_GRAPH=0 as the eval drivers do, the value environment() records from the bench
+    # switch table (the modules' own default is 1), and keeps a value the caller exported; FS-L leaves it unset
+    import os
+    for key in ("FS_FUSED_ATTN", "FS_STRICT_CAUSAL", "FS_PRUNE_KERNEL", "FSL_LINEAR_CACHE", "FS_PRUNE_POOL",
+                "FS_PRUNE_WINDOW", "FS_PRUNE_BLKCHUNK", "TOKENIZERS_PARALLELISM", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
+        monkeypatch.setenv(key, "unused")
+    monkeypatch.setenv("FSB_TRAIN_GRAPH", "unused")
+    monkeypatch.delenv("FSB_TRAIN_GRAPH")        # set first, then delete: teardown removes what configure sets
+    configure("fs-l")
+    assert "FSB_TRAIN_GRAPH" not in os.environ
+    configure("fs-b")
+    assert os.environ["FSB_TRAIN_GRAPH"] == "0"
+    monkeypatch.setenv("FSB_TRAIN_GRAPH", "1")
+    configure("fs-b")
+    assert os.environ["FSB_TRAIN_GRAPH"] == "1"
