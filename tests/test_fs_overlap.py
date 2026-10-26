@@ -146,6 +146,38 @@ def test_decode_fork_matches_serial(monkeypatch, serve, int8):
         assert torch.equal(runs["0", "0"], run), key
 
 
+@pytest.mark.parametrize("serve", ["dense", "sparse"])
+@torch.no_grad()
+def test_decode_fork_joins_when_the_read_raises(monkeypatch, serve):
+    # FS_DECODE_FORK=1: an exception in the forked read of a captured decode step still joins the read's stream before
+    # it propagates, so the capture ends cleanly: the read's own error reaches the caller (not the capture's
+    # unjoined-work error) and the process leaves capture mode (empty_cache runs)
+    from decode_graph import GraphedDecoder
+    _serve(monkeypatch, serve)
+    monkeypatch.setenv("FS_DECODE_FORK", "1")
+    L = 1024
+    m = _model(serve, L, 2, 71)
+    prompt = torch.randint(0, 512, (1, L), generator=torch.Generator().manual_seed(73)).cuda()
+    gd = GraphedDecoder(m, prompt, Lmax=L + 64, device="cuda", dtype=torch.bfloat16)
+    gd.prefill()
+    gd.step()                                                 # warm-up, capture and replay: every kernel is built
+    real = tt.lr_decode_read
+
+    def refuse(*a, **k):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("the read refuses capture (test)")
+        return real(*a, **k)
+
+    monkeypatch.setattr(tt, "lr_decode_read", refuse)
+    g = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="the read refuses capture"):
+        with torch.cuda.graph(g), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            gd._trunk_graph()
+    del g
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+
 @pytest.mark.parametrize("serve,store", [("dense", "int8"), ("dense", "bf16"), ("sparse", "int8"), ("sparse", "bf16"),
                                          ("sparse", "bounded")])
 @pytest.mark.parametrize("autocast,w32", [(True, False), (False, False), (False, True)])

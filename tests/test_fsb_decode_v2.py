@@ -197,6 +197,35 @@ def test_forked_read_matches_serial_step(monkeypatch, v2):
 
 @gpu
 @torch.no_grad()
+def test_forked_read_joins_when_it_raises(monkeypatch):
+    # FSB_DECODE_FORK: an exception in the forked read of a captured decode step still joins the read's stream before
+    # it propagates, so the capture ends cleanly: the read's own error reaches the caller (not the capture's
+    # unjoined-work error) and the process leaves capture mode (empty_cache runs)
+    from src.fsattn import fsb_tree as ft
+    m = _model(monkeypatch, 1024)
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(167)).cuda()
+    monkeypatch.setenv("FSB_DECODE_FORK", "1")
+    gd = _decoder(m, prompt, 8)
+    gd.step()                                   # warm-up, capture and replay: every kernel of the step is built
+    real = ft.fsb_decode_token
+
+    def refuse(*a, **k):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("the read refuses capture (test)")
+        return real(*a, **k)
+
+    monkeypatch.setattr(ft, "fsb_decode_token", refuse)
+    g = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="the read refuses capture"):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            ft._capture_decode_graph(g, gd._step_body)
+    del g
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+
+@gpu
+@torch.no_grad()
 @pytest.mark.parametrize("L", [1024, 4096])
 def test_fused_beams_match_pair_kernel(monkeypatch, L):
     # the fused kernel's two beam descents (its test hook writes both beams' cells) against forest_beam_pair (the

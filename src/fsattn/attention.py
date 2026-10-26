@@ -1463,14 +1463,18 @@ class FSAttn(nn.Module):
         pos_f = win_pos[-1:] if win_pos is not None else None
         if Q.is_cuda and getattr(fc, "_live", False) and os.environ.get("FSB_DECODE_FORK", "1") == "1" and not compiling():
             # FSB_DECODE_FORK: the long-range read and the window only meet at the combine, so the read forks to its
-            # own stream and runs beside the window (in a captured decode step, two parallel branches of the graph)
+            # own stream and runs beside the window (in a captured decode step, two parallel branches of the graph).
+            # The join also runs when either branch raises: a capture whose side branch is left unjoined cannot end,
+            # and its error would replace the branch's own
             cur = torch.cuda.current_stream(Q.device)
             side = _fsb_read_stream(Q.device)
             side.wait_stream(cur)
-            with torch.cuda.stream(side):
-                out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f)
-            out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
-            cur.wait_stream(side)
+            try:
+                with torch.cuda.stream(side):
+                    out_long = fsb_decode_token(self, Q, cache, sig, pos_t, pos_f=pos_f)
+                out_short = self._sr_kv_and_decode(Q, K, V, cache._k_buf, cache._v_buf, buf, sig, cache=cache)
+            finally:
+                cur.wait_stream(side)
             if os.environ.get("FSB_DECODE_JOIN", "1") == "1":
                 # FSB_DECODE_JOIN (default 1; 0 keeps torch's ops): the join is the one kernel after both branches,
                 # so torch's scale and add (and the transpose into W_o's input) run as one launch with the same values
@@ -1520,14 +1524,18 @@ class FSAttn(nn.Module):
             # writes (it reads cells completed before the query block; the window writes the new token's row). No
             # record_stream (under capture it would hold the read's buffers out of the graph pool): the read's output
             # comes from the side stream's pool and is freed after its consumers on this stream, and every fork waits
-            # on this stream before allocating, so the side stream reuses a block only after its last reader.
+            # on this stream before allocating, so the side stream reuses a block only after its last reader. The
+            # join also runs when either branch raises: a capture whose side branch is left unjoined cannot end, and
+            # its error would replace the branch's own
             cur = torch.cuda.current_stream(Q.device)
             side = _decode_read_stream(Q.device)
             side.wait_stream(cur)
-            with torch.cuda.stream(side):
-                read = _tt.lr_decode_read(self, Q, kbuf, vbuf, pool, pos_t, sigma, st, slots=slots)
-            out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
-            cur.wait_stream(side)
+            try:
+                with torch.cuda.stream(side):
+                    read = _tt.lr_decode_read(self, Q, kbuf, vbuf, pool, pos_t, sigma, st, slots=slots)
+                out_short = self._sr_kv_and_decode(Q, K, V, kbuf, vbuf, buf, sigma, cache=cache)
+            finally:
+                cur.wait_stream(side)
             if read is not None and _tt.lr_combine_ok(out_short, Q):
                 return self.W_o(_tt.lr_combine(out_short, *read))
         else:
