@@ -1,5 +1,6 @@
 """Exercise the report/log plumbing without loading a checkpoint or CUDA kernels."""
 
+import ast
 import importlib.util
 import json
 import sys
@@ -91,10 +92,10 @@ def ruler_driver(monkeypatch):
     {"FSB_BUILD_SMALL": "0"},
     {"FSB_BUILD_UNIFORM": "0"},
     {"FSB_BEAM_LONG": "0"},
-    {"FSB_GLUE_KV": "1"},
-    {"FSB_GLUE_FORK": "1"},
-    {"FSB_GLUE_KV": "1", "FSB_GLUE_FORK": "1"},
-    {"FSB_DECODE_SHARE": "1"},
+    {"FSB_GLUE_KV": "0"},
+    {"FSB_GLUE_FORK": "0"},
+    {"FSB_GLUE_KV": "0", "FSB_GLUE_FORK": "0"},
+    {"FSB_DECODE_SHARE": "0"},
     {"FSB_DECODE_CELLS": "1"},
     {"FSB_DECODE_CAPTURE_STRICT": "1"},
 ])
@@ -170,7 +171,7 @@ ATTN_FLAGS = tuple(k for k in ATTN_DEFAULTS if k != "FSL_SLIDING_MODE")
 @pytest.mark.parametrize("fsb", [True, False])
 @pytest.mark.parametrize("overrides", [{}, {name: "0" for name in ATTN_FLAGS}, {"FSL_SLIDING_MODE": "off"},
                                        {"FSL_WINDOW_STREAM": "1"}, {"FS_WINDOW_OVERLAP": "0", "FS_DECODE_FORK": "0"},
-                                       {"FSL_KV_BOUNDED": "0"}, {"FS_GLUE_KV": "1"}, {"FS_DECODE_CELLS": "1"}])
+                                       {"FSL_KV_BOUNDED": "0"}, {"FS_GLUE_KV": "0"}, {"FS_DECODE_CELLS": "1"}])
 def test_attention_execution_env_recorded(ruler_driver, monkeypatch, tmp_path, capsys, fsb, overrides):
     for name in (*ATTN_FLAGS, "FSL_SLIDING_MODE"):
         monkeypatch.delenv(name, raising=False)
@@ -190,3 +191,60 @@ def test_attention_execution_env_recorded(ruler_driver, monkeypatch, tmp_path, c
     env_line = next(line for line in capsys.readouterr().out.splitlines() if "attention eval env:" in line)
     for name, value in expected.items():
         assert f"{name}={value}" in env_line.split()
+
+
+def _environ_call(func, method):
+    # whether a call's function is os.environ.<method> (os.getenv counts as os.environ.get)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "os":
+        return method == "get" and func.attr == "getenv"
+    return (isinstance(func, ast.Attribute) and func.attr == method and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "environ" and isinstance(func.value.value, ast.Name) and func.value.value.id == "os")
+
+
+def _literal_calls(path, method):
+    # the os.environ.<method>(name, value) calls of a source file with a string literal value and a string literal name
+    # (or a conditional between two, as FSAttn reads its FS-B / FS switch pairs): [(name, value)]
+    out = []
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if not (isinstance(node, ast.Call) and len(node.args) == 2 and not node.keywords
+                and _environ_call(node.func, method)):
+            continue
+        name, value = node.args
+        names = [name.body, name.orelse] if isinstance(name, ast.IfExp) else [name]
+        if (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                and all(isinstance(n, ast.Constant) and isinstance(n.value, str) for n in names)):
+            out += [(n.value, value.value) for n in names]
+    return out
+
+
+def test_recorded_switch_tables_match_the_module_defaults(ruler_driver, monkeypatch):
+    # with every switch unset, each entry of the switch tables the drivers record (eval_ruler.py's FS-B and attention
+    # tables; bench_efficiency.py's FSB_FLAGS and ATTN_FLAGS, which hub.py's reports record too) is the default the code
+    # reads that switch with - every os.environ.get(name, default) of src/ and experiments/, found by an AST scan, and
+    # all of them alike - unless that driver sets the default itself (os.environ.setdefault) before anything reads it.
+    # A table that records "1" for a switch whose code still defaults to "0", or the reverse, fails here
+    root = Path(__file__).resolve().parents[1]
+    scaling = root / "experiments" / "scaling"
+    reads = {}
+    for path in sorted([*(root / "src").rglob("*.py"), *(root / "experiments").rglob("*.py")]):
+        for name, default in _literal_calls(path, "get"):
+            reads.setdefault(name, set()).add(default)
+    src = (scaling / "bench_efficiency.py").read_text()
+    tables = {t.id: ast.literal_eval(node.value) for node in ast.parse(src).body if isinstance(node, ast.Assign)
+              for t in node.targets if getattr(t, "id", None) in ("FSB_FLAGS", "ATTN_FLAGS")}
+    bench = {**tables["FSB_FLAGS"], **tables["ATTN_FLAGS"]}
+    for table in (ruler_driver._fsb_execution_env, ruler_driver._attn_execution_env):
+        for name in table():
+            monkeypatch.delenv(name, raising=False)
+    ruler = {**ruler_driver._fsb_execution_env(), **ruler_driver._attn_execution_env()}
+    wrong = []
+    for table, driver in ((ruler, root / "eval_ruler.py"), (bench, scaling / "bench_efficiency.py"),
+                          (bench, scaling / "hub.py")):
+        own = dict(_literal_calls(driver, "setdefault"))
+        for name, value in table.items():
+            code = reads.get(name, set())
+            effective = own[name] if name in own else next(iter(code), None)
+            if len(code) != 1 or effective != value:
+                wrong.append((driver.name, name, value, sorted(code), own.get(name)))
+    assert len(ruler) > 40 and len(bench) > 40
+    assert not wrong, wrong
