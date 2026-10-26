@@ -793,13 +793,20 @@ def union_rerank_fast(sel_a: torch.Tensor, sel_b, q: torch.Tensor, qpos: torch.T
 
 
 
+# True only while FSBGraphedDecoder runs a step eagerly in place of its failed whole-step capture
+# (decode_graph.FSBGraphedDecoder._eager_step): its bf16 readout then launches the kernel that capture records, on the
+# same full K / V buffers, instead of the reference readout
+_GRAPH_EAGER = False
+
+
 def decode_readout_ok(attn, q_t: torch.Tensor, sel, pos_t, Kp, Vp, must_capture: bool = True,
                       ln_f32_ok: bool = False) -> bool:
     # the fused decode readout's support envelope; anything outside it uses the reference eager readout. Capture
-    # is required on the bf16 buffers (on eager tokens their reference chain builds them once); the int8 read
-    # state is complete at every step and runs eagerly too (must_capture=False there).
+    # is required on the bf16 buffers (on eager tokens their reference chain builds them once), or the whole-step
+    # decoder's eager step (_GRAPH_EAGER); the int8 read state is complete at every step and runs eagerly too
+    # (must_capture=False there).
     if not (_HAVE_TRITON and bool(attn._prune_cfg("fs_fused_attn", "FS_FUSED_ATTN", 0)) and q_t.is_cuda
-            and (not must_capture or torch.cuda.is_current_stream_capturing())):
+            and (not must_capture or _GRAPH_EAGER or torch.cuda.is_current_stream_capturing())):
         return False
     if q_t.dim() != 4 or q_t.shape[2] != 1 or not torch.is_tensor(sel) or sel.dim() != 3:
         return False

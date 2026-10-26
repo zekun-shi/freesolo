@@ -334,14 +334,12 @@ class FSBGraphedDecoder:
     When the step raises inside its capture (a capture guard of a configuration the fused kernels do not cover, a kernel
     that refuses capture) and the capture still ends cleanly, the process is as it was before the capture: the decoder
     then runs that step and the rest of the generation eagerly (_eager_step; graph_failed records it) instead of
-    aborting, or raises the step's error under FSB_DECODE_CAPTURE_STRICT=1 (default 0). The eager step runs the step's
-    operations without a capture: on the int8 KV store its FS-B read and readout are the kernels a capture records (a
-    guarded configuration runs the eager fallback its guard keeps out of captures); on the bf16 store its FS-B readout
-    is the torch reference (_fsb_decode_readout) where a capture runs the fused readout, which differs from it by
-    rounding, so its tokens can differ from the graph's; the trunk runs its single-row norms and silu * mul as eager ops
-    and the gate and up projections as two GEMMs instead of the captured concatenated one. A capture that fails to
-    begin or to end (a stream left unjoined, an invalidated capture) can leave the caching allocator in capture mode,
-    so it raises, with the step's own error if there was one; an out-of-memory error keeps its type."""
+    aborting, or raises the step's error under FSB_DECODE_CAPTURE_STRICT=1 (default 0). The eager step makes the
+    capture's kernel choices (the trunk's one-pass single-row kernels and gate-up GEMM, and on the bf16 KV store the
+    fused FS-B readout, which otherwise runs only under capture), so it computes what a replay of the step would; only a
+    configuration that a capture guard refused runs the eager fallback that guard keeps out of captures. A capture that
+    fails to begin or to end (a stream left unjoined, an invalidated capture) can leave the caching allocator in capture
+    mode, so it raises, with the step's own error if there was one; an out-of-memory error keeps its type."""
 
     def __init__(self, model, prompt_ids, max_new_tokens, device="cuda", dtype=torch.bfloat16, lean_prefill=False):
         self.m = model
@@ -543,14 +541,19 @@ class FSBGraphedDecoder:
 
     @torch.no_grad()
     def _eager_step(self):
-        # the step's operations without a capture, on the decoder's buffers and caches, once a capture has failed (the
-        # class docstring lists where its kernels differ from the captured step's); its logits go to static_logits,
-        # where a replay leaves them
+        # the step without a capture, on the decoder's buffers and caches, once a capture has failed: with the
+        # capture's kernel choices (the warm-up's one-pass single-row trunk kernels and gate-up GEMM, the fused bf16
+        # readout through fsb_fast_step._GRAPH_EAGER), so it computes what a replay of the step would; its logits go
+        # to static_logits, where a replay leaves them
+        from src.fsattn import fsb_fast_step as _fst
         p = self.pos
         if p // self.Bq != self._blk:
             from src.fsattn.fsb_tree import fsb_decode_prepare_all
             fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, p)
             self._blk = p // self.Bq
+        for blk in self.blocks:
+            blk.ffn._use_gu_cache = True
+        _tt._GRAPH_WARMUP = _fst._GRAPH_EAGER = True
         try:
             with _autocast_ctx(self.dev, self.dt):
                 logits = self._step_body()
@@ -560,6 +563,10 @@ class FSBGraphedDecoder:
             raise RuntimeError(f"FSBGraphedDecoder: the eager step at pos {p}, which replaced the whole-step "
                                "CUDA-graph decode after its capture failed, raised; set FSB_DECODE_WHOLE=0 to decode "
                                "without the whole-step graph") from exc
+        finally:
+            _tt._GRAPH_WARMUP = _fst._GRAPH_EAGER = False
+            for blk in self.blocks:
+                blk.ffn._use_gu_cache = False
         self.static_logits = logits
         self.next_tok = logits.argmax(dim=-1)
         for c in self.cache:

@@ -227,6 +227,64 @@ def test_forked_read_joins_when_it_raises(monkeypatch):
 
 @gpu
 @torch.no_grad()
+@pytest.mark.parametrize("int8,fork", [("1", "0"), ("1", "1"), ("0", "0"), ("0", "1")])
+def test_eager_fallback_matches_graph_replay(monkeypatch, int8, fork):
+    # a step that raises inside its whole-step capture leaves the decoder on the eager step, which makes the capture's
+    # kernel choices (the trunk's one-pass kernels and gate-up GEMM; on the bf16 KV store, with bf16 norm weights, the
+    # fused readout that otherwise runs only under capture): teacher-forced steps across query blocks give the
+    # replays' logits and read cells bit for bit, every eager bf16 readout through the fused kernel
+    from src.fsattn import fsb_tree as ft
+    m = _model(monkeypatch, 1024, n_layers=2)
+    for blk in m.blocks:
+        f = blk.attn.fsattn
+        f.lr_norm.scale.data = f.lr_norm.scale.data.to(torch.bfloat16)     # the fused bf16 readout's norm weights
+    monkeypatch.setenv("FS_KV_INT8", int8)
+    monkeypatch.setenv("FSB_DECODE_FORK", fork)
+    monkeypatch.setenv("FSB_DECODE_V2", "1")
+    prompt = torch.randint(0, 512, (1, 1024), generator=torch.Generator().manual_seed(173)).cuda()
+    forced = torch.randint(0, 512, (200,), generator=torch.Generator().manual_seed(179)).cuda()
+    restore = _taus(m)
+    real_read, real_out = ft.fsb_decode_token, fast.decode_readout_fast
+    refuse, refused, eager_outs = [False], [], []
+
+    def read(*a, **k):
+        if refuse[0] and torch.cuda.is_current_stream_capturing():
+            refused.append(1)
+            raise RuntimeError("the FS-B read refuses capture in a test")
+        return real_read(*a, **k)
+
+    def readout(*a, **k):
+        out = real_out(*a, **k)
+        if fast._GRAPH_EAGER:
+            eager_outs.append(out is not None)
+        return out
+
+    monkeypatch.setattr(ft, "fsb_decode_token", read)
+    monkeypatch.setattr(fast, "decode_readout_fast", readout)
+    runs = {}
+    for fall in (True, False):                  # the eager run first: every kernel is built before a capture runs it
+        refuse[0] = fall
+        monkeypatch.setenv("FSB_DECODE_CAPTURE_STRICT", "0" if fall else "1")
+        restore()
+        gd = _decoder(m, prompt, len(forced))
+        logits, sels = [], []
+        for t in forced:
+            gd.next_tok = t.view(1)
+            gd.step()
+            logits.append(gd.static_logits.float().clone())
+            sels.append(torch.stack([c._fsb_forest._last_sel.clone() for c in gd.cache]))
+        assert gd.graph_failed == fall and (gd.graph is None) == fall
+        runs[fall] = (torch.stack(logits), torch.stack(sels))
+    assert refused == [1]
+    assert (len(eager_outs) > 0 and all(eager_outs)) if int8 == "0" else not eager_outs, eager_outs
+    (l0, s0), (l1, s1) = runs[False], runs[True]
+    assert torch.isfinite(l0).all() and (s0 >= 0).float().mean() > 0.9
+    assert torch.equal(s0, s1)
+    assert torch.equal(l0.view(torch.int32), l1.view(torch.int32))
+
+
+@gpu
+@torch.no_grad()
 @pytest.mark.parametrize("L", [1024, 4096])
 def test_fused_beams_match_pair_kernel(monkeypatch, L):
     # the fused kernel's two beam descents (its test hook writes both beams' cells) against forest_beam_pair (the
