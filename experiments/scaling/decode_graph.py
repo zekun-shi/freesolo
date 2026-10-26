@@ -428,6 +428,8 @@ class FSBGraphedDecoder:
         from src.fsattn.fsb_tree import _capture_decode_graph, fsb_decode_prepare_all
         fsb_decode_prepare_all(self.attn, self.cache, 1, self.H, self.D, self.dev, self.pos)
         self._blk = self.pos // self.Bq
+        self.graph = None                       # an earlier capture's graph is released first: a step that raises in
+        # the warm-up or the capture leaves no stale graph behind, so a retried step captures again
         accs = [getattr(a, "_fsb_read_acc", None) for a in self.attn]
         for a in self.attn:                     # the warm-up step must not add to the read statistics
             a._fsb_read_acc = None
@@ -445,7 +447,6 @@ class FSBGraphedDecoder:
             torch.cuda.current_stream().wait_stream(s)
             for a, acc in zip(self.attn, accs):
                 a._fsb_read_acc = acc
-            self.graph = None                   # an earlier capture's graph is released before this one
             g = torch.cuda.CUDAGraph()
             raised = []
 
