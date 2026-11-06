@@ -41,6 +41,7 @@ def main():
     from experiments.rebuttal.bounded_likelihood import completion_logprobs
     from experiments.scaling.bench_efficiency import serve_kwargs
     from experiments.scaling.longctx_infer import load_model
+    from experiments.scaling.model import MODEL_CONFIGS
 
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -60,10 +61,12 @@ def main():
     assert sha(data) == receipt['sha256']
     tokens = np.fromfile(data, dtype=np.uint16).reshape(320, 4097)
     assert int(tokens.max()) < 32000
-    model = load_model(str(a.checkpoint), config='800m', device='cuda',
-        max_seq_len=4096, **serve_kwargs('sparse', 0.0))
     with safe_open(str(a.checkpoint / 'model.safetensors'), framework='pt') as weights:
         stored = set(weights.keys())
+        assert weights.get_slice('tok_emb.weight').get_shape() == [32000, 1536]
+    MODEL_CONFIGS['800m']['vocab_size'] = 32000
+    model = load_model(str(a.checkpoint), config='800m', device='cuda',
+        max_seq_len=4096, **serve_kwargs('sparse', 0.0))
     expected = set(model.state_dict())
     assert not (stored - expected) and (expected - stored) <= {'lm_head.weight'}
     assert model.lm_head.weight.data_ptr() == model.tok_emb.weight.data_ptr()
@@ -75,6 +78,7 @@ def main():
         script_sha256=sha(Path(__file__)), bounded_adapter_sha256=sha(ROOT / 'experiments/rebuttal/bounded_likelihood.py'),
         data_receipt=receipt, corpus_manifest_sha256=sha(a.packets / 'manifest.json'),
         precision='FP32 weights, BF16 autocast', implementation='fully bounded FS-L P64/W8/K4',
+        model_config=dict(MODEL_CONFIGS['800m'], max_seq_len=4096),
         torch=torch.__version__, cuda=torch.version.cuda, gpu=torch.cuda.get_device_name(),
         started_at=time.time(), sequences=[])
     a.output.parent.mkdir(parents=True, exist_ok=True)
