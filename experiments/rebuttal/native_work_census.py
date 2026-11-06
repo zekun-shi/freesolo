@@ -54,7 +54,7 @@ class Census:
     }
 
     def __init__(self):
-        self.calls=Counter();self.work=Counter();self.patches=[]
+        self.calls=Counter();self.work=Counter();self.patches=[];self.forest_builds=[]
 
     def __enter__(self):
         for path,names in self.FUNCTIONS.items():
@@ -76,9 +76,40 @@ class Census:
             key=json.dumps(dict(function=name,inputs={k:metadata(v) for k,v in values.items()
                 if k not in ['out','pv_out','scratch','stats_out','ovf_out']}),sort_keys=True)
             self.calls[key]+=1
-            result=original(*args,**kwargs)
             short=name.rsplit('.',1)[-1]
+            before_admitted=(values['lean'][4].tolist() if short=='lean_dirty_build' else None)
+            result=original(*args,**kwargs)
+            if short=='lean_dirty_build_many':
+                for entry in values['entries']:
+                    lean=entry['lean']
+                    self.forest_builds.append(dict(kind=short,capacity=lean[7],
+                        head_dim=entry['Kbar'].shape[-1],admitted=lean[4].tolist(),
+                        n_seen=values['n_seen'],m_vis=values['M_vis'],
+                        tasks=lean[11].reshape(-1)[:int(entry['nk'])*entry['Kbar'].shape[0]*10].reshape(-1,10).tolist()))
+            if short=='lean_dirty_build' and result:
+                lean=values['lean']
+                nk=min(int(lean[6]),importlib.import_module('src.fsattn.fsb_build_cuda').DIRTY_KMAX)+1
+                self.forest_builds.append(dict(kind=short,capacity=lean[7],
+                    head_dim=values['Kbar'].shape[-1],admitted=lean[4].tolist(),
+                    tasks=lean[11].reshape(-1)[:nk*values['Kbar'].shape[0]*10].reshape(-1,10).tolist(),
+                    before_admitted=before_admitted,new_admitted=values['nn'].tolist(),
+                    tall=values.get('tall')))
             if result is None:return result
+            if short=='readout_combine':
+                self.work.update(readout_work(values['sel'],values['Q'].shape[2],
+                    values['K'].shape[2],values['cell_size'],values['query_block'],
+                    importlib.import_module('src.fsattn.readout_triton')._G))
+            if short=='build_forests_cuda':
+                for forest,_ in result:
+                    lean=values.get('lean')
+                    if forest.get('_lean_direct'):
+                        assert lean is not None
+                        admitted=lean[4].tolist();capacity=lean[7]
+                    else:
+                        admitted=forest['m_tot'].tolist();capacity=forest['M']
+                    self.forest_builds.append(dict(kind=short,capacity=capacity,
+                        head_dim=values['Kbar'].shape[-1],admitted=admitted,
+                        selected_chunks=values.get('sel'),prefill_trim=values.get('mb_max')))
             if short in ['forest_beam_fused','forest_beam_pair']:
                 beams=[result] if short=='forest_beam_fused' else result
                 for cells,visits in beams:
@@ -104,7 +135,30 @@ class Census:
 
     def report(self):
         return dict(kernel_calls=[dict(json.loads(k),calls=v) for k,v in self.calls.items()],
-            observed_work=dict(self.work),complete_flop_accounting=False)
+            observed_work=dict(self.work),forest_builds=self.forest_builds,complete_flop_accounting=False)
+
+
+def readout_work(selected,n_query,n_key,cell_size,query_block,group):
+    """Logical selected pairs and the fused readout's actual union-tile pairs."""
+    group=min(group,query_block)
+    assert n_query % group==0 and query_block % group==0
+    ids=selected[:,:,:n_query].long()
+    positions=torch.arange(n_query,device=ids.device)
+    valid=(ids>=0)&(ids<n_key//cell_size)
+    valid &= (ids+1)*cell_size <= (positions//query_block*query_block)[None,None,:,None]
+    ids=ids.masked_fill(~valid,-1)
+    ordered=ids.sort(-1).values
+    unique=ordered>=0
+    unique[...,1:] &= ordered[...,1:]!=ordered[...,:-1]
+    logical=int(unique.sum().item())
+    tiled=ids.reshape(*ids.shape[:2],n_query//group,group*ids.shape[-1]).sort(-1).values
+    unique=tiled>=0
+    unique[...,1:] &= tiled[...,1:]!=tiled[...,:-1]
+    unions=int(unique.sum().item())
+    return dict(readout_selected_cells=logical,readout_group_union_cells=unions,
+        readout_logical_token_pairs=logical*cell_size,
+        readout_tile_token_pairs=unions*group*cell_size,
+        readout_sort_items=selected.shape[0]*selected.shape[1]*n_query*(1<<(ids.shape[-1]-1).bit_length()))
 
 
 def tensor_sha(t):
