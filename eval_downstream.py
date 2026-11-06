@@ -18,6 +18,9 @@ def parse_args():
     p.add_argument("--swan_scale_base", type=float, default=8192)
     p.add_argument("--swan_rope_theta", type=float, default=1000000)
     p.add_argument("--lr_dense_control", action="store_true")
+    p.add_argument("--bounded-cache", action="store_true",
+                   help="Teacher-forced likelihood through the existing bounded FS-L cache")
+    p.add_argument("--prefill-chunk-size", type=int, default=2048)
     p.add_argument("--long_range_variant", default="cell_topk", choices=["cell_topk"])
     p.add_argument("--window_size", type=int, default=128)
     p.add_argument("--cell_stride", type=int, default=64, help="token-cell size of the long-range branch")
@@ -66,6 +69,10 @@ def parse_args():
     p.add_argument("--fsb_tau_calib_seed", type=int, default=1234)
     p.add_argument("--fsb_tau_calib_data", default="./data/fineweb_edu_llama32k.bin")
     args = p.parse_args()
+    if args.bounded_cache and (args.attn_type != "fsattn" or args.fsb or args.lr_dense_control):
+        p.error("--bounded-cache requires native FS-L attention")
+    if args.prefill_chunk_size < 1:
+        p.error("--prefill-chunk-size must be positive")
     if args.fsb_union_tau_file and not (args.fsb and args.fsb_union_tau_quantile > 0
                                         and args.fsb_union_width > 0 and args.fsb_read_top > 0):
         p.error("--fsb_union_tau_file requires FS-B with a filtered second forest and reranking")
@@ -285,6 +292,11 @@ def main():
         if len(full_ids) > MAXLEN:
             keep = MAXLEN - len(comp_ids)
             full_ids = (ctx_ids[-keep:] if keep > 0 else []) + comp_ids
+        if args.bounded_cache:
+            from experiments.rebuttal.bounded_likelihood import completion_logprobs
+            ll = completion_logprobs(model, full_ids, len(comp_ids),
+                chunk_size=args.prefill_chunk_size, dtype=dtype).sum().item()
+            return (ll, ll / max(len(completion), 1))
         x = torch.tensor(full_ids[:-1], device=device).unsqueeze(0)
         y = torch.tensor(full_ids[1:], device=device).unsqueeze(0)
         with torch.amp.autocast("cuda", dtype=dtype):
@@ -305,7 +317,14 @@ def main():
             parts.append(c + cands[gold])
         return "\n\n".join(parts) + "\n\n"
 
-    results = {"config": vars(args), "tasks": {}}
+    from experiments.scaling.provenance import source_revision
+    results = {"config": vars(args), "tasks": {},
+               "provenance": {"source_revision": source_revision(),
+                   "checkpoint_sha256": _file_sha256_once(os.path.join(args.checkpoint, "model.safetensors")),
+                   "torch": torch.__version__, "cuda": torch.version.cuda,
+                   "gpu": torch.cuda.get_device_name(), "weights_dtype": str(next(model.parameters()).dtype),
+                   "autocast_dtype": str(dtype), "bounded_cache": args.bounded_cache,
+                   "env": {k: v for k, v in os.environ.items() if k.startswith(("FS_", "FSL_", "FSB_"))}}}
     for task in [t for t in args.tasks.split(",") if t]:
         name, subset, split, tsplit, fields, metric = TASKS[task]
         load = (lambda s: load_dataset(name, subset, split=s)) if subset else (lambda s: load_dataset(name, split=s))
@@ -338,6 +357,7 @@ def main():
         results["tasks"][task] = {"metric": metric, "score": primary,
                                   "acc": acc, "acc_norm": acc_norm, "n": tot,
                                   "num_fewshot": args.num_fewshot, "mean_ctx_tokens": mean_ctx,
+                                  "context_tokens": ctx_lens,
                                   "dataset_fingerprint": getattr(ds, "_fingerprint", None),
                                   "predictions": predictions}
         print(f"{task}: {metric}={primary:.4f} (acc={acc:.4f} acc_norm={acc_norm:.4f}, "
