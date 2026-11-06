@@ -83,9 +83,10 @@ class MatchedBatchDataset(Dataset):
         self.seq_len, self.rank = seq_len, rank
         self.per_rank = self.plan.shape[1] // world_size
         self.tokens = None
+        self.start_update = 0
 
     def __len__(self):
-        return self.plan.shape[0] * self.per_rank
+        return (self.plan.shape[0] - self.start_update) * self.per_rank
 
     def __getitem__(self, index):
         if not 0 <= index < len(self):
@@ -93,6 +94,7 @@ class MatchedBatchDataset(Dataset):
         if self.tokens is None:
             self.tokens = np.memmap(self.data_path, dtype=np.uint16, mode="r")
         row, offset = divmod(index, self.per_rank)
+        row += self.start_update
         cid = int(self.plan[row, self.rank * self.per_rank + offset])
         start = cid * (self.seq_len + 1)
         chunk = self.tokens[start:start + self.seq_len + 1].astype(np.int64)

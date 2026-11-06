@@ -28,8 +28,9 @@ def main():
     p.add_argument("--pilot-packet", action="store_true",
                    help="Discarded implementation pilot on the verified GB200 packet, at most 50 steps")
     p.add_argument("--data-plan", help="Verified global-batch plan for changed GPU topology")
+    p.add_argument("--batch-packets", help="Verified ordered packet directory for progressive corpus transfer")
     p.add_argument("--stable-collectives", action="store_true",
-                   help="Use the validated GB200 Ring/no-NVLS, non-expandable allocator configuration")
+                   help="Use Ring/no-NVLS collectives and non-expandable CUDA allocations")
     p.add_argument("--steps", type=int)
     p.add_argument("--gpus-per-node", type=int, default=8)
     p.add_argument("--nodes", type=int, default=1)
@@ -57,16 +58,34 @@ def main():
     data = Path(a.data).resolve()
     expected_bytes, expected_sha256 = CORPORA["gb200-pilot" if a.pilot_packet else a.scale]
     receipt = json.loads(Path(a.data_receipt).read_text())
-    st = data.stat()
-    identity = dict(path=str(data), bytes=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
-    if any(receipt.get(k) != v for k, v in identity.items()) or (
-            receipt.get("sha256") != expected_sha256 or st.st_size != expected_bytes):
+    packet_manifest = None
+    if a.batch_packets:
+        if a.pilot_packet or not a.data_plan:
+            p.error("Ordered full-corpus packets require a batch plan and cannot use the pilot packet")
+        packet_manifest = json.loads((Path(a.batch_packets) / "manifest.json").read_text())
+        if packet_manifest["source"] != receipt or receipt["path"] != str(data):
+            p.error("Packets are not bound to the complete source-corpus checksum receipt")
+    else:
+        st = data.stat()
+        identity = dict(path=str(data), bytes=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
+        if any(receipt.get(k) != v for k, v in identity.items()):
+            p.error("Data file identity changed after its complete hash pass")
+    if receipt.get("sha256") != expected_sha256 or receipt.get("bytes") != expected_bytes:
         p.error("Data identity changed or the full checksum receipt is missing/incorrect")
     plan_manifest = None
     if a.data_plan:
         from experiments.rebuttal.matched_data import MatchedBatchDataset
-        ds = MatchedBatchDataset(data, a.data_plan, 4096, 0, world,
-                                 corpus_sha256=expected_sha256)
+        if a.batch_packets:
+            from experiments.rebuttal.packet_data import PacketBatchDataset
+            ds = PacketBatchDataset(a.batch_packets, a.data_plan, 4096, 0, world,
+                                     corpus_sha256=expected_sha256, wait_seconds=0)
+            ds[0]
+            validation = PacketBatchDataset(a.batch_packets, a.data_plan, 4096, 0, world,
+                                             validation=True, corpus_sha256=expected_sha256, wait_seconds=0)
+            validation[0]
+        else:
+            ds = MatchedBatchDataset(data, a.data_plan, 4096, 0, world,
+                                     corpus_sha256=expected_sha256)
         plan_manifest = json.loads(Path(a.data_plan).read_text())
         if (len(ds.plan) < a.steps or ds.per_rank % a.per_gpu
                 or plan_manifest["reference_world"] != (16 if large else 8)
@@ -103,6 +122,7 @@ def main():
         "--data_sha256", expected_sha256,
         "--fail_on_nonfinite",
         *(["--rebuttal_data_plan", str(Path(a.data_plan).resolve())] if a.data_plan else []),
+        *(["--rebuttal_batch_packets", str(Path(a.batch_packets).resolve())] if a.batch_packets else []),
         *(["--resume", a.resume] if a.resume else []),
     ]
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FS_", "FSB_", "FSL_"))}
@@ -118,6 +138,7 @@ def main():
     import triton
     manifest = dict(schema="freesolo_rebuttal_launch/1", arm=a.arm, name=a.name,
                     scale=a.scale, pilot_packet=a.pilot_packet, data_plan=plan_manifest,
+                    ordered_packets=packet_manifest,
                     source_revision=source_revision(), root=str(ROOT), command=command,
                     env=fixed_env, data=receipt, world_size=world, per_gpu=a.per_gpu,
                     accumulation=accum, tokens_per_update=524288, steps=a.steps,

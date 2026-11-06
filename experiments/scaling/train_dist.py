@@ -288,6 +288,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--rebuttal_data_plan", default=None,
                    help="Verified fixed global batches, independent of physical GPU count.")
+    p.add_argument("--rebuttal_batch_packets", default=None,
+                   help="Progressively transferred, verified packets of the same planned batches")
     p.add_argument("--output_dir", default="./runs/default")
     p.add_argument("--run_name", default=None)
     p.add_argument("--mlflow_uri", default="", help='empty disables MLflow')
@@ -669,6 +671,8 @@ def main():
 
     if args.rebuttal_data_plan and (scaling or not args.pretokenized):
         raise ValueError("The rebuttal batch plan requires the pretokenized rebuttal recipe")
+    if args.rebuttal_batch_packets and not args.rebuttal_data_plan:
+        raise ValueError("Ordered packets require the fixed global-batch plan")
     if scaling:
         from experiments.scaling.scaling_data import ScalingTokenDataset
         train_ds = ScalingTokenDataset(args.pretokenized, seq_len, rank, world,
@@ -680,9 +684,14 @@ def main():
             raise ValueError("Scaling budget exceeds a single pass through the training split")
     elif args.pretokenized and args.rebuttal_data_plan:
         from experiments.rebuttal.matched_data import MatchedBatchDataset
-        train_ds = MatchedBatchDataset(args.pretokenized, args.rebuttal_data_plan, seq_len, rank, world,
+        dataset = MatchedBatchDataset
+        path = args.pretokenized
+        if args.rebuttal_batch_packets:
+            from experiments.rebuttal.packet_data import PacketBatchDataset
+            dataset, path = PacketBatchDataset, args.rebuttal_batch_packets
+        train_ds = dataset(path, args.rebuttal_data_plan, seq_len, rank, world,
                                       corpus_sha256=args.data_sha256)
-        val_ds = MatchedBatchDataset(args.pretokenized, args.rebuttal_data_plan, seq_len, rank, world,
+        val_ds = dataset(path, args.rebuttal_data_plan, seq_len, rank, world,
                                     validation=True, corpus_sha256=args.data_sha256)
         if (train_ds.plan.shape[0] < args.max_steps or train_ds.per_rank % args.per_gpu_batch_size
                 or train_ds.per_rank != args.per_gpu_batch_size * args.grad_accum_steps):
@@ -1018,8 +1027,11 @@ def main():
     if scaling:
         train_ds.start_microbatch = start_step * args.grad_accum_steps
         accelerator.print(f"Scaling data cursor: microbatch {train_ds.start_microbatch}; single pass")
+    if args.rebuttal_data_plan:
+        train_ds.start_update = start_step
+        accelerator.print(f"Matched-data cursor: update {start_step}; exact planned remaining batches")
     train_iter = iter(train_loader)
-    if start_step > 0 and not scaling:
+    if start_step > 0 and not scaling and not args.rebuttal_data_plan:
         skip_mb = start_step * args.grad_accum_steps
         accelerator.print(f"Data-faithful resume: skipping {skip_mb} micro-batches (to step {start_step})...")
         for _i in range(skip_mb):
