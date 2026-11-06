@@ -31,6 +31,8 @@ def main():
     p.add_argument("--batch-packets", help="Verified ordered packet directory for progressive corpus transfer")
     p.add_argument("--stable-collectives", action="store_true",
                    help="Use Ring/no-NVLS collectives and non-expandable CUDA allocations")
+    p.add_argument("--disable-cudnn-sdpa", action="store_true",
+                   help="Use the other PyTorch SDPA backends for the GB200 large-batch runtime")
     p.add_argument("--steps", type=int)
     p.add_argument("--gpus-per-node", type=int, default=8)
     p.add_argument("--nodes", type=int, default=1)
@@ -121,6 +123,7 @@ def main():
         "--pretokenized", str(data), "--run_name", a.name, "--output_dir", str(run),
         "--data_sha256", expected_sha256,
         "--fail_on_nonfinite",
+        *(["--disable_cudnn_sdpa"] if a.disable_cudnn_sdpa else []),
         *(["--rebuttal_data_plan", str(Path(a.data_plan).resolve())] if a.data_plan else []),
         *(["--rebuttal_batch_packets", str(Path(a.batch_packets).resolve())] if a.batch_packets else []),
         *(["--resume", a.resume] if a.resume else []),

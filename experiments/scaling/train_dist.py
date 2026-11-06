@@ -278,6 +278,7 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--fail_on_nonfinite", action="store_true",
                    help="Stop before an optimizer update if the loss or gradient norm is nonfinite")
+    p.add_argument("--disable_cudnn_sdpa", action="store_true")
     p.add_argument("--optimizer", choices=["adamw"], default="adamw")
     p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=20)
@@ -581,6 +582,9 @@ def estimate_val_loss(model, val_loader, accelerator, max_batches=20):
 
 def main():
     args = parse_args()
+    if args.disable_cudnn_sdpa:
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        print("[runtime] cuDNN SDPA disabled", flush=True)
     checkpoint_steps = {int(s) for s in args.checkpoint_steps.split(",") if s}
     scaling = args.lr_schedule == "wsd"
     if scaling:
