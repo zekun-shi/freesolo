@@ -265,6 +265,10 @@ def parse_args():
     p.add_argument("--min_lr", type=float, default=3e-5)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--max_steps", type=int, default=100000)
+    p.add_argument("--stop_after_step", type=int, default=None,
+                   help="Save and stop early without shortening the learning-rate schedule")
+    p.add_argument("--eval_final", action="store_true",
+                   help="Measure held-out loss at the final executed update")
     p.add_argument("--warmup_steps", type=int, default=2000)
     p.add_argument("--lr_schedule", choices=["cosine", "wsd"], default="cosine")
     p.add_argument("--cooldown_start_step", type=int, default=None,
@@ -582,6 +586,8 @@ def estimate_val_loss(model, val_loader, accelerator, max_batches=20):
 
 def main():
     args = parse_args()
+    from experiments.rebuttal.resume_contract import stopping_step, validate_fixed_resume
+    end_step = stopping_step(args.max_steps, args.stop_after_step)
     if args.disable_cudnn_sdpa:
         torch.backends.cuda.enable_cudnn_sdp(False)
         print("[runtime] cuDNN SDPA disabled", flush=True)
@@ -875,6 +881,10 @@ def main():
             with open(os.path.join(args.resume, "scaling_state.json")) as f:
                 scaling_saved = json.load(f)
             validate_resume(scaling_saved, scaling_contract, scaling_schedule, start_step)
+        elif args.rebuttal_data_plan:
+            resume_contract = validate_fixed_resume(args.resume, args, cfg, attn_kwargs, world)
+            accelerator.print("RESUME_CONTRACT " + json.dumps(resume_contract, sort_keys=True))
+        end_step = stopping_step(args.max_steps, args.stop_after_step, start_step)
         accelerator.load_state(args.resume)
         if args.compile:
             model = torch.compile(model)
@@ -1051,7 +1061,7 @@ def main():
     rd_acc = {}
     fr_acc = {}
     retention_acc = {}
-    while step < args.max_steps:
+    while step < end_step:
         lr = (wsd_lr(step, args.warmup_steps, args.max_steps, args.lr, args.min_lr, args.cooldown_start_step)
               if scaling else get_lr(step, args.warmup_steps, args.max_steps, args.lr, args.min_lr))
         # the FS-B controller: its own group of the main optimizer (reinforce) or its own optimizer (ppo),
@@ -1136,7 +1146,7 @@ def main():
         running = 0.0
 
         if step % args.log_every == 0:
-            tps = ((step - start_step) * tokens_per_step if scaling else total_tokens) / (time.time() - t0)
+            tps = (step - start_step) * tokens_per_step / (time.time() - t0)
             gn = gnorm.item() if torch.is_tensor(gnorm) else (gnorm or 0.0)
             accelerator.print(
                 f"step {step:7d} | loss {avg_loss:.4f} | ppl {math.exp(min(avg_loss,20)):.1f} | "
@@ -1192,7 +1202,8 @@ def main():
                              "train/tok_per_s": tps, "train/total_tokens_B": total_tokens/1e9},
                             step=step)
 
-        if step % args.eval_every == 0 or (scaling and step == args.max_steps):
+        final_eval = step == end_step and (args.eval_final or args.stop_after_step is not None)
+        if step % args.eval_every == 0 or (scaling and step == args.max_steps) or final_eval:
             val_batches = (args.validation_chunks // (world * args.per_gpu_batch_size)) if scaling else 20
             val = estimate_val_loss(model, val_loader, accelerator, max_batches=val_batches)
             current_val = val
@@ -1204,8 +1215,21 @@ def main():
                 best_val = val
                 save_ckpt("best", step, val)
 
-        if step % args.save_every == 0 or step in checkpoint_steps or (scaling and step == args.max_steps):
-            save_ckpt(f"step{step}", step, current_val if scaling else best_val)
+        if (step % args.save_every == 0 or step in checkpoint_steps
+                or (scaling and step == args.max_steps)
+                or (args.stop_after_step is not None and step == end_step)):
+            save_ckpt(f"step{step}", step, current_val if scaling or final_eval else best_val)
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process and (args.stop_after_step is not None or args.eval_final):
+        completion = dict(start_step=start_step, final_step=step, schedule_steps=args.max_steps,
+                          tokens_per_update=tokens_per_step, total_tokens=total_tokens,
+                          executed_updates=step - start_step, final_val_loss=current_val,
+                          world_size=world, resume=args.resume)
+        completion_path = os.path.join(args.output_dir, "completion.json")
+        with open(completion_path + ".tmp", "w") as f:
+            json.dump(completion, f, indent=2, allow_nan=False)
+        os.replace(completion_path + ".tmp", completion_path)
 
     accelerator.print(f"\nDone. best_val={best_val:.4f} | "
                       f"{total_tokens/1e9:.2f}B tokens in {(time.time()-t0)/3600:.2f}h")

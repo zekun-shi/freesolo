@@ -34,6 +34,8 @@ def main():
     p.add_argument("--disable-cudnn-sdpa", action="store_true",
                    help="Use the other PyTorch SDPA backends for the GB200 large-batch runtime")
     p.add_argument("--steps", type=int)
+    p.add_argument("--stop-after-step", type=int,
+                   help="Stop and checkpoint early, preserving --steps as the LR schedule horizon")
     p.add_argument("--gpus-per-node", type=int, default=8)
     p.add_argument("--nodes", type=int, default=1)
     p.add_argument("--rank", type=int, default=0)
@@ -50,6 +52,8 @@ def main():
     a.steps = a.steps if a.steps is not None else (61035 if large else 28000)
     a.eval_every = a.eval_every if a.eval_every is not None else (2000 if large else 1000)
     a.save_every = a.save_every if a.save_every is not None else (5000 if large else 2000)
+    from experiments.rebuttal.resume_contract import stopping_step
+    stopping_step(a.steps, a.stop_after_step)
     if a.pilot_packet and (a.steps > 50 or a.resume):
         p.error("Packet pilots must start fresh and stop within 50 updates")
     world = a.nodes * a.gpus_per_node
@@ -120,6 +124,8 @@ def main():
         "--warmup_steps", "2000" if large else "1000", "--weight_decay", "0.1", "--grad_clip", "1",
         "--seed", "42", "--num_workers", "2", "--save_every", str(a.save_every),
         "--checkpoint_steps", str(a.steps),
+        "--eval_final",
+        *(["--stop_after_step", str(a.stop_after_step)] if a.stop_after_step is not None else []),
         "--eval_every", str(a.eval_every), "--log_every", str(a.log_every),
         "--pretokenized", str(data), "--run_name", a.name, "--output_dir", str(run),
         "--data_sha256", expected_sha256,
@@ -147,6 +153,7 @@ def main():
                     env=fixed_env, data=receipt, world_size=world, per_gpu=a.per_gpu,
                     accumulation=accum, tokens_per_update=524288, steps=a.steps,
                     training_tokens=a.steps * 524288, host=os.uname().nodename,
+                    stop_after_step=a.stop_after_step,
                     python=sys.version, packages={name: importlib.metadata.version(name)
                     for name in ("torch", "numpy", "accelerate", "transformers")},
                     created_at=datetime.now(timezone.utc).isoformat())
