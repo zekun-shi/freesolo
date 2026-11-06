@@ -80,7 +80,10 @@ class GraphedDecoder:
                     a._ensure_qkv_cache()
         self._alloc(P)
         self.cache = make_caches(m, linear=False, reserve=max(0, self.Lmax - P))
-        if os.environ.get("FS_KV_INT8", "1") == "1":
+        # FS/FS-L's fused int8 long-range read currently supports 64 channels.
+        # Other widths need a graph-owned BF16 buffer with the full reserve;
+        # materializing an int8 history cannot supply a writable future row.
+        if os.environ.get("FS_KV_INT8", "1") == "1" and all(a.head_dim == 64 for a in self.attn):
             from src.fsattn.kv_int8 import int8_on
             if int8_on():
                 for c in self.cache:

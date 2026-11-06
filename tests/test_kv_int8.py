@@ -386,13 +386,16 @@ def test_fsl_fs_int8_graphed_decode_across_blocks(monkeypatch, serve, head_dim):
         monkeypatch.setenv("FS_KV_INT8", "1" if i8 else "0")
         gd = GraphedDecoder(m, prompt, Lmax=L + 300 + 16, device="cuda", dtype=torch.bfloat16)
         gd.prefill()
-        assert all(getattr(c, "use_int8", False) == i8 for c in gd.cache)
+        expected_int8 = i8 and head_dim == 64
+        assert all(getattr(c, "use_int8", False) == expected_int8 for c in gd.cache)
         outs = []
         for t in forced:
             gd.next_tok = t.view(1)           # teacher-forced: both runs see the same stream
             outs.append(gd.step().clone())
         runs.append(torch.cat(outs))
     assert (runs[1] == runs[2]).all(), "the int8 decode graph must replay deterministically"
+    if head_dim == 96:
+        assert torch.equal(runs[0], runs[1]), "unsupported int8 widths must use the same BF16 graph path"
     agree = (runs[0] == runs[1]).float().mean().item()
     # cross-mode agreement within the cell quantization noise (sc/2 per row); a kernel bug instead
     # shows up clustered (boundary steps) or as a tail of flips, which the 0.97 floor rejects
