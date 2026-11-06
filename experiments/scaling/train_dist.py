@@ -224,6 +224,8 @@ def parse_args():
                    help="# cells kept for exact within-cell retrieval.")
     p.add_argument("--cell_select", default="score", choices=["score"],
                    help="long-range cell selection rule.")
+    p.add_argument("--lr_dense_control", action="store_true",
+                   help="Read all eligible LR tokens while retaining the FS backbone and masks.")
     p.add_argument("--disable_short_range", action="store_true", default=False,
                    help="LR-only ablation: train with no short-range window.")
     p.add_argument("--disable_long_range", action="store_true", default=False,

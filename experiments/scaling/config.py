@@ -27,6 +27,8 @@ def build_attn_kwargs(a):
         attn_kwargs["rope_long_range"] = not getattr(a, "fs_nope_longrange", False)
         attn_kwargs["fs_uniform_sr"] = bool(getattr(a, "fs_uniform_sr", False))
         attn_kwargs["sel_content_only"] = bool(getattr(a, "sel_content_only", False))
+        if getattr(a, "lr_dense_control", False):
+            attn_kwargs["lr_dense_control"] = True
         # FS-B: threaded only under --fsb; every knob left at None is not threaded, so the
         # library defaults hold and every existing run resolves the same attn_kwargs.
         if getattr(a, "fsb", False):
@@ -71,6 +73,7 @@ _CONFIG_TO_ARG = [
     ("attn.sel_strict_causal", "sel_strict_causal"),
     ("attn.fs_uniform_sr", "fs_uniform_sr"),
     ("attn.fs_nope_longrange", "fs_nope_longrange"),
+    ("attn.lr_dense_control", "lr_dense_control"),
     ("training.per_gpu_batch_size", "per_gpu_batch_size"),
     ("training.grad_accum_steps", "grad_accum_steps"),
     ("training.lr", "lr"),

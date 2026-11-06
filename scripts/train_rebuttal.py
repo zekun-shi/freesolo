@@ -19,7 +19,7 @@ from experiments.scaling.provenance import source_revision
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--arm", required=True, choices=["swan", "nope", "fs", "no_erf"])
+    p.add_argument("--arm", required=True, choices=["swan", "nope", "fs", "no_erf", "dense_lr"])
     p.add_argument("--data", required=True)
     p.add_argument("--data-receipt", required=True)
     p.add_argument("--runs", required=True)
@@ -58,6 +58,8 @@ def main():
          "--cell_select", "score", "--cell_topk", "4", "--cell_stride", "32",
          "--sel_strict_causal", "1", "--fs_nope_longrange", "--fs_uniform_sr",
          "--sigma_init", "0.01" if a.arm == "no_erf" else "4", "--require_freesolo"])
+    if a.arm == "dense_lr":
+        arch.append("--lr_dense_control")
     command = [
         sys.executable, "-m", "accelerate.commands.launch", "--multi_gpu",
         "--num_machines", str(a.nodes), "--num_processes", str(world),

@@ -17,6 +17,7 @@ def parse_args():
     p.add_argument("--swan_window_size", type=int, default=512)
     p.add_argument("--swan_scale_base", type=float, default=8192)
     p.add_argument("--swan_rope_theta", type=float, default=1000000)
+    p.add_argument("--lr_dense_control", action="store_true")
     p.add_argument("--long_range_variant", default="cell_topk", choices=["cell_topk"])
     p.add_argument("--window_size", type=int, default=128)
     p.add_argument("--cell_stride", type=int, default=64, help="token-cell size of the long-range branch")
@@ -154,6 +155,8 @@ def build_model(args, device):
         kw["rope_long_range"] = False
     if args.fs_uniform_sr:
         kw["fs_uniform_sr"] = True
+    if args.lr_dense_control:
+        kw["lr_dense_control"] = True
     if args.fsb:
         if args.attn_type != "fsattn" or args.long_range_variant != "cell_topk":
             raise SystemExit("--fsb needs --attn_type fsattn --long_range_variant cell_topk")
@@ -166,7 +169,7 @@ def build_model(args, device):
         kw["yarn_scale"] = args.yarn_scale
         kw["yarn_orig_max_seq_len"] = args.yarn_orig_max_seq_len
     if args.attn_type != "fsattn":
-        if args.fs_nope_longrange or args.fs_uniform_sr or args.use_yarn:
+        if args.fs_nope_longrange or args.fs_uniform_sr or args.use_yarn or args.lr_dense_control:
             raise SystemExit("FS architecture flags require --attn_type fsattn")
         kw = ({"use_rope": False} if args.attn_type == "standard" else
               dict(window_size=args.swan_window_size, swan_scale_base=args.swan_scale_base,

@@ -103,6 +103,7 @@ def main():
     ap.add_argument("--swan_window_size", type=int, default=512)
     ap.add_argument("--swan_scale_base", type=float, default=8192)
     ap.add_argument("--swan_rope_theta", type=float, default=1000000)
+    ap.add_argument("--lr_dense_control", action="store_true")
     ap.add_argument("--window_size", type=int, default=128, help="short-range window size")
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--tasks", required=True)
@@ -231,7 +232,7 @@ def main():
                          "lse_pos; 1 = off")
     a = ap.parse_args()
     if a.attn_type != "fsattn" and (a.fsb or a.use_rope or a.fs_uniform_sr or
-                                    a.fs_nope_longrange or a.sel_content_only):
+                                    a.fs_nope_longrange or a.sel_content_only or a.lr_dense_control):
         ap.error("FS architecture flags require --attn_type fsattn")
     os.makedirs(os.path.dirname(os.path.abspath(a.output)), exist_ok=True)
     if a.fsb_union_tau_file and not (a.fsb and a.fsb_union_tau_quantile > 0):
@@ -318,6 +319,8 @@ def main():
     elif a.attn_type == "swan":
         attn_kw = dict(window_size=a.swan_window_size, swan_scale_base=a.swan_scale_base,
                        swan_rope_theta=a.swan_rope_theta)
+    if a.lr_dense_control:
+        attn_kw["lr_dense_control"] = True
 
     tok = AutoTokenizer.from_pretrained(TOK_NAME, trust_remote_code=True)
     eos = tok.eos_token_id if tok.eos_token_id is not None else 2
@@ -544,6 +547,8 @@ def main():
 
     variant = "FS-B" if a.fsb else ("FS-L" if int(os.environ.get("FS_PRUNE_KERNEL", "0")) else "FS")
     variant = {"standard": "Global NoPE", "swan": "SWAN-GPT"}.get(a.attn_type, variant)
+    if a.lr_dense_control:
+        variant = "FS dense LR control"
     report = {"meta": {"ckpt": os.path.abspath(a.ckpt), "length": a.length, "tokenizer": TOK_NAME, "eos": eos,
                         "variant": variant, "attn_type": a.attn_type, "config": a.config, "limit": a.limit,
                         "attn_execution_env": attn_env,

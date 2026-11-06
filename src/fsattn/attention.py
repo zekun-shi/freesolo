@@ -120,6 +120,12 @@ class FSAttn(nn.Module):
         self.fs_fused_attn = kwargs.get("fs_fused_attn", None)
         self.cell_fused_select = kwargs.get("cell_fused_select", None)
         self.fsb_enabled = bool(kwargs.get("fsb_enabled", False))
+        self.lr_dense_control = bool(kwargs.get("lr_dense_control", False))
+        if self.lr_dense_control and (
+                not causal or (use_rope and rope_long_range) or self.fsb_enabled
+                or self._prune_cfg("cell_prune_kernel", "FS_PRUNE_KERNEL", 0)
+                or not self._prune_cfg("sel_strict_causal", "FS_STRICT_CAUSAL", 0)):
+            raise ValueError("Dense LR control requires strict-causal NoPE LR without FS-L/FS-B")
         if self.fsb_enabled:
             assert long_range_variant == "cell_topk" and cell_select == "score", (
                 "FS-B requires long_range_variant='cell_topk' and cell_select='score'"
@@ -327,10 +333,35 @@ class FSAttn(nn.Module):
         return out.transpose(1, 2).contiguous().view(B, N, self.d_model)
 
     def _long_range(self, Q, K, V, sigma, seq_len):
+        if self.lr_dense_control:
+            return self._lr_all_eligible(Q, K, V)
         if self.fsb_enabled:
             from .fsb_tree import fsb_long_range
             return fsb_long_range(self, Q, K, V, sigma, seq_len)
         return self._lr_cell_topk(Q, K, V, sigma, seq_len)
+
+    def _lr_all_eligible(self, Q, K, V, q_offset=0):
+        """Same FS token eligibility and normalization, with every eligible cell read.
+
+        Each query block attends a shared completed-cell prefix. SDPA over these
+        blocks avoids constructing a sequence-length-squared mask at 64k.
+        """
+        n, block, stride = Q.shape[2], self._cell_block, self.cell_stride
+        outputs = []
+        start = 0
+        while start < n:
+            absolute = q_offset + start
+            stop = min(n, start + block - absolute % block)
+            end = (absolute // block * block) // stride * stride
+            if end > K.shape[2]:
+                raise ValueError("Dense LR control needs the complete eligible KV history")
+            query = Q[:, :, start:stop]
+            out = (F.scaled_dot_product_attention(query, K[:, :, :end], V[:, :, :end],
+                                                 scale=self.scale, is_causal=False)
+                   if end else torch.zeros_like(query))
+            outputs.append(out)
+            start = stop
+        return self.lr_norm(torch.cat(outputs, dim=2).to(Q.dtype))
 
     def _prune_cfg(self, attr, env, dflt):
         v = getattr(self, attr, None)
@@ -993,6 +1024,8 @@ class FSAttn(nn.Module):
         del x
 
         if getattr(cache, "bounded", False):
+            if self.lr_dense_control:
+                raise NotImplementedError("Dense LR control needs a full-history FSKVCache")
             if self.fsb_enabled:
                 raise NotImplementedError("FS-B has no bounded-cache (linear) path; use FSKVCache.")
             out = cache.attend(Q, K, V)
@@ -1199,6 +1232,9 @@ class FSAttn(nn.Module):
         return self.lr_norm(ob.to(q_t.dtype))
 
     def _lr_decode_step(self, q_t, cache, sigma, pos):
+        if self.lr_dense_control:
+            K, V = cache.lr_tokens()
+            return self._lr_all_eligible(q_t, K, V, q_offset=pos)
         if self._is_dense_lr():
             return self._lr_decode_step_dense(q_t, cache, sigma, pos)
         B, H, _, D = q_t.shape
@@ -1491,6 +1527,8 @@ class FSAttn(nn.Module):
         return self.W_o(out.transpose(1, 2).contiguous().view(B, N, self.d_model))
 
     def graph_decode_layer(self, x, buf):
+        if self.lr_dense_control:
+            raise NotImplementedError("Dense LR control uses the ordinary cached SDPA decode")
         from ..utils import trunk_triton as _tt
         B, N, _ = x.shape
         H, D = self.n_heads, self.head_dim
@@ -1636,6 +1674,8 @@ class FSAttn(nn.Module):
 
     def _lr_prefill_blocks(self, Q, cache, sigma, N):
         K, V = cache.lr_tokens()
+        if self.lr_dense_control:
+            return self._lr_all_eligible(Q, K[:, :, :N], V[:, :, :N])
         if self.fsb_enabled:
             from .fsb_tree import fsb_long_range
             kvp = None
