@@ -284,6 +284,8 @@ def parse_args():
     p.add_argument("--data_subset", default="sample-10BT")
     p.add_argument("--pretokenized", default=None)
     p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--rebuttal_data_plan", default=None,
+                   help="Verified fixed global batches, independent of physical GPU count.")
     p.add_argument("--output_dir", default="./runs/default")
     p.add_argument("--run_name", default=None)
     p.add_argument("--mlflow_uri", default="", help='empty disables MLflow')
@@ -663,6 +665,8 @@ def main():
         except Exception as e:
             accelerator.print(f"MLflow unavailable ({e}); stdout only")
 
+    if args.rebuttal_data_plan and (scaling or not args.pretokenized):
+        raise ValueError("The rebuttal batch plan requires the pretokenized rebuttal recipe")
     if scaling:
         from experiments.scaling.scaling_data import ScalingTokenDataset
         train_ds = ScalingTokenDataset(args.pretokenized, seq_len, rank, world,
@@ -672,6 +676,15 @@ def main():
         required = args.max_steps * args.grad_accum_steps * args.per_gpu_batch_size * world
         if required > train_ds.train_chunks:
             raise ValueError("Scaling budget exceeds a single pass through the training split")
+    elif args.pretokenized and args.rebuttal_data_plan:
+        from experiments.rebuttal.matched_data import MatchedBatchDataset
+        train_ds = MatchedBatchDataset(args.pretokenized, args.rebuttal_data_plan, seq_len, rank, world,
+                                      corpus_sha256=args.data_sha256)
+        val_ds = MatchedBatchDataset(args.pretokenized, args.rebuttal_data_plan, seq_len, rank, world,
+                                    validation=True, corpus_sha256=args.data_sha256)
+        if (train_ds.plan.shape[0] < args.max_steps or train_ds.per_rank % args.per_gpu_batch_size
+                or train_ds.per_rank != args.per_gpu_batch_size * args.grad_accum_steps):
+            raise ValueError("Fixed-batch plan is too short or microbatch crosses an update boundary")
     elif args.pretokenized:
         train_ds = DistPreTokenizedDataset(args.pretokenized, seq_len, rank, world, seed=args.seed)
         val_ds = DistPreTokenizedDataset(args.pretokenized, seq_len, rank, world, val_split=True)
@@ -681,7 +694,8 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.per_gpu_batch_size,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
                               **({"generator": torch.Generator().manual_seed(args.seed + rank)} if scaling else {}))
-    val_loader = DataLoader(val_ds, batch_size=args.per_gpu_batch_size,
+    val_loader = DataLoader(val_ds, batch_size=(val_ds.per_rank if args.rebuttal_data_plan
+                                               else args.per_gpu_batch_size),
                             num_workers=1, pin_memory=True, drop_last=True,
                             **({"generator": torch.Generator().manual_seed(args.seed + 10000 + rank)} if scaling else {}))
 
