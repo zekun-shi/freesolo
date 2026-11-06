@@ -204,7 +204,11 @@ def parse_args():
                         "(ending in .yaml/.yml) to enable OmegaConf config mode. In "
                         "config mode, base.yaml + the variant + any 'key=value' CLI "
                         "dotlist overrides populate the same args below.")
-    p.add_argument("--attn_type", default="fsattn", choices=["fsattn", "standard"])
+    p.add_argument("--attn_type", default="fsattn", choices=["fsattn", "standard", "swan"])
+    p.add_argument("--swan_scale_base", type=float, default=8192.0,
+                   help="SWAN global-layer inference log base; 0 disables inference scaling.")
+    p.add_argument("--swan_rope_theta", type=float, default=1000000.0,
+                   help="SWAN local-layer RoPE base (published architecture: 1e6).")
     p.add_argument("--n_layers", type=int, default=None,
                    help="override config n_layers (iso-param)")
     p.add_argument("--vocab", type=int, default=None,
@@ -864,6 +868,13 @@ def main():
                                    margin=args.retention_margin, source="natural exact 4-gram repeats"), f)
             with open(os.path.join(path, "step.txt"), "w") as f:
                 f.write(str(step))
+            from experiments.scaling.provenance import source_revision
+            with open(os.path.join(path, "run_config.json"), "w") as f:
+                json.dump(dict(schema="freesolo_rebuttal/1", step=step,
+                               config=cfg, attn_type=args.attn_type, attn_kwargs=attn_kwargs,
+                               source_revision=source_revision(), args=vars(args),
+                               argv=sys.argv, world_size=world, tokens=step * tokens_per_step),
+                          f, indent=2, sort_keys=True)
             with open(os.path.join(path, "meta.txt"), "w") as f:
                 _mup_meta = "mup=0"
                 f.write(f"step={step} val_loss={val_loss} params={n_params} "

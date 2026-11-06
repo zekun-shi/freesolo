@@ -157,7 +157,7 @@ class AttentionWithRoPE(nn.Module):
         **attn_kwargs,
     ):
         super().__init__()
-        if attn_type not in ("fsattn", "standard"):
+        if attn_type not in ("fsattn", "standard", "swan"):
             raise ValueError(f"unknown attn_type {attn_type!r}")
         self.d_model = d_model
         self.n_heads = n_heads
@@ -166,10 +166,21 @@ class AttentionWithRoPE(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.use_rope = attn_kwargs.pop("use_rope", True)
         self.attn_type = attn_type
-        if attn_type == "standard":
+        if attn_type in ("standard", "swan"):
             from experiments.scaling.dense_attention import DenseAttention
+            dense_kwargs = {}
+            if attn_type == "swan":
+                # Published global-start 1:3 pattern (SWAN section 2).
+                global_layer = layer_idx % 4 == 0
+                self.use_rope = not global_layer
+                dense_kwargs = dict(
+                    window_size=None if global_layer else int(attn_kwargs.get("window_size", 512)),
+                    rope_theta=float(attn_kwargs.get("swan_rope_theta", 1000000.0)),
+                    infer_scale_base=float(attn_kwargs.get("swan_scale_base", 8192.0))
+                    if global_layer else 0.0,
+                )
             self.standard = DenseAttention(d_model, n_heads, max_seq_len,
-                                           causal=causal, use_rope=self.use_rope)
+                                           causal=causal, use_rope=self.use_rope, **dense_kwargs)
             return
         self.fsattn = FSAttn(
             d_model, n_heads, causal=causal,
@@ -180,7 +191,7 @@ class AttentionWithRoPE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, cache=None) -> torch.Tensor:
-        if self.attn_type == "standard":
+        if self.attn_type in ("standard", "swan"):
             return self.standard(x, cache=cache)
         return self.fsattn(x, cache=cache)
 

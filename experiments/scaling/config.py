@@ -4,6 +4,10 @@ import os
 def build_attn_kwargs(a):
     attn_type = a.attn_type
     attn_kwargs = {}
+    if attn_type == "swan":
+        attn_kwargs.update(window_size=a.window_size,
+                           swan_scale_base=getattr(a, "swan_scale_base", 8192.0),
+                           swan_rope_theta=getattr(a, "swan_rope_theta", 1000000.0))
     if attn_type == "fsattn":
         attn_kwargs["window_size"] = a.window_size
         attn_kwargs["long_range_variant"] = a.long_range_variant
@@ -58,6 +62,8 @@ _CONFIG_TO_ARG = [
     ("attn.attn_type", "attn_type"),
     ("attn.long_range_variant", "long_range_variant"),
     ("attn.window_size", "window_size"),
+    ("attn.swan_scale_base", "swan_scale_base"),
+    ("attn.swan_rope_theta", "swan_rope_theta"),
     ("attn.sigma_init", "sigma_init"),
     ("attn.cell_stride", "cell_stride"),
     ("attn.cell_topk", "cell_topk"),
