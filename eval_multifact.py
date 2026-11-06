@@ -149,7 +149,7 @@ def main():
     ap.add_argument("--arch", required=True, choices=["FS-B", "FS-L", "FS"])
     ap.add_argument("--protocol", required=True, choices=["capeval340", "rebuttal800"])
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config", required=True, choices=["340m", "800m"])
+    ap.add_argument("--config", required=True, choices=["340m", "800m", "1.3b_fs"])
     ap.add_argument("--data", required=True, help="gen_multifact_data .jsonl (prefix, facts, questions)")
     ap.add_argument("--output", required=True, help=".jsonl (manifest, one row per question, summary)")
     ap.add_argument("--limit", type=int, default=0)
@@ -187,6 +187,7 @@ def main():
     ap.add_argument("--fsb_tau_calib_data", default=None,
                     help="pretokenized uint16 corpus for --fsb_union_tau_quantile calibration")
     ap.add_argument("--fsb_tau_cache_dir", default=None)
+    ap.add_argument("--fsb_union_tau_file", help="checkpoint-bound portable union calibration JSON")
     a = ap.parse_args()
 
     if (a.arch == "FS-B") != a.fsb:
@@ -207,8 +208,10 @@ def main():
         ap.error("FSL_LINEAR_CACHE must be unset/0 (masked implementation)")
     if a.fsb_union_tau_quantile > 0 and (a.fsb_union_width <= 0 or a.fsb_read_top <= 0):
         ap.error("--fsb_union_tau_quantile needs --fsb_union_width > 0 and --fsb_read_top > 0")
-    if a.fsb_union_tau_quantile > 0 and not a.fsb_tau_calib_data:
-        ap.error("--fsb_union_tau_quantile needs --fsb_tau_calib_data")
+    if a.fsb_union_tau_file and not (a.fsb and a.fsb_union_tau_quantile > 0):
+        ap.error("--fsb_union_tau_file needs FS-B with a positive union quantile")
+    if a.fsb_union_tau_quantile > 0 and not (a.fsb_tau_calib_data or a.fsb_union_tau_file):
+        ap.error("--fsb_union_tau_quantile needs --fsb_tau_calib_data or --fsb_union_tau_file")
 
     if a.fsb:
         os.environ.setdefault("FSB_TRAIN_GRAPH", "0")
@@ -261,10 +264,16 @@ def main():
             cdir = a.fsb_tau_cache_dir or os.environ.get("FSB_TAU_CACHE_DIR") or os.path.dirname(os.path.abspath(a.output))
             if ckpt_sha is None:
                 ap.error(f"--fsb_union_tau_quantile: {ckpt_file} not found (the tau cache is keyed by its sha256)")
-            utau_info = fsb_tau_calib.calibrate_or_load(
-                model, ckpt_sha=ckpt_sha, quantile=a.fsb_union_tau_quantile, n_batches=a.fsb_tau_calib_batches,
-                length=a.fsb_tau_calib_len, seed=a.fsb_tau_calib_seed, data_path=a.fsb_tau_calib_data, cache_dir=cdir,
-                device="cuda", autocast_dtype=torch.bfloat16, target="fsb_tau_union")
+            if a.fsb_union_tau_file:
+                from experiments.scaling.fsb_release import load_union_calibration
+                utau_info = load_union_calibration(model, a.fsb_union_tau_file,
+                    checkpoint_sha256=ckpt_sha, quantile=a.fsb_union_tau_quantile)
+                utau_info["loaded_from_cache"] = True
+            else:
+                utau_info = fsb_tau_calib.calibrate_or_load(
+                    model, ckpt_sha=ckpt_sha, quantile=a.fsb_union_tau_quantile, n_batches=a.fsb_tau_calib_batches,
+                    length=a.fsb_tau_calib_len, seed=a.fsb_tau_calib_seed, data_path=a.fsb_tau_calib_data, cache_dir=cdir,
+                    device="cuda", autocast_dtype=torch.bfloat16, target="fsb_tau_union")
             _, uall = fsb_tau_calib.tau_summary(model, target="fsb_tau_union")
             _, mall = fsb_tau_calib.tau_summary(model)
             print(f"[multifact] tau_union {'cached' if utau_info['loaded_from_cache'] else 'computed'}: min {uall[0]:.4f} "
