@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-from experiments.scaling.baseline_cache import DenseKVCache, make_baseline_caches
+from experiments.scaling.baseline_cache import DenseKVCache, make_baseline_caches, baseline_cached_generate
 from experiments.scaling.dense_attention import DenseAttention
 from experiments.scaling.model import FreeSoloLM
 
@@ -135,3 +135,26 @@ def test_model_reload_preserves_baseline_outputs(tmp_path, monkeypatch):
     x = torch.randint(0, 64, (1, 19))
     with torch.no_grad():
         torch.testing.assert_close(model(x), restored(x), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("kind", ["standard", "swan"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_greedy_generation_matches_full_prefix_and_stops_at_eos(kind, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    torch.manual_seed(51)
+    model = small_model(kind).eval().to(device)
+    prompt = torch.randint(0, 64, (2, 13), device=device)
+    expected = prompt.clone()
+    with torch.no_grad():
+        for _ in range(7):
+            nxt = model(expected)[:, -1].argmax(-1, keepdim=True)
+            expected = torch.cat([expected, nxt], dim=1)
+    actual = baseline_cached_generate(model, prompt, 7, device=device, dtype="float32")
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    eos = int(expected[0, prompt.shape[1]])
+    stopped = baseline_cached_generate(model, prompt[0], 7, device=device,
+                                       dtype="float32", eos_token_id=eos)
+    torch.testing.assert_close(stopped, expected[:1, :prompt.shape[1] + 1], atol=0, rtol=0)
+    unchanged = baseline_cached_generate(model, prompt, 0, device=device)
+    torch.testing.assert_close(unchanged, prompt, atol=0, rtol=0)

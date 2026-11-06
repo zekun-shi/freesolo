@@ -46,3 +46,39 @@ def make_baseline_caches(model, max_tokens):
             raise ValueError("Baseline caches require standard or SWAN attention throughout")
         caches.append(DenseKVCache(max_tokens, block.attn.standard.window_size))
     return caches
+
+
+@torch.no_grad()
+def baseline_cached_generate(model, prompt_ids, max_new_tokens, device="cuda", *,
+                             dtype="bfloat16", eos_token_id=None):
+    """Greedy baseline generation with the same head, precision and EOS rules as FS."""
+    from .longctx_infer import _as_2d_long, _autocast_ctx, _lm_head_fp32, _resolve_device
+
+    device = _resolve_device(device)
+    model.eval()
+    seq = _as_2d_long(prompt_ids, device)
+    if seq.shape[1] == 0 or max_new_tokens < 0:
+        raise ValueError("Generation needs a nonempty prompt and nonnegative token budget")
+    if max_new_tokens == 0:
+        return seq
+    dt = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+    caches = make_baseline_caches(model, seq.shape[1] + max_new_tokens)
+    finished = torch.zeros(seq.shape[0], dtype=torch.bool, device=device)
+    generated, step_in = [], seq
+    with _autocast_ctx(device, dt):
+        for _ in range(max_new_tokens):
+            hidden = model.drop(model.tok_emb(step_in))
+            for i, block in enumerate(model.blocks):
+                hidden = block(hidden, cache=caches[i])
+            # Avoid a prompt-length by vocabulary allocation at long contexts.
+            hidden = model.ln_final(hidden[:, -1:, :])
+            logits = _lm_head_fp32(model, hidden, 4096)[:, 0, :]
+            nxt = logits.argmax(dim=-1)
+            if eos_token_id is not None:
+                nxt = torch.where(finished, torch.full_like(nxt, eos_token_id), nxt)
+                finished |= nxt == eos_token_id
+            generated.append(nxt)
+            step_in = nxt.unsqueeze(1)
+            if eos_token_id is not None and bool(finished.all()):
+                break
+    return torch.cat([seq, torch.stack(generated, dim=1)], dim=1)

@@ -12,7 +12,11 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True, help="accelerate ckpt DIR (model.safetensors) or .pt file")
     p.add_argument("--config", default="340m")
-    p.add_argument("--attn_type", default="fsattn", choices=["fsattn"])
+    p.add_argument("--attn_type", default="fsattn", choices=["fsattn", "standard", "swan"],
+                   help="standard is the matched global NoPE baseline")
+    p.add_argument("--swan_window_size", type=int, default=512)
+    p.add_argument("--swan_scale_base", type=float, default=8192)
+    p.add_argument("--swan_rope_theta", type=float, default=1000000)
     p.add_argument("--long_range_variant", default="cell_topk", choices=["cell_topk"])
     p.add_argument("--window_size", type=int, default=128)
     p.add_argument("--cell_stride", type=int, default=64, help="token-cell size of the long-range branch")
@@ -161,6 +165,12 @@ def build_model(args, device):
         kw["use_yarn"] = True
         kw["yarn_scale"] = args.yarn_scale
         kw["yarn_orig_max_seq_len"] = args.yarn_orig_max_seq_len
+    if args.attn_type != "fsattn":
+        if args.fs_nope_longrange or args.fs_uniform_sr or args.use_yarn:
+            raise SystemExit("FS architecture flags require --attn_type fsattn")
+        kw = ({"use_rope": False} if args.attn_type == "standard" else
+              dict(window_size=args.swan_window_size, swan_scale_base=args.swan_scale_base,
+                   swan_rope_theta=args.swan_rope_theta))
     model = FreeSoloLM(attn_type=args.attn_type, **kw, **cfg).to(device)
     ck = args.checkpoint
     if os.path.isdir(ck):
@@ -300,7 +310,7 @@ def main():
         prefix = fewshot_prefix(train_ds, fields, args.num_fewshot)
         n_eval = len(ds) if args.limit == 0 else min(args.limit, len(ds))
         correct = correct_norm = tot = 0
-        ctx_lens = []
+        ctx_lens = []; predictions = []
         for i in range(n_eval):
             ctx, cands, gold = fields(ds[i])
             if isinstance(ctx, (list, tuple)):
@@ -311,6 +321,8 @@ def main():
             scored = [score(full_ctxs[j], cands[j]) for j in range(len(cands))]
             raw = [s[0] for s in scored]
             nrm = [s[1] for s in scored]
+            predictions.append(dict(index=i, gold=gold, raw=raw, normalized=nrm,
+                                    context_sha256=[hashlib.sha256(c.encode()).hexdigest() for c in full_ctxs]))
             if max(range(len(cands)), key=lambda j: raw[j]) == gold:
                 correct += 1
             if max(range(len(cands)), key=lambda j: nrm[j]) == gold:
@@ -322,7 +334,9 @@ def main():
         mean_ctx = sum(ctx_lens) / len(ctx_lens)
         results["tasks"][task] = {"metric": metric, "score": primary,
                                   "acc": acc, "acc_norm": acc_norm, "n": tot,
-                                  "num_fewshot": args.num_fewshot, "mean_ctx_tokens": mean_ctx}
+                                  "num_fewshot": args.num_fewshot, "mean_ctx_tokens": mean_ctx,
+                                  "dataset_fingerprint": getattr(ds, "_fingerprint", None),
+                                  "predictions": predictions}
         print(f"{task}: {metric}={primary:.4f} (acc={acc:.4f} acc_norm={acc_norm:.4f}, "
               f"n={tot}, {args.num_fewshot}-shot, mean_ctx={mean_ctx:.0f} tok)")
 

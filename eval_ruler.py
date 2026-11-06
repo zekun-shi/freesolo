@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(_HERE, "experiments", "scaling"))
 sys.path.insert(0, _HERE)
 from longctx_infer import load_model
 from kv_cache import cached_generate
+from experiments.scaling.baseline_cache import baseline_cached_generate
 import longctx_infer as _lci
 
 TOK_NAME = "fla-hub/transformer-1.3B-100B"
@@ -97,6 +98,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--config", default="340m", help="MODEL_CONFIGS key (340m, 800m, ...)")
+    ap.add_argument("--attn_type", default="fsattn", choices=["fsattn", "standard", "swan"],
+                    help="standard is the matched global NoPE baseline")
+    ap.add_argument("--swan_window_size", type=int, default=512)
+    ap.add_argument("--swan_scale_base", type=float, default=8192)
+    ap.add_argument("--swan_rope_theta", type=float, default=1000000)
     ap.add_argument("--window_size", type=int, default=128, help="short-range window size")
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--tasks", required=True)
@@ -224,6 +230,9 @@ def main():
                          "multiplied by s (0 = they compete on content alone) while the main beam's keep the full "
                          "lse_pos; 1 = off")
     a = ap.parse_args()
+    if a.attn_type != "fsattn" and (a.fsb or a.use_rope or a.fs_uniform_sr or
+                                    a.fs_nope_longrange or a.sel_content_only):
+        ap.error("FS architecture flags require --attn_type fsattn")
     os.makedirs(os.path.dirname(os.path.abspath(a.output)), exist_ok=True)
     if a.fsb_union_tau_file and not (a.fsb and a.fsb_union_tau_quantile > 0):
         ap.error("--fsb_union_tau_file requires --fsb and a positive --fsb_union_tau_quantile")
@@ -304,11 +313,16 @@ def main():
                                 rope_long_range=(False if a.fs_nope_longrange else None),
                                 fs_uniform_sr=a.fs_uniform_sr,
                                 sel_content_only=a.sel_content_only, fsb=fsb_kw)
+    if a.attn_type == "standard":
+        attn_kw = {"use_rope": False}
+    elif a.attn_type == "swan":
+        attn_kw = dict(window_size=a.swan_window_size, swan_scale_base=a.swan_scale_base,
+                       swan_rope_theta=a.swan_rope_theta)
 
     tok = AutoTokenizer.from_pretrained(TOK_NAME, trust_remote_code=True)
     eos = tok.eos_token_id if tok.eos_token_id is not None else 2
     lean = a.length >= 16384
-    model = load_model(a.ckpt, config=a.config, attn_type="fsattn", device="cuda",
+    model = load_model(a.ckpt, config=a.config, attn_type=a.attn_type, device="cuda",
                        max_seq_len=a.length + 256, **attn_kw)
     if a.fsb_router_file and not a.fsb:
         ap.error("--fsb_router_file needs --fsb")
@@ -439,7 +453,7 @@ def main():
         recs = [json.loads(x) for x in open(jf)]
         if a.limit: recs = recs[:a.limit]
         mx = min(max_new_for(task), a.max_new); metric = scorer_for(task)
-        scores = []; t0 = time.time(); status = "ok"
+        scores = []; examples = []; t0 = time.time(); status = "ok"
         # FS-B per-example read count (cells read per (layer, head, query) row over prefill + decode) and the
         # prefill's admitted-cell fraction (the noise filter's footprint)
         _rd = {"sum": 0.0, "rows": 0.0, "max": 0.0, "af": [], "afu": [], "ut": 0.0, "utf": [], "uq": 0.0, "uqf": []}
@@ -450,10 +464,17 @@ def main():
                 P = ids.numel()
                 if a.fsb:
                     fsb_read_stats_reset(model)
-                out = cached_generate(model, ids, mx, device="cuda", dtype="bfloat16",
-                                      eos_token_id=eos, lean_prefill=lean)
+                if a.attn_type == "fsattn":
+                    out = cached_generate(model, ids, mx, device="cuda", dtype="bfloat16",
+                                          eos_token_id=eos, lean_prefill=lean)
+                else:
+                    out = baseline_cached_generate(model, ids, mx, device="cuda",
+                                                    dtype="bfloat16", eos_token_id=eos)
                 pred = tok.decode(out[0, P:])
                 scores.append(score_one(pred, r["outputs"], metric))
+                examples.append(dict(index=ri, prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+                                     prompt_tokens=P, generated_ids=out[0, P:].tolist(),
+                                     prediction=pred, references=r["outputs"], score=scores[-1]))
                 if a.fsb:
                     _rs = fsb_read_stats(model)
                     _afl, _af = _fsb_admit_frac()
@@ -495,7 +516,8 @@ def main():
             status = "ERR:" + str(e)[:120]; traceback.print_exc()
         sc = round(sum(scores) / len(scores) * 100, 2) if scores else None
         results[task] = {"score": sc, "n": len(scores), "seconds": round(time.time() - t0),
-                         "status": status, "metric": metric, "max_new": mx}
+                         "status": status, "metric": metric, "max_new": mx,
+                         "data_sha256": _file_sha256_once(jf), "examples": examples}
         _pk = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
         results[task]["peak_alloc_gib"] = round(_pk, 2)
         _rdmsg = ""
@@ -521,8 +543,9 @@ def main():
               f"mx={mx} {results[task]['seconds']}s {status} peak_alloc={_pk:.1f}GiB{_rdmsg}", flush=True)
 
     variant = "FS-B" if a.fsb else ("FS-L" if int(os.environ.get("FS_PRUNE_KERNEL", "0")) else "FS")
+    variant = {"standard": "Global NoPE", "swan": "SWAN-GPT"}.get(a.attn_type, variant)
     report = {"meta": {"ckpt": os.path.abspath(a.ckpt), "length": a.length, "tokenizer": TOK_NAME, "eos": eos,
-                        "variant": variant, "config": a.config, "limit": a.limit,
+                        "variant": variant, "attn_type": a.attn_type, "config": a.config, "limit": a.limit,
                         "attn_execution_env": attn_env,
                         **({"fsb_execution_env": fsb_env} if a.fsb else {}),
                         # FS-B generations whose whole-step decode capture failed and that finished on the decoder's
@@ -531,8 +554,9 @@ def main():
                            if a.fsb else {}),
                         **({"union_tau_sha256": _utau_info["tau_sha256"]}
                            if a.fsb and a.fsb_union_tau_quantile > 0 else {}),
-                        "attn_kwargs": attn_kw, "cell_topk": a.cell_topk,
-                        "lean_prefill": lean, "fsb_route_fixed_c": int(a.fsb_route_fixed_c),
+                        "attn_kwargs": attn_kw, "cell_topk": a.cell_topk if a.attn_type == "fsattn" else None,
+                        "lean_prefill": lean if a.attn_type == "fsattn" else None,
+                        "fsb_route_fixed_c": int(a.fsb_route_fixed_c),
                         **({"fsb_router_file": a.fsb_router_file} if a.fsb_router_file else {}),
                         **({"fsb_union_quota": a.fsb_union_quota} if a.fsb_union_quota > 0 else {}),
                         **({"fsb_union_prior_scale": a.fsb_union_prior_scale} if a.fsb_union_prior_scale != 1.0 else {})},
