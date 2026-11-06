@@ -119,6 +119,7 @@ def main():
         "--min_lr", "4e-5" if large else "3e-5",
         "--warmup_steps", "2000" if large else "1000", "--weight_decay", "0.1", "--grad_clip", "1",
         "--seed", "42", "--num_workers", "2", "--save_every", str(a.save_every),
+        "--checkpoint_steps", str(a.steps),
         "--eval_every", str(a.eval_every), "--log_every", str(a.log_every),
         "--pretokenized", str(data), "--run_name", a.name, "--output_dir", str(run),
         "--data_sha256", expected_sha256,
