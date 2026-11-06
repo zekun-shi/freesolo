@@ -28,6 +28,8 @@ def main():
     p.add_argument("--pilot-packet", action="store_true",
                    help="Discarded implementation pilot on the verified GB200 packet, at most 50 steps")
     p.add_argument("--data-plan", help="Verified global-batch plan for changed GPU topology")
+    p.add_argument("--stable-collectives", action="store_true",
+                   help="Use the validated GB200 Ring/no-NVLS, non-expandable allocator configuration")
     p.add_argument("--steps", type=int)
     p.add_argument("--gpus-per-node", type=int, default=8)
     p.add_argument("--nodes", type=int, default=1)
@@ -84,7 +86,7 @@ def main():
     if a.arm == "dense_lr":
         arch.append("--lr_dense_control")
     command = [
-        sys.executable, "-m", "accelerate.commands.launch", "--multi_gpu",
+        sys.executable, "-m", "accelerate.commands.launch", *(["--multi_gpu"] if world > 1 else []),
         "--num_machines", str(a.nodes), "--num_processes", str(world),
         "--machine_rank", str(a.rank), "--main_process_ip", a.master_addr,
         "--main_process_port", str(a.port), "--same_network", "--mixed_precision", "bf16",
@@ -99,6 +101,7 @@ def main():
         "--eval_every", str(a.eval_every), "--log_every", str(a.log_every),
         "--pretokenized", str(data), "--run_name", a.name, "--output_dir", str(run),
         "--data_sha256", expected_sha256,
+        "--fail_on_nonfinite",
         *(["--rebuttal_data_plan", str(Path(a.data_plan).resolve())] if a.data_plan else []),
         *(["--resume", a.resume] if a.resume else []),
     ]
@@ -108,6 +111,9 @@ def main():
                      OMP_NUM_THREADS="2", MKL_NUM_THREADS="2", PYTHONUNBUFFERED="1",
                      PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
                      NCCL_DEBUG="WARN", TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="3600")
+    if a.stable_collectives:
+        fixed_env.update(NCCL_ALGO="Ring", NCCL_NVLS_ENABLE="0",
+                         PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False")
     env.update(fixed_env)
     import triton
     manifest = dict(schema="freesolo_rebuttal_launch/1", arm=a.arm, name=a.name,

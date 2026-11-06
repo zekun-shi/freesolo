@@ -276,6 +276,8 @@ def parse_args():
     p.add_argument("--validation_chunks", type=int, default=2560,
                    help="WSD: first chunks of the held-out 1 percent, shared across ranks")
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--fail_on_nonfinite", action="store_true",
+                   help="Stop before an optimizer update if the loss or gradient norm is nonfinite")
     p.add_argument("--optimizer", choices=["adamw"], default="adamw")
     p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=20)
@@ -1084,6 +1086,8 @@ def main():
                     _rs = torch.stack((retention_loss.detach(), retention_loss.new_tensor(retention_count)))
                     retention_acc["sum"] = _rs if not retention_acc else retention_acc["sum"] + _rs
                     retention_acc["n"] = retention_acc.get("n", 0) + 1
+            if args.fail_on_nonfinite and not bool(torch.isfinite(loss_total.detach()).all()):
+                raise FloatingPointError(f"Nonfinite loss at update {step}, rank {rank}")
             accelerator.backward(loss_total)
             gnorm = None
             if accelerator.sync_gradients:
@@ -1098,6 +1102,8 @@ def main():
                         accelerator.clip_grad_norm_(_pol, args.fsb_policy_clip)
                 else:
                     gnorm = accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if args.fail_on_nonfinite and gnorm is not None and not bool(torch.isfinite(gnorm)):
+                raise FloatingPointError(f"Nonfinite gradient norm at update {step}, rank {rank}")
             optimizer.step()
             optimizer.zero_grad()
             if _ppo and accelerator.sync_gradients:
