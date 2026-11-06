@@ -9,14 +9,7 @@ import time
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-
-def sha256(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(8 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
+from experiments.rebuttal.packet_io import sha256, atomic_json, packet_entries
 
 
 def read_plan(path):
@@ -35,30 +28,10 @@ def read_plan(path):
     return meta, arrays
 
 
-def atomic_json(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + ".part")
-    with temporary.open("x") as stream:
-        json.dump(value, stream, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    if path.exists():
-        raise FileExistsError(path)
-    temporary.replace(path)
-
-
 def source_identity(path):
     path = Path(path).resolve()
     st = path.stat()
     return dict(path=str(path), bytes=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
-
-
-def packet_entries(meta):
-    """Validation arrives first; each training packet contains complete updates."""
-    yield "validation", 0, meta["validation_rows"], "validation.bin"
-    for start in range(0, meta["steps"], meta["shard_updates"]):
-        yield "train", start, min(meta["shard_updates"], meta["steps"] - start), f"train_{start:06d}.bin"
 
 
 def write_packets(data_path, plan_path, source_receipt, output, shard_updates=128):

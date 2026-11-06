@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import time
 
-from experiments.rebuttal.packet_data import atomic_json, packet_entries, sha256
+from experiments.rebuttal.packet_io import atomic_json, packet_entries, sha256
 
 
 def read_json(stream):
