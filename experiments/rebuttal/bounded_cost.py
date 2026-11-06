@@ -102,7 +102,9 @@ def collect(args):
                 if report['unknown_operators']:
                     emit(dict(kind='decode_inventory',length=length,step=step,**report))
                     raise RuntimeError('Uncounted decode operators; inventory retained')
-                per_step.append(report['total'])
+                # The first report becomes the aggregate below; keep the
+                # individual step independent of that in-place accumulation.
+                per_step.append(dict(report['total']))
                 if totals is None:
                     totals=report
                 else:
