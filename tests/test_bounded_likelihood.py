@@ -29,7 +29,7 @@ def tokenwise_reference(model, ids, n):
     return torch.stack(logs), caches
 
 
-@pytest.mark.parametrize('boundary', [31, 32, 33, 127])
+@pytest.mark.parametrize('boundary', [127, 128, 129, 383])
 @pytest.mark.parametrize('chunk', [1, 17, 64])
 def test_completion_likelihood_matches_tokenwise_across_cells_and_eviction(boundary, chunk):
     model = tiny_model()
@@ -38,7 +38,7 @@ def test_completion_likelihood_matches_tokenwise_across_cells_and_eviction(bound
     got = adapter.completion_logprobs(model, ids, 19, chunk_size=chunk, dtype=torch.float32)
     torch.testing.assert_close(got, expected, atol=3e-5, rtol=1e-5)
     assert all(c.pos == len(ids) - 1 and c._top['ids'].shape[-1] <= 2 for c in caches)
-    if boundary == 127:
+    if boundary == 383:
         assert all(c.eligible > c.P for c in caches)
 
 
