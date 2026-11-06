@@ -4,8 +4,9 @@ import torch
 from experiments.rebuttal.multifact_oracle import replace_required, source_spans
 
 
-def test_fixed_budget_preserves_targets_and_unaffected_rows():
-    selected = torch.tensor([[1, 2, 3, 4], [1, 2, 3, 4], [-1, 2, -1, -1], [1, 2, 3, 4]])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_fixed_budget_preserves_targets_and_unaffected_rows(dtype):
+    selected = torch.tensor([[1, 2, 3, 4], [1, 2, 3, 4], [-1, 2, -1, -1], [1, 2, 3, 4]], dtype=dtype)
     required = torch.tensor([[2, 7], [-1, -1], [6, 2], [4, 3]])
     result, changed = replace_required(selected, required)
     assert result.tolist() == [[1, 2, 3, 7], [1, 2, 3, 4], [-1, 2, -1, 6], [1, 2, 3, 4]]
@@ -13,8 +14,9 @@ def test_fixed_budget_preserves_targets_and_unaffected_rows():
     assert selected.tolist()[0] == [1, 2, 3, 4]
 
 
-def test_four_sources_keep_every_target_and_causal_padding():
-    result, changed = replace_required(torch.tensor([[2, 3, 4, 5], [2, 3, 4, 5]]),
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_four_sources_keep_every_target_and_causal_padding(dtype):
+    result, changed = replace_required(torch.tensor([[2, 3, 4, 5], [2, 3, 4, 5]], dtype=dtype),
                                       torch.tensor([[6, 7, 4, 2], [6, -1, -1, -1]]))
     assert set(result[0].tolist()) == {2, 4, 6, 7}
     assert result[1].tolist() == [2, 3, 4, 6]

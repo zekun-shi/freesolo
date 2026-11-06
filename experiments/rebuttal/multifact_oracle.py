@@ -63,7 +63,7 @@ def replace_required(selected, required):
         if bool((missing & (replace < 0)).any()):
             raise ValueError("No nongold slot available")
         rows = missing.nonzero().flatten()
-        out[rows, replace[rows]] = target[rows]
+        out[rows, replace[rows]] = target[rows].to(out.dtype)
         changed += missing.long()
     return out, changed
 
