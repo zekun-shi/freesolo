@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--fs_uniform_sr", action="store_true",
                    help="uniform-window short-range branch (no distance bias)")
     p.add_argument("--cell_select", type=str, default="score", choices=["score"])
+    p.add_argument("--sel_content_only", action="store_true",
+                   help="Use the genuine content-only selector without the norm/distance bonus")
     p.add_argument("--cell_prune_kernel", type=int, default=None)
     p.add_argument("--cell_prune_pool", type=int, default=None)
     p.add_argument("--cell_prune_window", type=int, default=None)
@@ -162,6 +164,8 @@ def build_model(args, device):
         kw["rope_long_range"] = False
     if args.fs_uniform_sr:
         kw["fs_uniform_sr"] = True
+    if args.sel_content_only:
+        kw["sel_content_only"] = True
     if args.lr_dense_control:
         kw["lr_dense_control"] = True
     if args.fsb:
@@ -176,7 +180,7 @@ def build_model(args, device):
         kw["yarn_scale"] = args.yarn_scale
         kw["yarn_orig_max_seq_len"] = args.yarn_orig_max_seq_len
     if args.attn_type != "fsattn":
-        if args.fs_nope_longrange or args.fs_uniform_sr or args.use_yarn or args.lr_dense_control:
+        if args.fs_nope_longrange or args.fs_uniform_sr or args.use_yarn or args.lr_dense_control or args.sel_content_only:
             raise SystemExit("FS architecture flags require --attn_type fsattn")
         kw = ({"use_rope": False} if args.attn_type == "standard" else
               dict(window_size=args.swan_window_size, swan_scale_base=args.swan_scale_base,
