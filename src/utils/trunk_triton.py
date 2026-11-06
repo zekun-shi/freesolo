@@ -194,7 +194,7 @@ if triton is not None:
     def _sr_kv_rope_kernel(
         Q, K, V, Kbuf, Vbuf, Cos, Sin, PosT, WinIdx,
         Qrot, KwOut, VwOut,
-        Lw, H: tl.constexpr, HALF: tl.constexpr,
+        Lw, H: tl.constexpr, HALF: tl.constexpr, BLOCK_HALF: tl.constexpr,
         sqb, sqh, skb, skh, svb, svh,
         skbb, skbh, skbn, svbb, svbh, svbn,
         scn, ssn,
@@ -205,36 +205,38 @@ if triton is not None:
         bh = tl.program_id(1)
         b = bh // H
         h = bh - b * H
-        cols = tl.arange(0, HALF)
+        # The 743M model has 96 channels/head, so each rotary half has 48.
+        cols = tl.arange(0, BLOCK_HALF)
+        cm = cols < HALF
         pos_t = tl.load(PosT)
         if pid_n == 0:
             kp = K + b * skb + h * skh + cols
-            k1 = tl.load(kp)
-            k2 = tl.load(kp + HALF)
+            k1 = tl.load(kp, mask=cm, other=0)
+            k2 = tl.load(kp + HALF, mask=cm, other=0)
             kbp = Kbuf + b * skbb + h * skbh + pos_t * skbn + cols
-            tl.store(kbp, k1)
-            tl.store(kbp + HALF, k2)
+            tl.store(kbp, k1, mask=cm)
+            tl.store(kbp + HALF, k2, mask=cm)
 
             vp = V + b * svb + h * svh + cols
-            v1 = tl.load(vp)
-            v2 = tl.load(vp + HALF)
+            v1 = tl.load(vp, mask=cm, other=0)
+            v2 = tl.load(vp + HALF, mask=cm, other=0)
             vbp = Vbuf + b * svbb + h * svbh + pos_t * svbn + cols
-            tl.store(vbp, v1)
-            tl.store(vbp + HALF, v2)
+            tl.store(vbp, v1, mask=cm)
+            tl.store(vbp + HALF, v2, mask=cm)
 
             qp = Q + b * sqb + h * sqh + cols
-            q1 = tl.load(qp).to(tl.float32)
-            q2 = tl.load(qp + HALF).to(tl.float32)
+            q1 = tl.load(qp, mask=cm, other=0).to(tl.float32)
+            q2 = tl.load(qp + HALF, mask=cm, other=0).to(tl.float32)
             if USE_ROPE:
-                c = tl.load(Cos + pos_t * scn + cols).to(tl.float32)
-                s = tl.load(Sin + pos_t * ssn + cols).to(tl.float32)
+                c = tl.load(Cos + pos_t * scn + cols, mask=cm, other=0).to(tl.float32)
+                s = tl.load(Sin + pos_t * ssn + cols, mask=cm, other=0).to(tl.float32)
                 rq1 = _rnd(_rnd(q1 * c, RND) - _rnd(q2 * s, RND), RND)
                 rq2 = _rnd(_rnd(q2 * c, RND) + _rnd(q1 * s, RND), RND)
             else:
                 rq1, rq2 = q1, q2
             qrp = Qrot + b * sqrb + h * sqrh + cols
-            tl.store(qrp, rq1.to(Qrot.dtype.element_ty))
-            tl.store(qrp + HALF, rq2.to(Qrot.dtype.element_ty))
+            tl.store(qrp, rq1.to(Qrot.dtype.element_ty), mask=cm)
+            tl.store(qrp + HALF, rq2.to(Qrot.dtype.element_ty), mask=cm)
 
         rows = pid_n * BN + tl.arange(0, BN)
         m = rows < Lw
@@ -242,43 +244,43 @@ if triton is not None:
         is_cur = (w_idx == pos_t)[:, None]
 
         kbp_w = Kbuf + b * skbb + h * skbh + w_idx[:, None] * skbn + cols[None, :]
-        kw1 = tl.load(kbp_w, mask=m[:, None], other=0.0)
-        kw2 = tl.load(kbp_w + HALF, mask=m[:, None], other=0.0)
+        kw1 = tl.load(kbp_w, mask=(m[:, None] & cm[None, :]), other=0.0)
+        kw2 = tl.load(kbp_w + HALF, mask=(m[:, None] & cm[None, :]), other=0.0)
         kp0 = K + b * skb + h * skh + cols[None, :]
-        k1_cur = tl.load(kp0)
-        k2_cur = tl.load(kp0 + HALF)
+        k1_cur = tl.load(kp0, mask=cm[None, :], other=0)
+        k2_cur = tl.load(kp0 + HALF, mask=cm[None, :], other=0)
         kw1 = tl.where(is_cur, k1_cur, kw1).to(tl.float32)
         kw2 = tl.where(is_cur, k2_cur, kw2).to(tl.float32)
 
         if USE_ROPE:
             r_idx = (pos_t - (Lw - 1)) + rows
-            c = tl.load(Cos + r_idx[:, None] * scn + cols[None, :], mask=m[:, None], other=0.0).to(tl.float32)
-            s = tl.load(Sin + r_idx[:, None] * ssn + cols[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+            c = tl.load(Cos + r_idx[:, None] * scn + cols[None, :], mask=(m[:, None] & cm[None, :]), other=0.0).to(tl.float32)
+            s = tl.load(Sin + r_idx[:, None] * ssn + cols[None, :], mask=(m[:, None] & cm[None, :]), other=0.0).to(tl.float32)
             rkw1 = _rnd(_rnd(kw1 * c, RND) - _rnd(kw2 * s, RND), RND)
             rkw2 = _rnd(_rnd(kw2 * c, RND) + _rnd(kw1 * s, RND), RND)
         else:
             rkw1, rkw2 = kw1, kw2
         kw_out_p = KwOut + b * skwb + h * skwh + rows[:, None] * skwl + cols[None, :]
-        tl.store(kw_out_p, rkw1.to(KwOut.dtype.element_ty), mask=m[:, None])
-        tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=m[:, None])
+        tl.store(kw_out_p, rkw1.to(KwOut.dtype.element_ty), mask=(m[:, None] & cm[None, :]))
+        tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=(m[:, None] & cm[None, :]))
 
         vbp_w = Vbuf + b * svbb + h * svbh + w_idx[:, None] * svbn + cols[None, :]
-        vw1 = tl.load(vbp_w, mask=m[:, None], other=0.0)
-        vw2 = tl.load(vbp_w + HALF, mask=m[:, None], other=0.0)
+        vw1 = tl.load(vbp_w, mask=(m[:, None] & cm[None, :]), other=0.0)
+        vw2 = tl.load(vbp_w + HALF, mask=(m[:, None] & cm[None, :]), other=0.0)
         vp0 = V + b * svb + h * svh + cols[None, :]
-        v1_cur = tl.load(vp0)
-        v2_cur = tl.load(vp0 + HALF)
+        v1_cur = tl.load(vp0, mask=cm[None, :], other=0)
+        v2_cur = tl.load(vp0 + HALF, mask=cm[None, :], other=0)
         vw1 = tl.where(is_cur, v1_cur, vw1)
         vw2 = tl.where(is_cur, v2_cur, vw2)
         vw_out_p = VwOut + b * svwb + h * svwh + rows[:, None] * svwl + cols[None, :]
-        tl.store(vw_out_p, vw1, mask=m[:, None])
-        tl.store(vw_out_p + HALF, vw2, mask=m[:, None])
+        tl.store(vw_out_p, vw1, mask=(m[:, None] & cm[None, :]))
+        tl.store(vw_out_p + HALF, vw2, mask=(m[:, None] & cm[None, :]))
 
     @triton.jit
     def _sr_kv_rope_int8_kernel(
         Q, K, V, QK, SK, HOTK, QV, SV, HOTV, NQ, Cos, Sin, PosT, WinIdx, CSLOT,
         Qrot, KwOut, VwOut,
-        Lw, S, H: tl.constexpr, HALF: tl.constexpr,
+        Lw, S, H: tl.constexpr, HALF: tl.constexpr, BLOCK_HALF: tl.constexpr,
         sqb, sqh, skb, skh, svb, svh,
         sqkb, sqkh, sqkn, sskb, sskh, shkb, shkh, shkn,
         sqvb, sqvh, sqvn, ssvb, ssvh, shvb, shvh, shvn,
@@ -295,7 +297,8 @@ if triton is not None:
         bh = tl.program_id(1)
         b = bh // H
         h = bh - b * H
-        cols = tl.arange(0, HALF)
+        cols = tl.arange(0, BLOCK_HALF)
+        cm = cols < HALF
         pos_t = tl.load(PosT)
         nq = tl.load(NQ)
         if SLOTS:
@@ -310,32 +313,32 @@ if triton is not None:
         if pid_n == 0:
             hi_cur = pos_t - nq
             kp = K + b * skb + h * skh + cols
-            k1 = tl.load(kp)
-            k2 = tl.load(kp + HALF)
+            k1 = tl.load(kp, mask=cm, other=0)
+            k2 = tl.load(kp + HALF, mask=cm, other=0)
             kbp = HOTK + b * shkb + h * shkh + hi_cur * shkn + cols
-            tl.store(kbp, k1)
-            tl.store(kbp + HALF, k2)
+            tl.store(kbp, k1, mask=cm)
+            tl.store(kbp + HALF, k2, mask=cm)
 
             vp = V + b * svb + h * svh + cols
-            v1 = tl.load(vp)
-            v2 = tl.load(vp + HALF)
+            v1 = tl.load(vp, mask=cm, other=0)
+            v2 = tl.load(vp + HALF, mask=cm, other=0)
             vbp = HOTV + b * shvb + h * shvh + hi_cur * shvn + cols
-            tl.store(vbp, v1)
-            tl.store(vbp + HALF, v2)
+            tl.store(vbp, v1, mask=cm)
+            tl.store(vbp + HALF, v2, mask=cm)
 
             qp = Q + b * sqb + h * sqh + cols
-            q1 = tl.load(qp).to(tl.float32)
-            q2 = tl.load(qp + HALF).to(tl.float32)
+            q1 = tl.load(qp, mask=cm, other=0).to(tl.float32)
+            q2 = tl.load(qp + HALF, mask=cm, other=0).to(tl.float32)
             if USE_ROPE:
-                c = tl.load(Cos + pos_t * scn + cols).to(tl.float32)
-                s = tl.load(Sin + pos_t * ssn + cols).to(tl.float32)
+                c = tl.load(Cos + pos_t * scn + cols, mask=cm, other=0).to(tl.float32)
+                s = tl.load(Sin + pos_t * ssn + cols, mask=cm, other=0).to(tl.float32)
                 rq1 = _rnd(_rnd(q1 * c, RND) - _rnd(q2 * s, RND), RND)
                 rq2 = _rnd(_rnd(q2 * c, RND) + _rnd(q1 * s, RND), RND)
             else:
                 rq1, rq2 = q1, q2
             qrp = Qrot + b * sqrb + h * sqrh + cols
-            tl.store(qrp, rq1.to(Qrot.dtype.element_ty))
-            tl.store(qrp + HALF, rq2.to(Qrot.dtype.element_ty))
+            tl.store(qrp, rq1.to(Qrot.dtype.element_ty), mask=cm)
+            tl.store(qrp + HALF, rq2.to(Qrot.dtype.element_ty), mask=cm)
 
         rows = pid_n * BN + tl.arange(0, BN)
         m = rows < Lw
@@ -353,49 +356,49 @@ if triton is not None:
         mq = m & (w_idx < nq)
 
         kq1 = tl.load(QK + b * sqkb + h * sqkh + prow[:, None] * sqkn + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
+                      mask=(m[:, None] & cm[None, :]), other=0).to(tl.float32)
         kq2 = tl.load(QK + b * sqkb + h * sqkh + prow[:, None] * sqkn + HALF + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
+                      mask=(m[:, None] & cm[None, :]), other=0).to(tl.float32)
         ksc = tl.load(SK + b * sskb + h * sskh + pcell, mask=mq, other=0.0).to(tl.float32)[:, None]
         kh1 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + cols[None, :],
-                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+                      mask=(m[:, None] & is_hot & cm[None, :]), other=0.0).to(tl.float32)
         kh2 = tl.load(HOTK + b * shkb + h * shkh + hot_i * shkn + HALF + cols[None, :],
-                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+                      mask=(m[:, None] & is_hot & cm[None, :]), other=0.0).to(tl.float32)
         kp0 = K + b * skb + h * skh + cols[None, :]
-        k1_cur = tl.load(kp0).to(tl.float32)
-        k2_cur = tl.load(kp0 + HALF).to(tl.float32)
+        k1_cur = tl.load(kp0, mask=cm[None, :], other=0).to(tl.float32)
+        k2_cur = tl.load(kp0 + HALF, mask=cm[None, :], other=0).to(tl.float32)
         kw1 = tl.where(is_cur, k1_cur, tl.where(is_hot, kh1, kq1 * ksc))
         kw2 = tl.where(is_cur, k2_cur, tl.where(is_hot, kh2, kq2 * ksc))
 
         if USE_ROPE:
             r_idx = (pos_t - (Lw - 1)) + rows
-            c = tl.load(Cos + r_idx[:, None] * scn + cols[None, :], mask=m[:, None], other=0.0).to(tl.float32)
-            s = tl.load(Sin + r_idx[:, None] * ssn + cols[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+            c = tl.load(Cos + r_idx[:, None] * scn + cols[None, :], mask=(m[:, None] & cm[None, :]), other=0.0).to(tl.float32)
+            s = tl.load(Sin + r_idx[:, None] * ssn + cols[None, :], mask=(m[:, None] & cm[None, :]), other=0.0).to(tl.float32)
             rkw1 = _rnd(_rnd(kw1 * c, RND) - _rnd(kw2 * s, RND), RND)
             rkw2 = _rnd(_rnd(kw2 * c, RND) + _rnd(kw1 * s, RND), RND)
         else:
             rkw1, rkw2 = kw1, kw2
         kw_out_p = KwOut + b * skwb + h * skwh + rows[:, None] * skwl + cols[None, :]
-        tl.store(kw_out_p, rkw1.to(KwOut.dtype.element_ty), mask=m[:, None])
-        tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=m[:, None])
+        tl.store(kw_out_p, rkw1.to(KwOut.dtype.element_ty), mask=(m[:, None] & cm[None, :]))
+        tl.store(kw_out_p + HALF, rkw2.to(KwOut.dtype.element_ty), mask=(m[:, None] & cm[None, :]))
 
         vq1 = tl.load(QV + b * sqvb + h * sqvh + prow[:, None] * sqvn + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
+                      mask=(m[:, None] & cm[None, :]), other=0).to(tl.float32)
         vq2 = tl.load(QV + b * sqvb + h * sqvh + prow[:, None] * sqvn + HALF + cols[None, :],
-                      mask=m[:, None], other=0).to(tl.float32)
+                      mask=(m[:, None] & cm[None, :]), other=0).to(tl.float32)
         vsc = tl.load(SV + b * ssvb + h * ssvh + pcell, mask=mq, other=0.0).to(tl.float32)[:, None]
         vh1 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + cols[None, :],
-                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+                      mask=(m[:, None] & is_hot & cm[None, :]), other=0.0).to(tl.float32)
         vh2 = tl.load(HOTV + b * shvb + h * shvh + hot_i * shvn + HALF + cols[None, :],
-                      mask=(m[:, None] & is_hot), other=0.0).to(tl.float32)
+                      mask=(m[:, None] & is_hot & cm[None, :]), other=0.0).to(tl.float32)
         vp0 = V + b * svb + h * svh + cols[None, :]
-        v1_cur = tl.load(vp0).to(tl.float32)
-        v2_cur = tl.load(vp0 + HALF).to(tl.float32)
+        v1_cur = tl.load(vp0, mask=cm[None, :], other=0).to(tl.float32)
+        v2_cur = tl.load(vp0 + HALF, mask=cm[None, :], other=0).to(tl.float32)
         vw1 = tl.where(is_cur, v1_cur, tl.where(is_hot, vh1, vq1 * vsc))
         vw2 = tl.where(is_cur, v2_cur, tl.where(is_hot, vh2, vq2 * vsc))
         vw_out_p = VwOut + b * svwb + h * svwh + rows[:, None] * svwl + cols[None, :]
-        tl.store(vw_out_p, vw1.to(VwOut.dtype.element_ty), mask=m[:, None])
-        tl.store(vw_out_p + HALF, vw2.to(VwOut.dtype.element_ty), mask=m[:, None])
+        tl.store(vw_out_p, vw1.to(VwOut.dtype.element_ty), mask=(m[:, None] & cm[None, :]))
+        tl.store(vw_out_p + HALF, vw2.to(VwOut.dtype.element_ty), mask=(m[:, None] & cm[None, :]))
 
     @triton.jit
     def _sr_softmax_cast_kernel(
@@ -1071,7 +1074,7 @@ def sr_decode_ok(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, kbuf: torch.
     B, H, N, D = Q.shape
     Lw = win_idx.numel()
     half = D // 2
-    if not (N == 1 and B * H > 0 and 1 <= Lw <= 1024 and D % 2 == 0 and half >= 16 and (half & (half - 1)) == 0):
+    if not (N == 1 and B * H > 0 and 1 <= Lw <= 1024 and D % 2 == 0 and half >= 16 and (half == 48 or (half & (half - 1)) == 0)):
         return False
     if not (Q.stride(-1) == 1 and K.stride(-1) == 1 and V.stride(-1) == 1
             and kbuf.stride(-1) == 1 and vbuf.stride(-1) == 1 and win_idx.is_contiguous() and win_pos.is_contiguous()):
@@ -1104,7 +1107,7 @@ def sr_decode_fused(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, kbuf: tor
     _sr_kv_rope_kernel[grid](
         Q, K, V, kbuf, vbuf, cos_t, sin_t, pos_t, win_idx,
         Qrot, Kw, Vw,
-        Lw, H=H, HALF=D // 2,
+        Lw, H=H, HALF=D // 2, BLOCK_HALF=triton.next_power_of_2(D // 2),
         sqb=Q.stride(0), sqh=Q.stride(1), skb=K.stride(0), skh=K.stride(1), svb=V.stride(0), svh=V.stride(1),
         skbb=kbuf.stride(0), skbh=kbuf.stride(1), skbn=kbuf.stride(2),
         svbb=vbuf.stride(0), svbh=vbuf.stride(1), svbn=vbuf.stride(2),
@@ -1139,7 +1142,7 @@ def sr_decode_int8_ok(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: tor
     B, H, N, D = Q.shape
     Lw = win_idx.numel()
     half = D // 2
-    if not (N == 1 and B * H > 0 and 1 <= Lw <= 1024 and D % 2 == 0 and half >= 16 and (half & (half - 1)) == 0):
+    if not (N == 1 and B * H > 0 and 1 <= Lw <= 1024 and D % 2 == 0 and half >= 16 and (half == 48 or (half & (half - 1)) == 0)):
         return False
     if not (Q.stride(-1) == 1 and K.stride(-1) == 1 and V.stride(-1) == 1
             and qk.stride(-1) == 1 and hotk.stride(-1) == 1 and qv.stride(-1) == 1 and hotv.stride(-1) == 1
@@ -1182,7 +1185,7 @@ def sr_decode_fused_int8(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, qk: 
         Q, K, V, qk, sk, hotk, qv, sv, hotv, nq_t, cos_t, sin_t, pos_t, win_idx,
         slots if slots is not None else nq_t,
         Qrot, Kw, Vw,
-        Lw, s, H=H, HALF=D // 2,
+        Lw, s, H=H, HALF=D // 2, BLOCK_HALF=triton.next_power_of_2(D // 2),
         sqb=Q.stride(0), sqh=Q.stride(1), skb=K.stride(0), skh=K.stride(1), svb=V.stride(0), svh=V.stride(1),
         sqkb=qk.stride(0), sqkh=qk.stride(1), sqkn=qk.stride(2),
         sskb=sk.stride(0), sskh=sk.stride(1),

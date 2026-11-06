@@ -312,7 +312,8 @@ def test_fsb_reference_readout_capture_guard(monkeypatch):
 
 @gpu
 @torch.no_grad()
-def test_fsb_int8_graphed_decode_fp32_lr_norm_across_blocks(monkeypatch):
+@pytest.mark.parametrize("head_dim", [64, 96])
+def test_fsb_int8_graphed_decode_fp32_lr_norm_across_blocks(monkeypatch, head_dim):
     # the RULER fingerprint: fp32 norms + int8 KV + decode graph replayed past the captured length.
     # Before the fix this crashed at the first replay whose selection crossed the captured n.
     from pathlib import Path
@@ -325,7 +326,7 @@ def test_fsb_int8_graphed_decode_fp32_lr_norm_across_blocks(monkeypatch):
     kw = be.serve_kwargs("fsb", 0.5)
     torch.manual_seed(41)
     L = 1024
-    m = FreeSoloLM(vocab_size=512, d_model=256, n_layers=2, n_heads=4, d_ff=512, max_seq_len=L + 512,
+    m = FreeSoloLM(vocab_size=512, d_model=4 * head_dim, n_layers=2, n_heads=4, d_ff=512, max_seq_len=L + 512,
                    attn_type="fsattn", **kw).cuda().to(torch.bfloat16).eval()
     for blk in m.blocks:
         blk.attn.fsattn.lr_norm.scale.data = blk.attn.fsattn.lr_norm.scale.data.float()
@@ -356,7 +357,8 @@ def test_fsb_int8_graphed_decode_fp32_lr_norm_across_blocks(monkeypatch):
 @gpu
 @torch.no_grad()
 @pytest.mark.parametrize("serve", ["sparse", "dense"])
-def test_fsl_fs_int8_graphed_decode_across_blocks(monkeypatch, serve):
+@pytest.mark.parametrize("head_dim", [64, 96])
+def test_fsl_fs_int8_graphed_decode_across_blocks(monkeypatch, serve, head_dim):
     # the FS-L / base-FS long-range decode on the int8 store: the fused lr_comb_int8 kernel must match
     # the bf16 graph decode over teacher-forced steps that cross a query-block boundary
     from pathlib import Path
@@ -372,7 +374,7 @@ def test_fsl_fs_int8_graphed_decode_across_blocks(monkeypatch, serve):
     kw = be.serve_kwargs(serve, 0.5)
     torch.manual_seed(52)
     L = 1024
-    m = FreeSoloLM(vocab_size=512, d_model=256, n_layers=2, n_heads=4, d_ff=512, max_seq_len=L + 512,
+    m = FreeSoloLM(vocab_size=512, d_model=4 * head_dim, n_layers=2, n_heads=4, d_ff=512, max_seq_len=L + 512,
                    attn_type="fsattn", **kw).cuda().to(torch.bfloat16).eval()
     for blk in m.blocks:
         blk.attn.fsattn.lr_norm.scale.data = blk.attn.fsattn.lr_norm.scale.data.float()

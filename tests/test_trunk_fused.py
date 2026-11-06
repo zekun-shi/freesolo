@@ -263,11 +263,12 @@ def test_one_row_rms_norm_cast_matches_eager(monkeypatch, D, rows, out_dt):
 @pytest.mark.parametrize("use_rope", [False, True])
 @pytest.mark.parametrize("uniform", [False, True])
 @pytest.mark.parametrize("Lw", [65, 513])
+@pytest.mark.parametrize("D", [64, 96])
 @torch.no_grad()
-def test_sr_decode_fused_matches_eager(monkeypatch, use_rope, uniform, Lw):
+def test_sr_decode_fused_matches_eager(monkeypatch, use_rope, uniform, Lw, D):
     from src.fsattn.attention import FSAttn
     torch.manual_seed(17 + Lw + int(use_rope) * 3 + int(uniform) * 7)
-    H, D = 8, 64
+    H = 8
     W = Lw - 1
     attn = FSAttn(d_model=H * D, n_heads=H, window_size=W, causal=True, use_rope=use_rope,
                   rope_long_range=False, fs_uniform_sr=uniform, max_seq_len=2048,
@@ -287,6 +288,8 @@ def test_sr_decode_fused_matches_eager(monkeypatch, use_rope, uniform, Lw):
     buf = {"pos_t": pos_t, "win_idx": win_idx, "win_pos": win_pos}
     sigma = attn.sigma
     with torch.autocast("cuda", dtype=torch.bfloat16):
+        assert tt.sr_decode_ok(Q, K, V, kbuf_got, vbuf_got, win_idx, win_pos,
+                               attn.rope.cos_cached if use_rope else None)
         got = attn._sr_kv_and_decode(Q, K, V, kbuf_got, vbuf_got, buf, sigma)
         monkeypatch.setenv("FSL_SR_DECODE_FUSED", "0")
         ref = attn._sr_kv_and_decode(Q, K, V, kbuf_ref, vbuf_ref, buf, sigma)
