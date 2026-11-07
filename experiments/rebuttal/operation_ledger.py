@@ -203,7 +203,7 @@ class OperationLedger(TorchDispatchMode):
         self.patches.append((obj,name,original))
         setattr(obj,name,call)
 
-    def install_bounded_kernels(self):
+    def install_bounded_kernels(self, *, include_readout=True):
         from src.utils import trunk_triton as tt
         from src.fsattn import cell_select_triton as ct
 
@@ -235,7 +235,8 @@ class OperationLedger(TorchDispatchMode):
 
         self._patch(tt,'rms_norm_cast',norm)
         self._patch(tt,'silu_mul',silu)
-        self._patch(ct,'indexed_cell_attention',read)
+        if include_readout:
+            self._patch(ct,'indexed_cell_attention',read)
 
     def attach_model(self, model):
         # FSAttn.forward is used by bounded prefill. Graph bodies call explicit
