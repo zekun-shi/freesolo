@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -63,3 +64,38 @@ def test_changed_batches_and_attention_are_rejected(tmp_path):
 def test_invalid_stopping_step(start, end):
     with pytest.raises(ValueError, match="schedule horizon"):
         stopping_step(28000, end, start)
+
+
+def legacy_checkpoint(tmp_path):
+    folder, args, cfg = checkpoint(tmp_path)
+    saved = json.loads((folder / "run_config.json").read_text())
+    saved["world_size"] = 8
+    saved["args"].update(rebuttal_data_plan=None, grad_accum_steps=8)
+    saved["args"].pop("disable_cudnn_sdpa")
+    (folder / "run_config.json").write_text(json.dumps(saved))
+    plan = dict(schema="freesolo_matched_batches/1", seq_len=4096,
+                corpus_sha256="source", seed=42, steps=28000,
+                reference_world=8, reference_batch=2, reference_workers=2,
+                reference_accumulation=8)
+    Path(args.rebuttal_data_plan).write_text(json.dumps(plan))
+    args.grad_accum_steps = 4
+    return folder, args, cfg, plan
+
+
+def test_legacy_eight_gpu_stream_can_resume_on_sixteen(tmp_path):
+    folder, args, cfg, _ = legacy_checkpoint(tmp_path)
+    result = validate_fixed_resume(folder, args, cfg, {"lr_dense_control": True}, 16)
+    assert result["legacy_stream_bridge"] is True
+    assert result["sequences_per_update"] == 128
+    assert result["previous_world"] == 8 and result["world"] == 16
+
+
+@pytest.mark.parametrize("key,value", [("seed", 43), ("corpus_sha256", "wrong"),
+    ("reference_world", 16), ("reference_batch", 1), ("reference_workers", 1),
+    ("reference_accumulation", 4), ("seq_len", 2048), ("steps", 1002)])
+def test_legacy_bridge_rejects_a_different_stream(tmp_path, key, value):
+    folder, args, cfg, plan = legacy_checkpoint(tmp_path)
+    plan[key] = value
+    Path(args.rebuttal_data_plan).write_text(json.dumps(plan))
+    with pytest.raises(ValueError, match="Legacy checkpoint"):
+        validate_fixed_resume(folder, args, cfg, {"lr_dense_control": True}, 16)
