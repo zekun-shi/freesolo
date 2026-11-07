@@ -109,7 +109,7 @@ def test_pair_counts_match_executed_control_attention_calls(monkeypatch):
             attn(x)
         assert sum(recorded) == attention_work(mode, 17, geometry=g)['valid_token_pairs']
     dense = FSAttn(8, 2, window_size=4, use_rope=True, rope_long_range=False,
-                  max_seq_len=32, fs_uniform_sr=True, cell_stride=2,
+                  max_seq_len=32, causal=True, fs_uniform_sr=True, cell_stride=2,
                   sel_strict_causal=1, cell_prune_kernel=0, lr_dense_control=True)
     dense._cell_block = 8
     for offset, count in [(0, 17), (8, 1), (9, 7)]:
