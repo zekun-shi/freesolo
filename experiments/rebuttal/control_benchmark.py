@@ -86,8 +86,10 @@ def main():
     else:
         attn_type, kwargs = 'fsattn', serve_kwargs('dense')
         kwargs.update(lr_dense_control=args.arm=='dense_lr', fs_fused_attn=1)
+    # Released safetensors omit the output-head alias tied to tok_emb.weight.
+    # load_model's check_params_loaded still rejects every unloaded independent parameter.
     model = load_model(str(args.checkpoint), config='340m', attn_type=attn_type,
-                       max_seq_len=4096, strict=True, device='cuda', **kwargs).eval()
+                       max_seq_len=4096, strict=False, device='cuda', **kwargs).eval()
     # Keep positional buffers in fp32, as in the released evaluator.
     for parameter in model.parameters():
         parameter.data = parameter.data.to(torch.bfloat16)
