@@ -52,10 +52,12 @@ def test_rounding_and_index_shifts_are_separate_from_flops():
     with OperationLedger() as ledger:
         rounded = x.floor()
         shifted = rounded.to(torch.int64) << 2
+        shifted_tensor = torch.bitwise_left_shift(rounded.to(torch.int64), torch.tensor([2,2,2]))
     assert shifted.tolist() == [-8, 0, 12]
+    assert torch.equal(shifted, shifted_tensor)
     counts = ledger.report()['total']
     assert counts.get('flops', 0) == 0
-    assert counts['floor'] == counts['integer_arithmetic'] == 3
+    assert counts['floor'] == 3 and counts['integer_arithmetic'] == 6
     assert not ledger.unknown
 
 

@@ -112,7 +112,7 @@ class OperationLedger(TorchDispatchMode):
                 self.add(copy_output_bytes=sum(t.numel()*t.element_size() for t in outs))
         elif name in self.COMPARE:
             self.add(predicate_outputs=n)
-        elif name in {'bitwise_left_shift', 'bitwise_right_shift'}:
+        elif name in {'bitwise_left_shift', 'bitwise_right_shift', '__lshift__', '__rshift__'}:
             self.add(integer_arithmetic=n)
         elif name in {'mm', 'bmm', 'matmul', 'dot', 'mv'}:
             self.add(flops=matmul_flops(args[0].shape, args[1].shape), matmul_calls=1)
