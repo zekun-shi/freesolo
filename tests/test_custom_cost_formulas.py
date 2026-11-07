@@ -3,7 +3,8 @@ from collections import Counter
 import math
 
 from experiments.rebuttal.custom_cost_formulas import (
-    cell_statistics, fused_prefill_readout, quantize_cells,
+    cell_statistics, fused_prefill_readout, quantize_cells, short_decode_int8,
+    streaming_decode_readout_int8, flat_decode_readout_int8,
 )
 
 
@@ -101,3 +102,78 @@ def test_fused_readout_matches_explicit_online_softmax_and_norm():
             combined=[Scalar(0.2)+x*0.8 for x in normalized]
             assert all(math.isfinite(x.value) for x in combined)
     assert dict(Scalar.counts)==fused_prefill_readout(3,4,group,size,width)
+
+
+def norm(values):
+    mean_square=reduction([x*x for x in values])*(1/len(values))
+    inv_rms=(mean_square+1e-8).special('rsqrt',lambda x:1/math.sqrt(x))
+    return [(x*inv_rms)*0.9 for x in values]
+
+
+def rotate(values):
+    half=len(values)//2
+    left=[values[i]*0.9-values[i+half]*0.1 for i in range(half)]
+    right=[values[i+half]*0.9+values[i]*0.1 for i in range(half)]
+    return left+right
+
+
+def test_local_decode_matches_dequantize_rotate_gemm_and_softmax():
+    rows,window,width=2,3,4
+    Scalar.counts.clear()
+    for _ in range(rows):
+        q=rotate([Scalar(0.1+d) for d in range(width)])
+        keys=[rotate([Scalar(1+s+d)*0.1 for d in range(width)]) for s in range(window)]
+        values=[[Scalar(2+s+d)*0.1 for d in range(width)] for s in range(window)]
+        scores=[matrix_dot(q,k) for k in keys]
+        scores=[score*0.5 for score in scores]
+        for s in range(window):
+            assert (abs(Scalar(window-1)-Scalar(s))>window) is False
+        maximum=max(scores)
+        weights=[(score-maximum).special('exp',math.exp) for score in scores]
+        denominator=reduction(weights)
+        weights=[x/denominator for x in weights]
+        out=[matrix_dot(weights,list(column)) for column in zip(*values)]
+        assert all(math.isfinite(x.value) for x in out)
+    assert dict(Scalar.counts)==short_decode_int8(rows,window,width)
+
+
+def test_streaming_decode_counts_explicit_reductions_and_online_rescaling():
+    rows,cells,size,width=2,2,3,4
+    Scalar.counts.clear()
+    for row in range(rows):
+        q=[Scalar(0.05*(1+row+d)) for d in range(width)]
+        acc=[Scalar(0) for _ in range(width)]
+        denominator=Scalar(0)
+        maximum=Scalar(-math.inf)
+        for cell in range(cells):
+            keys=[[Scalar(1+cell+s+d)*0.1 for d in range(width)] for s in range(size)]
+            values=[[Scalar(2+cell+s+d)*0.1 for d in range(width)] for s in range(size)]
+            scores=[reduction([a*b for a,b in zip(q,k)])*0.5 for k in keys]
+            new_max=max(maximum,max(scores))
+            alpha=(maximum-new_max).special('exp',math.exp)
+            weights=[(score-new_max).special('exp',math.exp) for score in scores]
+            denominator=denominator*alpha+reduction(weights)
+            acc=[old*alpha+reduction([a*b for a,b in zip(weights,column)])
+                 for old,column in zip(acc,zip(*values))]
+            maximum=new_max
+        assert denominator>0
+        out=[x*0.8 for x in norm([x/denominator for x in acc])]
+        assert all(math.isfinite(x.value) for x in out)
+    assert dict(Scalar.counts)==streaming_decode_readout_int8(rows,cells,size,width)
+
+
+def test_flat_decode_counts_one_softmax_over_all_selected_cells():
+    rows,cells,size,width=2,2,3,4
+    Scalar.counts.clear()
+    for row in range(rows):
+        q=[Scalar(0.05*(1+row+d)) for d in range(width)]
+        keys=[[Scalar(1+s+d)*0.1 for d in range(width)] for s in range(cells*size)]
+        values=[[Scalar(2+s+d)*0.1 for d in range(width)] for s in range(cells*size)]
+        scores=[reduction([a*b for a,b in zip(q,k)])*0.5 for k in keys]
+        maximum=max(scores)
+        weights=[(score-maximum).special('exp',math.exp) for score in scores]
+        denominator=reduction(weights)
+        weights=[x/denominator for x in weights]
+        out=norm([reduction([a*b for a,b in zip(weights,column)]) for column in zip(*values)])
+        assert all(math.isfinite(x.value) for x in out)
+    assert dict(Scalar.counts)==flat_decode_readout_int8(rows,cells,size,width)

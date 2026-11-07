@@ -40,3 +40,44 @@ query_rows includes all heads/layers. Integer union/sorting work is separate.
                       +query_rows*(7*width+1),
                 exp=updates*(size+1),rsqrt=query_rows,
                 fp_comparisons=updates*(size+1)+query_rows)
+
+
+def short_decode_int8(rows, window, width):
+    """Uniform local branch: dequantization, RoPE, two GEMMs and softmax.
+
+    Matches trunk_triton.sr_decode_fused_int8 with use_rope=True and
+    fs_uniform_sr=True. window includes the current token. Nominal logical
+    elements are counted, including the dequantization expression evaluated
+    before selecting hot rows. Integer indexing and copies are separate.
+    """
+    assert rows >= 0 and window > 0 and width > 0 and width % 2 == 0
+    return dict(flops=rows*(9*window*width+3*width+6*window-1),
+                exp=rows*window, fp_comparisons=rows*(2*window-1))
+
+
+def streaming_decode_readout_int8(rows, cells, size, width):
+    """FS/FS-L selected-cell readout, excluding selection and SR addition.
+
+    The _lrc/_fsd_comb_int8 kernels use explicit multiply/reduce expressions,
+    unlike the prefill tensor-core GEMMs. Count each such reduction with n-1
+    additions. Includes online softmax, dequantization, RMS and long scaling.
+    All selected cells must be valid and distinct; rows with empty reads need
+    a separate census. Inputs in the rebuttal grid are beyond the cold prefix.
+    """
+    assert rows >= 0 and min(cells,size,width) > 0
+    return dict(flops=rows*(cells*(6*size*width+2*size+width+2)+6*width+1),
+                exp=rows*cells*(size+1),rsqrt=rows,
+                fp_comparisons=rows*(cells*size+1))
+
+
+def flat_decode_readout_int8(rows, cells, size, width):
+    """FS-B _fsb_decread_int8_kernel with sr=None; no long scaling yet.
+
+    Softmax spans all selected tokens together. The separately observed
+    lr_scale_combine supplies the long scale and SR addition (2*rows*width).
+    """
+    assert rows >= 0 and min(cells,size,width) > 0
+    tokens=cells*size
+    return dict(flops=rows*(6*tokens*width+3*tokens+3*width),
+                exp=rows*tokens,rsqrt=rows,
+                fp_comparisons=rows*(tokens-1))
