@@ -57,6 +57,7 @@ class OperationLedger(TorchDispatchMode):
         'fill_', 'zero_', 'flip', 'constant_pad_nd', 'embedding', 'repeat',
         'repeat_interleave', 'where', 'tril', 'triu', '_local_scalar_dense',
         'is_same_size', 'record_stream', 'is_pinned', 'resize_', 'set_',
+        'promote_types',  # Dtype metadata query; no tensor arithmetic or copy.
     }
     COMPARE = {'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'isfinite', 'isinf', 'isnan',
                'logical_and', 'logical_or', 'logical_not', 'bitwise_and', 'bitwise_or',

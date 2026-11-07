@@ -38,6 +38,15 @@ def test_unknown_arithmetic_prevents_complete_coverage_claim():
     assert not ledger.report()['complete_operator_coverage']
 
 
+def test_dtype_promotion_has_no_tensor_work():
+    with OperationLedger() as ledger:
+        dtype = torch.promote_types(torch.bfloat16, torch.float32)
+    assert dtype == torch.float32
+    assert ledger.ops['aten.promote_types.default'] == 1
+    assert ledger.report()['total'] == {}
+    assert not ledger.unknown
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA indexed attention validation')
 def test_custom_read_counts_valid_unique_causal_cells_and_preserves_output():
     from src.fsattn.cell_select_triton import indexed_cell_attention
