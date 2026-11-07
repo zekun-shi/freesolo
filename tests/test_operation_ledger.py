@@ -47,6 +47,18 @@ def test_dtype_promotion_has_no_tensor_work():
     assert not ledger.unknown
 
 
+def test_rounding_and_index_shifts_are_separate_from_flops():
+    x = torch.tensor([-1.5, 0.25, 3.75])
+    with OperationLedger() as ledger:
+        rounded = x.floor()
+        shifted = rounded.to(torch.int64) << 2
+    assert shifted.tolist() == [-8, 0, 12]
+    counts = ledger.report()['total']
+    assert counts.get('flops', 0) == 0
+    assert counts['floor'] == counts['integer_arithmetic'] == 3
+    assert not ledger.unknown
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA indexed attention validation')
 def test_custom_read_counts_valid_unique_causal_cells_and_preserves_output():
     from src.fsattn.cell_select_triton import indexed_cell_attention

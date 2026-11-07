@@ -112,6 +112,8 @@ class OperationLedger(TorchDispatchMode):
                 self.add(copy_output_bytes=sum(t.numel()*t.element_size() for t in outs))
         elif name in self.COMPARE:
             self.add(predicate_outputs=n)
+        elif name in {'bitwise_left_shift', 'bitwise_right_shift'}:
+            self.add(integer_arithmetic=n)
         elif name in {'mm', 'bmm', 'matmul', 'dot', 'mv'}:
             self.add(flops=matmul_flops(args[0].shape, args[1].shape), matmul_calls=1)
         elif name in {'addmm', 'baddbmm'}:
@@ -138,7 +140,7 @@ class OperationLedger(TorchDispatchMode):
             else:
                 self.add(pow=n)
         elif name in {'sqrt', 'rsqrt', 'exp', 'exp2', 'log', 'log2', 'log1p',
-                      'erf', 'erfc', 'sin', 'cos', 'tanh'}:
+                      'erf', 'erfc', 'sin', 'cos', 'tanh', 'floor', 'ceil', 'round', 'trunc'}:
             self.add(**{name: n})
         elif name in {'sigmoid', 'silu'}:
             self.add(flops=(3 if name == 'sigmoid' else 4)*n, exp=n)
