@@ -183,6 +183,17 @@ def aggregate_common_kernels(phase, *, read_top=4):
         assert work['readout_tile_token_pairs']==work['readout_group_union_cells']*64*size
         add('long_prefill',costs.fused_prefill_readout(
             work['readout_group_union_cells'],readout_rows,64,size,width))
+    for slot in phase.get('slot_store_kernels',[]):
+        assert slot['flags']==[0,0]
+        if slot['method'] in ['prefill','store_cell']:
+            # _fill_slots_kernel evaluates its quantization expressions even
+            # for masked cells, then masks the stores. Count the launched shape.
+            add('slot_quantization',costs.quantize_cells(
+                2*slot['launched_cells'],slot['size'],slot['width']))
+        elif slot['method']=='pool':
+            elements=slot['heads']*slot['candidate_slots']
+            add('slot_pool',dict(flops=4*elements,fp_comparisons=elements))
+        else:raise AssertionError(('unrecognized slot method',slot['method']))
     total=Counter()
     for counts in components.values():total.update(counts)
     return dict(covered_kernel_arithmetic=dict(total),

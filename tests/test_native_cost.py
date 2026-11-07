@@ -1,6 +1,6 @@
 """Guard the census boundary between wrapper calls and actual arithmetic."""
 from experiments.rebuttal.native_cost import aggregate_common_kernels,forest_node_population
-from experiments.rebuttal.custom_cost_formulas import cell_statistics
+from experiments.rebuttal.custom_cost_formulas import cell_statistics,quantize_cells
 
 
 def call(name, inputs, repeats=1):
@@ -62,3 +62,13 @@ def test_tall_proposal_filter_and_subtrees_cover_each_node_once():
     assert forest_node_population(record)=={1<<k:1024>>k for k in range(11)}
     record['new_admitted']=[0]
     assert forest_node_population(record)=={}
+
+
+def test_slot_store_counts_masked_quantization_shape_and_both_kv_tensors():
+    phase=dict(kernel_calls=[],observed_work={},slot_store_kernels=[
+        dict(method='prefill',heads=2,width=64,size=32,flags=[0,0],
+             launched_cells=8,retained_cells=3),
+        dict(method='pool',heads=2,width=64,size=32,flags=[0,0],candidate_slots=72)])
+    got=aggregate_common_kernels(phase)
+    assert got['components']['slot_quantization']==quantize_cells(16,32,64)
+    assert got['components']['slot_pool']==dict(flops=576,fp_comparisons=144)

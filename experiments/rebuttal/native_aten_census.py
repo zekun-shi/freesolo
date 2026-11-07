@@ -33,8 +33,10 @@ class NativeAtenCensus(BaseCensus):
         self.ledger=OperationLedger()
         self.method_patches=[]
         self.spines=[]
+        self.slot_work=[]
 
     def __enter__(self):
+        from src.fsattn.kv_bounded import SlotStore
         self.ledger.install_bounded_kernels(include_readout=False)
         self.ledger.attach_model(active_model)
         self.ledger._patch(native.tt,'rope',lambda x,cos,sin,out_dtype=None:
@@ -49,6 +51,31 @@ class NativeAtenCensus(BaseCensus):
                         return _original(*args,**kwargs)
                 self.method_patches.append((attention,name,original))
                 setattr(attention,name,scoped)
+        for name in ['prefill','store_cell','pool']:
+            original=getattr(SlotStore,name)
+            signature=inspect.signature(original)
+            @functools.wraps(original)
+            def slot_call(store,*args,_original=original,_name=name,_signature=signature,**kwargs):
+                # Keep the original Python arithmetic in the ATen ledger.
+                # Only the opaque kernels below need additional formula work.
+                result=_original(store,*args,**kwargs)
+                with self.ledger.suspend():
+                    values=_signature.bind(store,*args,**kwargs).arguments
+                    record=dict(method=_name,heads=store.B*store.H,width=store.D,size=store.s,
+                        flags=store.flags.tolist())
+                    assert record['flags']==[0,0],record
+                    if _name=='prefill':
+                        cells=values['N']//store.s
+                        record.update(launched_cells=store.B*store.H*cells,
+                            retained_cells=int((store.slot_of[:,:,:cells]>=0).sum().item()))
+                    elif _name=='store_cell':
+                        record.update(launched_cells=store.B*store.H,cell=values['cell'])
+                    else:
+                        record.update(candidate_slots=0 if result.get('empty',True) else result['C'])
+                    self.slot_work.append(record)
+                return result
+            self.method_patches.append((SlotStore,name,original))
+            setattr(SlotStore,name,slot_call)
         self.ledger.__enter__()
         return super().__enter__()
 
@@ -86,7 +113,8 @@ class NativeAtenCensus(BaseCensus):
 
     def report(self):
         result=super().report()
-        result.update(aten_outside_observed_kernels=self.ledger.report(),spine_builds=self.spines)
+        result.update(aten_outside_observed_kernels=self.ledger.report(),spine_builds=self.spines,
+            slot_store_kernels=self.slot_work)
         return result
 
 
