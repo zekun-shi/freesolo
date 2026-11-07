@@ -61,6 +61,20 @@ def test_rounding_and_index_shifts_are_separate_from_flops():
     assert not ledger.unknown
 
 
+def test_reverse_subtraction_distinguishes_floating_and_index_arithmetic():
+    x = torch.tensor([0.25, 0.5, 0.75])
+    indices = torch.tensor([0, 3, 7, 15])
+    with OperationLedger() as ledger:
+        weights = 1 - x
+        reversed_indices = 15 - indices
+    assert weights.tolist() == [0.75, 0.5, 0.25]
+    assert reversed_indices.tolist() == [15, 12, 8, 0]
+    counts = ledger.report()['total']
+    assert counts['flops'] == 3 and counts['integer_arithmetic'] == 4
+    assert ledger.ops['aten.rsub.Scalar'] == 2
+    assert not ledger.unknown
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA indexed attention validation')
 def test_custom_read_counts_valid_unique_causal_cells_and_preserves_output():
     from src.fsattn.cell_select_triton import indexed_cell_attention

@@ -122,7 +122,7 @@ class OperationLedger(TorchDispatchMode):
             self.add(flops=matmul_flops(args[1].shape, args[2].shape)
                 + (n if beta else 0) + (n if beta not in (0, 1) else 0)
                 + (n if alpha != 1 else 0), matmul_calls=1)
-        elif name in {'add', 'add_', 'sub', 'sub_', 'mul', 'mul_', 'div', 'div_',
+        elif name in {'add', 'add_', 'sub', 'sub_', 'rsub', 'mul', 'mul_', 'div', 'div_',
                       'true_divide', 'neg', 'neg_', 'abs', 'abs_', 'reciprocal'}:
             self.add(**{('flops' if floating else 'integer_arithmetic'): n})
         elif name in {'addcmul', 'addcmul_'}:
