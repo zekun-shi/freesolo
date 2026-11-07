@@ -33,6 +33,27 @@ def put(path, data):
     temporary.replace(path)
 
 
+def gpu_process_ids(gpu_uuid):
+    rows = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid,pid',
+                                    '--format=csv,noheader,nounits'], text=True)
+    return [int(row.split(',')[1]) for row in rows.splitlines()
+            if row.split(',')[0].strip() == gpu_uuid]
+
+
+def bind_exclusive_cuda_process(gpu_uuid, initialize_context):
+    # NVML reports host PIDs, which need not equal os.getpid() inside the pod.
+    assert not gpu_process_ids(gpu_uuid), 'GPU already has a compute process'
+    initialize_context()
+    owners = gpu_process_ids(gpu_uuid)
+    assert len(owners) == 1, ('CUDA context must be the sole GPU process', owners)
+    return owners[0]
+
+
+def require_exclusive_gpu(gpu_uuid, owner_pid):
+    actual = gpu_process_ids(gpu_uuid)
+    assert actual == [owner_pid], ('GPU occupancy changed', actual, owner_pid)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, required=True)
@@ -67,12 +88,15 @@ def main():
         '--query-gpu=uuid', '--format=csv,noheader'], text=True).strip()
     assert gpu_uuid.startswith('GPU-') and '\n' not in gpu_uuid
 
+    def initialize_context():
+        marker = torch.empty(1, device='cuda')
+        torch.cuda.synchronize()
+        del marker
+
+    owner_pid = bind_exclusive_cuda_process(gpu_uuid, initialize_context)
+
     def exclusive():
-        rows = subprocess.check_output(['nvidia-smi','--query-compute-apps=gpu_uuid,pid',
-                                        '--format=csv,noheader,nounits'], text=True)
-        foreign = [row for row in rows.splitlines()
-                   if row.split(',')[0].strip()==gpu_uuid and int(row.split(',')[1])!=os.getpid()]
-        assert not foreign, foreign
+        require_exclusive_gpu(gpu_uuid, owner_pid)
 
     exclusive()
     config = MODEL_CONFIGS['340m'].copy()
@@ -150,6 +174,7 @@ def main():
         source_commit=(args.source/'SOURCE_COMMIT').read_text().strip(),
         source_manifest_sha256=sha(args.source/'SOURCE_MANIFEST.json'),helper_sha256=sha(__file__),
         torch=torch.__version__,cuda=torch.version.cuda,hardware=torch.cuda.get_device_name(0),gpu_uuid=gpu_uuid,
+        container_pid=os.getpid(),nvml_compute_pid=owner_pid,
         geometry=config,attn_type=attn_type,attention_kwargs=kwargs,weight_dtype='bfloat16',
         positional_buffers='float32',autocast='bfloat16',decode_mode='ordinary cached; fast attention kernels enabled',
         environment={k:v for k,v in os.environ.items() if k.startswith(('FS_','FSL_','KV_','CUDA_VISIBLE'))},
