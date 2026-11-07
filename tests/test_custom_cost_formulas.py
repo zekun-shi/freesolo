@@ -5,6 +5,7 @@ import math
 from experiments.rebuttal.custom_cost_formulas import (
     cell_statistics, fused_prefill_readout, quantize_cells, short_decode_int8,
     streaming_decode_readout_int8, flat_decode_readout_int8,
+    forest_node, spine_merge,
 )
 
 
@@ -177,3 +178,60 @@ def test_flat_decode_counts_one_softmax_over_all_selected_cells():
         out=norm([reduction([a*b for a,b in zip(weights,column)]) for column in zip(*values)])
         assert all(math.isfinite(x.value) for x in out)
     assert dict(Scalar.counts)==flat_decode_readout_int8(rows,cells,size,width)
+
+
+def unit(values):
+    denominator=max(reduction([x*x for x in values]).special('sqrt',math.sqrt),Scalar(1e-6))
+    return [x/denominator for x in values]
+
+
+def test_forest_node_counts_complete_split_algebra():
+    for rows in [1,2,4,8]:
+        width=3
+        points=[[Scalar(1+r*r+d*0.2*r) for d in range(width)] for r in range(rows)]
+        ceilings=[Scalar(2+r) for r in range(rows)]
+        Scalar.counts.clear()
+        means=[reduction(list(column))/rows for column in zip(*points)]
+        # Quantization itself is a cast, not a floating arithmetic operation.
+        rounded=[Scalar(round(x.value,2)) for x in means]
+        rounding_error=[a-b for a,b in zip(means,rounded)]
+        slack=reduction([x*x for x in rounding_error]).special('sqrt',math.sqrt)
+        if rows==1:
+            radius=Scalar(0)+slack
+            ceiling=max(ceilings[0],Scalar(0))
+        else:
+            centered=[[x-mu for x,mu in zip(point,means)] for point in points]
+            norms=[reduction([x*x for x in point]) for point in centered]
+            radius=max(norms).special('sqrt',math.sqrt)+slack
+            ceiling=max(max(ceilings),Scalar(0))
+            far=max(range(rows),key=lambda i:norms[i])
+            denominator=max(norms[far].special('sqrt',math.sqrt),Scalar(1e-6))
+            direction=[x/denominator for x in centered[far]]
+            for _ in range(2):
+                projection=[reduction([x*v for x,v in zip(point,direction)]) for point in centered]
+                direction=unit([reduction([x*p for x,p in zip(column,projection)])
+                                for column in zip(*centered)])
+            projection=[reduction([x*v for x,v in zip(point,direction)]) for point in centered]
+            Scalar.counts['sort_input_items']+=len(projection)
+        actual=dict(Scalar.counts)
+        actual.setdefault('sort_input_items',0)
+        assert math.isfinite(radius.value+ceiling.value)
+        assert actual==forest_node(rows,width)
+
+
+def test_spine_merge_counts_weighted_mean_and_enclosing_radius():
+    width=4
+    Scalar.counts.clear()
+    na,nb=Scalar(3),Scalar(5)
+    a=[Scalar(i) for i in range(width)]
+    b=[Scalar(2+i) for i in range(width)]
+    total=na+nb
+    mean=[(x*na+y*nb)/total for x,y in zip(a,b)]
+    distances=[]
+    for center in [a,b]:
+        delta=[x-m for x,m in zip(center,mean)]
+        distances.append(reduction([x*x for x in delta]).special('sqrt',math.sqrt))
+    radius=max(Scalar(0.7)+distances[0],Scalar(0.8)+distances[1])
+    ceiling=max(Scalar(3),Scalar(4))
+    assert math.isfinite(radius.value+ceiling.value)
+    assert dict(Scalar.counts)==spine_merge(width)

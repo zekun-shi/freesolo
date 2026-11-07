@@ -1,5 +1,5 @@
 """Guard the census boundary between wrapper calls and actual arithmetic."""
-from experiments.rebuttal.native_cost import aggregate_common_kernels
+from experiments.rebuttal.native_cost import aggregate_common_kernels,forest_node_population
 from experiments.rebuttal.custom_cost_formulas import cell_statistics
 
 
@@ -34,3 +34,31 @@ def test_fsl_readout_does_not_hide_its_unresolved_selection():
     assert got['pending_kernel_components']=={'lr_comb_int8.selection':1}
     assert got['wrappers_not_double_counted']=={'lr_decode_read':1}
     assert not got['complete_kernel_coverage']
+
+
+def test_trimmed_forest_counts_only_complete_visible_chunks():
+    record=dict(kind='build_forests_cuda',capacity=8,admitted=[8,3],
+                selected_chunks=None,prefill_trim=6)
+    assert forest_node_population(record)=={1:15,2:5,4:1}
+    record['selected_chunks']=[[2,[1,None]],[0,[None,2]]]
+    record['prefill_trim']=None
+    assert forest_node_population(record)=={1:5,2:2,4:1}
+
+
+def test_dirty_tasks_skip_incomplete_and_empty_chunks():
+    record=dict(kind='lean_dirty_build_many',admitted=[8,3],tasks=[
+        [0,0,0,3,0,1,0,0,-1,-1],
+        [0,0,1,2,0,1,0,0,-1,-1],
+        [0,0,0,0,0,0,0,0,-1,-1]])
+    assert forest_node_population(record)=={1:8,2:4,4:2,8:1}
+
+
+def test_tall_proposal_filter_and_subtrees_cover_each_node_once():
+    proposals=[[1,0,0,10,0,1,0,0,-1,-1],
+               [2,0,0,10,0,1,1,0,-1,-1],
+               [2,0,0,10,0,1,1,1,-1,-1]]
+    record=dict(kind='lean_dirty_build',admitted=[1024],new_admitted=[4],
+                tasks=[],tall=[proposals,0,1])
+    assert forest_node_population(record)=={1<<k:1024>>k for k in range(11)}
+    record['new_admitted']=[0]
+    assert forest_node_population(record)=={}

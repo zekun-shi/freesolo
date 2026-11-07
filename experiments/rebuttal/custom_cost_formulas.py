@@ -81,3 +81,25 @@ def flat_decode_readout_int8(rows, cells, size, width):
     return dict(flops=rows*(6*tokens*width+3*tokens+3*width),
                 exp=rows*tokens,rsqrt=rows,
                 fp_comparisons=rows*(tokens-1))
+
+
+def forest_node(rows, width):
+    """Logical lean16 node algebra, without padding or redundant warp copies.
+
+    Includes the mean, bf16 rounding slack, radius, farthest-vector start,
+    two power iterations, and final split projection. Dot products expressed
+    as multiply/reduce use n-1 additions. The signed-zero padding machinery
+    and integer split permutation are not floating arithmetic in this model.
+    A leaf stores its mean and rounding slack but performs no split.
+    """
+    assert rows > 0 and rows & (rows-1)==0 and width > 0
+    if rows==1:
+        return dict(flops=4*width,sqrt=1,fp_comparisons=1,sort_input_items=0)
+    return dict(flops=14*rows*width-4*rows+8*width-2,
+                sqrt=5,fp_comparisons=3*rows+1,sort_input_items=rows)
+
+
+def spine_merge(width):
+    """Weighted mean and two enclosing-radius distances for one spine merge."""
+    assert width>0
+    return dict(flops=10*width+1,sqrt=2,fp_comparisons=2)

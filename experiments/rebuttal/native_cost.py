@@ -10,6 +10,102 @@ import math
 from experiments.rebuttal import custom_cost_formulas as costs
 
 
+def forest_node_population(record):
+    """Count valid logical nodes from the captured CUDA build task records.
+
+    Full builds follow spine_chunks; dirty builds follow batch_full and the
+    tall proposal filter. Empty/padded chunks write sentinels and contribute
+    no logical tree nodes. Rebuilds are counted again when executed again.
+    """
+    population=Counter()
+    admitted=record['admitted']
+
+    def tree(height, copies=1):
+        for level in range(height+1):population[1<<level] += copies*(1<<(height-level))
+
+    def tasks(records):
+        for kind,forest,head,height,chunk,count,depth,node,flag,dep in records:
+            assert forest==0 and 0<=head<len(admitted)
+            if kind==0:
+                for h in range(head,head+(max(node,1) if height<=5 else 1)):
+                    for i in range(count):
+                        if (chunk+(i<<depth)+1)*(1<<height)<=admitted[h]:tree(height)
+            elif kind in [1,2]:
+                if (chunk+1)*(1<<height)>admitted[head]:continue
+                if kind==1:
+                    assert 0<=depth<height and 0<=node<(1<<depth)
+                    population[1<<(height-depth)] += 1
+                else:
+                    assert depth==height-9 and 0<=node<(1<<depth)
+                    tree(9)
+            else:raise AssertionError(('unrecognized forest task',kind))
+
+    if record['kind']=='build_forests_cuda':
+        selected=record['selected_chunks']
+        if selected is not None:
+            for height,heads in selected:
+                assert len(heads)==len(admitted)
+                for count,chunk in zip(admitted,heads):
+                    if chunk is not None and (chunk+1)*(1<<height)<=count:tree(height)
+        else:
+            trim=record['prefill_trim']
+            for count in admitted:
+                limit=min(count,record['capacity'])
+                if trim is not None:limit=min(limit,trim)
+                for height in range(record['capacity'].bit_length()):
+                    chunks=limit>>height
+                    if trim is not None:chunks=(chunks+1)//2
+                    tree(height,chunks)
+    else:
+        assert record['kind'] in ['lean_dirty_build','lean_dirty_build_many']
+        tasks(record['tasks'])
+        tall=record.get('tall')
+        if tall is not None:
+            proposals,nkept,_=tall
+            old=[n-added for n,added in zip(admitted,record['new_admitted'])]
+            def held(n,k,j):return bool((n>>k)&1) and ((n>>(k+1))<<1)==j
+            def dirty(k):
+                now=any((n>>k)&1 for n in admitted)
+                was=any((n>>k)&1 for n in old)
+                changed=any(((a>>k)&1)!=((b>>k)&1) or
+                    (((a>>(k+1))<<1) if (a>>k)&1 else 0)!=
+                    (((b>>(k+1))<<1) if (b>>k)&1 else 0)
+                    for a,b in zip(admitted,old))
+                return now and (not was or changed)
+            kept=[]
+            for index,task in enumerate(proposals):
+                _,_,head,k,j,*_=task
+                now,was=held(admitted[head],k,j),held(old[head],k,j)
+                keep=(now and not was) if index<len(proposals)-nkept else (dirty(k) and now and was)
+                if keep:
+                    kept.append(task)
+            tasks(kept)
+    return {size:n for size,n in sorted(population.items()) if n}
+
+
+def forest_algebra(phase):
+    """Logical node/spine algebra; admission and layout overhead remain separate."""
+    total=Counter()
+    nodes=Counter()
+    internal_spine_merges=0
+    for record in phase['forest_builds']:
+        population=forest_node_population(record)
+        nodes.update(population)
+        for size,count in population.items():
+            total.update({k:v*count for k,v in costs.forest_node(size,record['head_dim']).items()})
+        if record['kind'].startswith('lean_dirty_build'):
+            merges=sum(max(0,n.bit_count()-1) for n in record['admitted'])
+            internal_spine_merges += merges
+            total.update({k:v*merges for k,v in costs.spine_merge(record['head_dim']).items()})
+    external_spine_merges=sum(s['merges'] for s in phase.get('spine_builds',[]))
+    if external_spine_merges:
+        assert all(record['head_dim']==64 for record in phase['forest_builds'])
+        total.update({k:v*external_spine_merges for k,v in costs.spine_merge(64).items()})
+    return dict(logical_algebra=dict(total),nodes_by_population=dict(nodes),
+        internal_spine_merges=internal_spine_merges,external_spine_merges=external_spine_merges,
+        scope='Valid logical nodes; padding, integer layout and admission checks are separate')
+
+
 def aggregate_common_kernels(phase, *, read_top=4):
     components = {}
     pending = Counter()
