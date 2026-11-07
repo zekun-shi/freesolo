@@ -9,6 +9,7 @@ import time
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from experiments.rebuttal.matched_data import batch_partition
 from experiments.rebuttal.packet_io import sha256, atomic_json, packet_entries
 
 
@@ -99,9 +100,8 @@ class PacketBatchDataset(Dataset):
             raise ValueError("Packet corpus or sampling plan mismatch")
         self.validation = validation
         self.plan = arrays["validation" if validation else "train"]
-        if self.plan.shape[1] % world_size or not 0 <= rank < world_size:
-            raise ValueError("GPU topology does not divide the global batch")
-        self.per_rank = self.plan.shape[1] // world_size
+        rank, self.per_rank = batch_partition(self.plan.shape[1], rank, world_size,
+                                              validation=validation)
         self.rank, self.seq_len, self.wait_seconds = rank, seq_len, wait_seconds
         self._name, self._tokens = None, None
         self.start_update = 0

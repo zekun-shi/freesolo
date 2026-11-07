@@ -27,7 +27,7 @@ def corpus(tmp_path):
     return path, plan / "manifest.json", packets, digest
 
 
-@pytest.mark.parametrize("world", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("world", [1, 2, 4, 8, 16, 32, 64])
 def test_packets_match_original_corpus_at_every_rank_boundary(corpus, world):
     path, plan, packets, digest = corpus
     for validation in (False, True):

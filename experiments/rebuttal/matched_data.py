@@ -10,6 +10,22 @@ import torch
 from torch.utils.data import Dataset
 
 
+def batch_partition(width, rank, world_size, *, validation=False):
+    """Keep training disjoint; uniformly repeat small validation batches.
+
+    The fixed validation rows contain sixteen examples. Larger worlds assign
+    each example to the same number of ranks, preserving its weight in the
+    distributed mean without changing the frozen validation plan.
+    """
+    if width < 1 or world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("Invalid batch width or GPU rank/topology")
+    if validation and world_size > width and world_size % width == 0:
+        return rank % width, 1
+    if width % world_size:
+        raise ValueError("GPU topology does not divide the fixed global batch")
+    return rank, width // world_size
+
+
 def batch_plan(total_chunks, virtual_world, reference_batch, steps, seed=42):
     """Replay the historical two-worker IterableDataset, including epoch wraps."""
     if virtual_world * reference_batch * 8 != 128:
@@ -78,10 +94,10 @@ class MatchedBatchDataset(Dataset):
         if hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
             raise ValueError("Data-plan hash mismatch")
         self.plan = np.load(path, mmap_mode="r", allow_pickle=False)
-        if self.plan.shape[1] % world_size or not 0 <= rank < world_size:
-            raise ValueError("GPU topology does not divide the fixed global batch")
+        rank, per_rank = batch_partition(self.plan.shape[1], rank, world_size,
+                                         validation=validation)
         self.seq_len, self.rank = seq_len, rank
-        self.per_rank = self.plan.shape[1] // world_size
+        self.per_rank = per_rank
         self.tokens = None
         self.start_update = 0
 
