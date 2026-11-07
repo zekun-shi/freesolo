@@ -106,7 +106,7 @@ def forest_algebra(phase):
         scope='Valid logical nodes; padding, integer layout and admission checks are separate')
 
 
-def aggregate_common_kernels(phase, *, read_top=4):
+def aggregate_common_kernels(phase, *, read_top=4, initial_length=None, steps=None):
     components = {}
     pending = Counter()
     accounted_calls = Counter()
@@ -126,6 +126,25 @@ def aggregate_common_kernels(phase, *, read_top=4):
             b,h,_,d = args['K']['shape']
             assert args['s']==32 and d==64
             add('cell_statistics', costs.cell_statistics(b*h*args['M'],args['s'],d), repeats)
+        elif name in ['fsl_fast_select','fsl_dense_fast_select']:
+            b,h,n,d=args['Q']['shape']
+            assert n==args['N']==args['nb']*args['Bq']
+            assert not args['content_only'] and d==64 and args['s']==32 and args['Bq']==128
+            if name=='fsl_fast_select':
+                amount=costs.pooled_prefill_selection(b*h,args['nb'],args['Bq'],args['s'],d,args['Pk'],args['Wc'])
+            else:
+                amount=costs.dense_prefill_selection(b*h,args['nb'],args['Bq'],args['s'],d)
+            add('prefill_selection',amount,repeats)
+        elif name=='prefix_topp':
+            # CUDA top-P compares sortable integer encodings of ceilings.
+            add('prefix_pruning',dict(radix_input_items=args['BH']*args['M'],
+                prefix_topk_output_items=args['BH']*args['nb']*args['Pk']),repeats)
+        elif name=='fsl_dense_decode_topk':
+            assert initial_length is not None and steps is not None and repeats%steps==0
+            b,h,n,d=args['q_t']['shape']
+            assert n==1 and d==64 and args['cell_size']==32
+            add('dense_decode_selection',costs.dense_decode_selection(
+                b*h*(repeats//steps),initial_length,steps,128,32,d,args['split_m']))
         elif name == 'cache_cell_stats':
             # This wrapper calls the observed cell_stats. Its tensor casts and
             # layout changes add no arithmetic; never count the summaries twice.
@@ -159,7 +178,8 @@ def aggregate_common_kernels(phase, *, read_top=4):
             # Dense FS has an independently observed selection kernel. FS-L
             # performs candidate scoring and top-K inside this function.
             if not args['pool'].get('dense',False):
-                pending['lr_comb_int8.selection'] += repeats
+                add('pooled_decode_selection',costs.pooled_decode_selection(
+                    b*h,args['pool']['C'],d,read_top),repeats)
         elif name == 'decode_readout_fast':
             b,h,n,d=args['q_t']['shape']
             assert n==1 and args['sr'] is None
@@ -209,9 +229,69 @@ def aggregate_row(row):
         phase=row[name]
         aten=phase['aten_outside_observed_kernels']
         assert aten['complete_operator_coverage'] and not aten['unknown_operators']
-        kernels=aggregate_common_kernels(phase)
+        kernels=aggregate_common_kernels(phase,initial_length=row['length'],steps=row['final']['steps'])
+        search=aggregate_forest_search(phase)
+        for function in search['covered_functions']:
+            kernels['pending_kernel_components'].pop(function,None)
+        kernels['complete_kernel_coverage']=not kernels['pending_kernel_components']
         partial=Counter(aten['total']);partial.update(kernels['covered_kernel_arithmetic'])
+        partial.update(search['arithmetic'])
         result['phases'][name]=dict(aten=aten,opaque_kernels=kernels,
+            forest_search=search,
             accounted_arithmetic=dict(partial),
             complete_flop_accounting=kernels['complete_kernel_coverage'])
+    result['counting_convention']=(
+        'FMA=2; explicit reductions use n-1 additions; transcendental and discrete work are separate. '
+        'ATen and dense readout/selection use observed operand shapes. Forest construction/beam scores '
+        'use logical nodes; FS-B reranking uses observed block-union pairs in prefill and all valid '
+        'beam candidates before deduplication in decode, with the complete position formula. '
+        'These are algorithmic FLOP estimates, not CUDA instruction counts. Fixed 341M gate sigma '
+        'and successful fused selection are required; one-time shape-cache construction is excluded.')
     return result
+
+
+def aggregate_forest_search(phase):
+    """Complete the logical forest graph using the retained visit/build records."""
+    calls=phase['kernel_calls']
+    names={c['function'].rsplit('.',1)[-1] for c in calls}
+    beam_names=names & {'forest_beam_pair','forest_beam_fused'}
+    if not beam_names:return dict(arithmetic={},components={},covered_functions=[])
+    work=phase['observed_work']
+    assert phase['forest_builds'] and work['beam_node_visits']>0
+    queries=0
+    for call in calls:
+        name=call['function'].rsplit('.',1)[-1]
+        if name not in beam_names:continue
+        args=call['inputs']
+        assert args['node_score']=='bound' and args['q']['shape'][-1]==64
+        assert args['s']==32 and args['radius_coef']==8.0
+        queries+=math.prod(args['q']['shape'][:-1])*call['calls']*(2 if name=='forest_beam_pair' else 1)
+    forest=forest_algebra(phase)
+    components=dict(forest=forest['logical_algebra'],
+        beam=costs.beam_node_scores(work['beam_node_visits'],queries,64))
+    covered=set(beam_names)
+    covered.update(names & {'build_forests_cuda','lean_dirty_build','lean_dirty_build_many',
+                           'build_spines_fast','spines_tables_cuda'})
+    rerank_names=names & {'union_rerank_rows','union_rerank_fast'}
+    assert len(rerank_names)==1
+    for call in calls:
+        if call['function'].rsplit('.',1)[-1] in rerank_names:
+            assert call['inputs']['score']=='lse_pos' and call['inputs']['s']==32
+    if 'union_rerank_rows' in rerank_names:
+        pairs=work['rerank_block_query_cell_pairs']
+        components['rerank']=costs.candidate_lse_scores(pairs,32,64)
+    else:
+        # The int8 kernel scores each nonnegative slot first. Deduplication
+        # happens in _fsb_selpv_kernel, after all those LSEs are computed.
+        pairs=work['beam_valid_candidates']
+        assert pairs>=work['rerank_query_unique_cells']
+        components['rerank']=costs.candidate_lse_scores(pairs,32,64,int8=True)
+    components['discrete_work']=dict(beam_candidate_slots=work['beam_candidate_slots'],
+        rerank_unique_input_items=work['rerank_query_unique_cells'],
+        rerank_selected_items=work['rerank_read_cells'])
+    covered.update(rerank_names)
+    total=Counter()
+    for value in components.values():total.update(value)
+    return dict(arithmetic=dict(total),components=components,covered_functions=sorted(covered),
+        forest_population=forest,beam_queries=queries,rerank_scored_pairs=pairs,
+        scope='Logical forest algebra and complete positional scoring; SIMD padding and far shortcuts are not hardware counts')

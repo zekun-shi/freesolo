@@ -6,6 +6,9 @@ from experiments.rebuttal.custom_cost_formulas import (
     cell_statistics, fused_prefill_readout, quantize_cells, short_decode_int8,
     streaming_decode_readout_int8, flat_decode_readout_int8,
     forest_node, spine_merge,
+    pooled_decode_selection, beam_node_scores, candidate_lse_scores,
+    dense_prefill_selection, pooled_prefill_selection,
+    dense_decode_selection,
 )
 
 
@@ -235,3 +238,158 @@ def test_spine_merge_counts_weighted_mean_and_enclosing_radius():
     ceiling=max(Scalar(3),Scalar(4))
     assert math.isfinite(radius.value+ceiling.value)
     assert dict(Scalar.counts)==spine_merge(width)
+
+
+def test_pooled_selection_counts_masked_candidate_vector_and_shared_denominator():
+    rows,candidates,width,topk=2,3,64,2
+    Scalar.counts.clear()
+    for _ in range(rows):
+        denominator=Scalar(2)*Scalar(4)
+        for c in range(4):
+            dot=Scalar(0)
+            for t in range(16):
+                terms=[Scalar(0.01*(t+i+1))*Scalar(0.02*(c+i+1)) for i in range(4)]
+                dot=dot+reduction(terms)
+            content=dot*0.125
+            distance=abs(Scalar(100)-Scalar(16+32*c))
+            score=content+(Scalar(0.7)*Scalar(0.9))*(distance/denominator).special('erf',math.erf)
+            assert math.isfinite(score.value)
+    actual=dict(Scalar.counts,topk_input_items=8,topk_passes=rows*topk)
+    assert actual==pooled_decode_selection(rows,candidates,width,topk)
+
+
+def test_beam_score_matches_explicit_bound_expression():
+    visits,queries,width=3,2,4
+    Scalar.counts.clear()
+    for query,nodes in enumerate([1,2]):
+        q=[Scalar(0.1*(query+d+1)) for d in range(width)]
+        qnorm=reduction([x*x for x in q]).special('sqrt',math.sqrt)*8
+        denominator=Scalar(2)*Scalar(4)
+        for node in range(nodes):
+            mu=[Scalar(0.2*(node+d+1)) for d in range(width)]
+            content=reduction([x*y for x,y in zip(q,mu)])*0.125
+            content=content+(qnorm*Scalar(0.3))*0.125
+            center=(Scalar(node)+0.5)*32
+            position=(abs(Scalar(128)-center)/denominator).special('erf',math.erf)
+            score=content+(Scalar(0.7)*Scalar(0.9))*position
+            assert math.isfinite(score.value)
+    assert dict(Scalar.counts,beam_scored_nodes=visits)==beam_node_scores(visits,queries,width)
+
+
+def test_candidate_lse_covers_dequantization_and_duplicate_scoring():
+    pairs,size,width=3,2,4
+    for int8 in [False,True]:
+        Scalar.counts.clear()
+        for pair in range(pairs):
+            q=[Scalar(0.1*(d+1)) for d in range(width)]
+            keys=[[Scalar(0.2*(s+d+1)) for d in range(width)] for s in range(size)]
+            if int8:keys=[[x*0.3 for x in key] for key in keys]
+            if int8:scores=[reduction([x*y for x,y in zip(q,key)])*0.125 for key in keys]
+            else:scores=[matrix_dot(q,key)*0.125 for key in keys]
+            maximum=max(scores)
+            weights=[(x-maximum).special('exp',math.exp) for x in scores]
+            lse=maximum+reduction(weights).special('log',math.log)
+            center=(Scalar(pair%2)+0.5)*32
+            denominator=Scalar(2)*Scalar(4)
+            positional=(abs(Scalar(128)-center)/denominator).special('erf',math.erf)
+            score=lse+(Scalar(0.7)*Scalar(0.9))*positional
+            assert math.isfinite(score.value)
+        assert dict(Scalar.counts)==candidate_lse_scores(pairs,size,width,int8=int8)
+
+
+def test_dense_selection_counts_partial_tiles_and_far_shortcut():
+    heads,blocks,bq,size,width,tile=2,7,2,2,3,4
+    sigma=0.2
+    threshold=3.9194984436035156
+    Scalar.counts.clear()
+    erfs=items=pairs=0
+    for _ in range(heads):
+        for block in range(1,blocks):
+            visible=block*bq//size
+            start=Scalar(block)*bq
+            denominator=Scalar(sigma)+Scalar(sigma)
+            margin=denominator*threshold
+            positions=[Scalar(i)+start for i in range(bq)]
+            for c0 in range(0,visible,tile):
+                nc=min(tile,visible-c0)
+                far=False
+                if nc==tile:
+                    distance=start-(Scalar(c0+tile-1)+0.5)*size
+                    far=distance.value>=margin.value
+                bonus=[];centers=[];near=[]
+                for c in range(nc):
+                    if not far:
+                        center=(Scalar(c0+c)+0.5)*size
+                        distance=start-center
+                        centers.append(center)
+                        near.append(distance.value<margin.value)
+                    bonus.append(Scalar(0.7)*Scalar(0.9))
+                for pos in positions:
+                    for c in range(tile):
+                        score=matrix_dot([Scalar(0.1)]*width,[Scalar(0.2)]*width)*0.5
+                        score=score+(bonus[c] if c<nc else Scalar(0))
+                        pairs+=1;items+=1
+                    if not far:
+                        for c in range(nc):
+                            if near[c]:
+                                term=(abs(pos-centers[c])/denominator).special('erf',math.erf)
+                                score=Scalar(0.1)+bonus[c]*term
+                                erfs+=1;items+=1
+    actual=dict(Scalar.counts,selection_score_items=items,selection_gemm_pairs=pairs)
+    assert actual==dense_prefill_selection(heads,blocks,bq,size,width,sigma=sigma,tile=tile)
+
+
+def test_pooled_prefill_counts_cold_block_and_deduplicated_near_cell():
+    heads,blocks,bq,size,width,pool,recent=1,3,2,2,3,33,2
+    sigma=0.2;candidates=pool+recent
+    Scalar.counts.clear();items=pairs=0
+    for block in range(blocks):
+        visible=block*bq//size
+        start=Scalar(block)*bq
+        denominator=Scalar(sigma)+Scalar(sigma)
+        for c in range(candidates):
+            cand=c if c<pool else visible-1-(c-pool)
+            cc=max(cand,0)
+            if cand>=0:visibility=(Scalar(cc)+1)*size
+            center=(Scalar(cc)+0.5)*size
+            distance=start-center
+            margin=denominator*3.9194984436035156
+            bonus=Scalar(0.7)*Scalar(0.9)
+        for query in range(bq):
+            pos=Scalar(query)+start
+            for c in range(candidates):
+                score=matrix_dot([Scalar(0.1)]*width,[Scalar(0.2)]*width)*0.5
+                score=score+Scalar(0.2)
+                pairs+=1;items+=1
+            # The last visible cell survives once after top-P/recent dedup.
+            if visible:
+                term=(abs(pos-Scalar((visible-0.5)*size))/denominator).special('erf',math.erf)
+                score=Scalar(0.1)+Scalar(0.2)*term
+                items+=1
+    actual=dict(Scalar.counts,selection_score_items=items,selection_gemm_pairs=pairs)
+    assert actual==pooled_prefill_selection(heads,blocks,bq,size,width,pool,recent,sigma=sigma)
+
+
+def test_dense_decode_tracks_block_boundary_visibility_and_erf_shortcut():
+    heads,length,steps,bq,size,width,splits=2,8,5,4,2,4,2
+    sigma=0.2
+    Scalar.counts.clear();cells=0
+    for _ in range(heads):
+        for position in range(length,length+steps):
+            for _split in range(splits):
+                denominator=Scalar(sigma)+Scalar(sigma)
+                margin=denominator*3.9194984436035156
+            for c in range((position//bq)*bq//size):
+                dot=Scalar(0)
+                for t in range(width//4):
+                    terms=[Scalar(0.1)*Scalar(0.2) for _ in range(4)]
+                    dot=dot+reduction(terms)
+                content=dot*0.5
+                center=(Scalar(c)+0.5)*size
+                bonus=Scalar(0.7)*Scalar(0.9)
+                distance=abs(Scalar(position)-center)
+                erf=(distance/denominator).special('erf',math.erf) if distance.value<margin.value else Scalar(1)
+                score=content+bonus*erf
+                cells+=1
+    actual=dict(Scalar.counts,selection_score_items=cells)
+    assert actual==dense_decode_selection(heads,length,steps,bq,size,width,splits,sigma=sigma)

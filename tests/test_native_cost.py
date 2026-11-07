@@ -1,10 +1,40 @@
 """Guard the census boundary between wrapper calls and actual arithmetic."""
-from experiments.rebuttal.native_cost import aggregate_common_kernels,forest_node_population
-from experiments.rebuttal.custom_cost_formulas import cell_statistics,quantize_cells
+from experiments.rebuttal.native_cost import aggregate_common_kernels,forest_node_population,aggregate_forest_search
+from experiments.rebuttal.custom_cost_formulas import cell_statistics,quantize_cells,pooled_decode_selection,candidate_lse_scores
 
 
 def call(name, inputs, repeats=1):
     return dict(function='test.'+name,inputs=inputs,calls=repeats)
+
+
+def test_forest_decode_counts_duplicate_candidates_before_union():
+    phase=dict(kernel_calls=[
+        call('forest_beam_pair',dict(q=dict(shape=[1,2,64]),node_score='bound',s=32,radius_coef=8.0)),
+        call('union_rerank_fast',dict(score='lse_pos',s=32)),
+        call('build_forests_cuda',{})],
+        observed_work=dict(beam_node_visits=4,beam_valid_candidates=6,beam_candidate_slots=8,
+            rerank_query_unique_cells=4,rerank_read_cells=4),
+        forest_builds=[dict(kind='build_forests_cuda',capacity=2,admitted=[2],
+            selected_chunks=None,prefill_trim=None,head_dim=64)],spine_builds=[])
+    got=aggregate_forest_search(phase)
+    assert got['beam_queries']==4
+    assert got['rerank_scored_pairs']==6
+    assert got['components']['rerank']==candidate_lse_scores(6,32,64,int8=True)
+    assert set(got['covered_functions'])=={'forest_beam_pair','union_rerank_fast','build_forests_cuda'}
+
+
+def test_forest_prefill_counts_union_cells_against_every_query_in_block():
+    phase=dict(kernel_calls=[
+        call('forest_beam_pair',dict(q=dict(shape=[1,2,64]),node_score='bound',s=32,radius_coef=8.0)),
+        call('union_rerank_rows',dict(score='lse_pos',s=32)),
+        call('build_forests_cuda',{})],
+        observed_work=dict(beam_node_visits=4,beam_valid_candidates=6,beam_candidate_slots=8,
+            rerank_query_unique_cells=4,rerank_read_cells=4,rerank_block_query_cell_pairs=8),
+        forest_builds=[dict(kind='build_forests_cuda',capacity=2,admitted=[2],
+            selected_chunks=None,prefill_trim=None,head_dim=64)],spine_builds=[])
+    got=aggregate_forest_search(phase)
+    assert got['rerank_scored_pairs']==8
+    assert got['components']['rerank']==candidate_lse_scores(8,32,64)
 
 
 def test_nested_cell_statistics_are_counted_once():
@@ -25,15 +55,16 @@ def test_unhandled_forest_work_prevents_complete_total():
     assert not got['complete_kernel_coverage']
 
 
-def test_fsl_readout_does_not_hide_its_unresolved_selection():
-    inputs=dict(q_t=dict(shape=[1,2,1,64]),out_short=None,pool=dict(empty=False),st=[32])
+def test_fsl_readout_includes_its_separate_pooled_selection_cost():
+    inputs=dict(q_t=dict(shape=[1,2,1,64]),out_short=None,pool=dict(empty=False,C=72),st=[32])
     phase=dict(kernel_calls=[call('lr_decode_read',dict(st=[32])),
                             call('lr_comb_int8',inputs)],observed_work={})
     got=aggregate_common_kernels(phase)
     assert got['components']['long_decode']['flops']>0
-    assert got['pending_kernel_components']=={'lr_comb_int8.selection':1}
+    assert got['components']['pooled_decode_selection']==pooled_decode_selection(2,72,64,4)
+    assert got['pending_kernel_components']=={}
     assert got['wrappers_not_double_counted']=={'lr_decode_read':1}
-    assert not got['complete_kernel_coverage']
+    assert got['complete_kernel_coverage']
 
 
 def test_trimmed_forest_counts_only_complete_visible_chunks():
